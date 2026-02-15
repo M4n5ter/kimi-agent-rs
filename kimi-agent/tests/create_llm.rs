@@ -5,7 +5,7 @@ use serde_json::json;
 
 use kimi_agent::config::{LLMModel, LLMProvider, ModelCapability, ProviderType};
 use kimi_agent::llm::{augment_provider_with_env_vars, create_llm};
-use kosong::chat_provider::echo::echo::EchoChatProvider;
+use kosong::chat_provider::echo::EchoChatProvider;
 use kosong::chat_provider::kimi::Kimi;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());

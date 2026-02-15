@@ -179,7 +179,7 @@ pub async fn create_llm(
             }
             Box::new(kimi)
         }
-        ProviderType::Echo => Box::new(kosong::chat_provider::echo::echo::EchoChatProvider),
+        ProviderType::Echo => Box::new(kosong::chat_provider::echo::EchoChatProvider),
         ProviderType::ScriptedEcho => {
             if let Some(envs) = &provider.env {
                 for (key, value) in envs {

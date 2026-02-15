@@ -19,7 +19,7 @@ use kimi_agent::soul::denwarenji::DenwaRenji;
 use kimi_agent::soul::toolset::KimiToolset;
 use kimi_agent::utils::Environment;
 use kimi_agent::wire::WireFile;
-use kosong::chat_provider::echo::echo::EchoChatProvider;
+use kosong::chat_provider::echo::EchoChatProvider;
 use tempfile::TempDir;
 
 pub struct RuntimeFixture {
