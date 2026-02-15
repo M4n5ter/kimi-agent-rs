@@ -752,15 +752,12 @@ impl CallableTool for McpTool {
 
     async fn call(&self, arguments: Value) -> ToolReturnValue {
         let description = format!("Call MCP tool `{}`.", self.base.name);
-        let approved = match self
+        let approved = self
             .runtime
             .approval
             .request(&self.base.name, &self.action_name, &description, None)
             .await
-        {
-            Ok(value) => value,
-            Err(_) => false,
-        };
+            .unwrap_or_default();
         if !approved {
             return tool_rejected_error();
         }
