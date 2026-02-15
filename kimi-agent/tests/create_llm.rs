@@ -1,14 +1,14 @@
 use std::collections::HashSet;
-use std::sync::Mutex;
 
 use serde_json::json;
+use tokio::sync::Mutex;
 
 use kimi_agent::config::{LLMModel, LLMProvider, ModelCapability, ProviderType};
 use kimi_agent::llm::{augment_provider_with_env_vars, create_llm};
 use kosong::chat_provider::echo::EchoChatProvider;
 use kosong::chat_provider::kimi::Kimi;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 struct EnvGuard {
     key: &'static str,
@@ -44,7 +44,7 @@ impl Drop for EnvGuard {
 
 #[test]
 fn test_augment_provider_with_env_vars_kimi() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.blocking_lock();
     let _guards = vec![
         EnvGuard::set("KIMI_BASE_URL", "https://env.test/v1"),
         EnvGuard::set("KIMI_API_KEY", "env-key"),
@@ -95,7 +95,7 @@ fn test_augment_provider_with_env_vars_kimi() {
 
 #[test]
 fn test_augment_provider_with_env_vars_invalid_max_context_size() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.blocking_lock();
     let _guard = EnvGuard::set("KIMI_MODEL_MAX_CONTEXT_SIZE", "not-a-number");
 
     let mut provider = LLMProvider {
@@ -122,7 +122,7 @@ fn test_augment_provider_with_env_vars_invalid_max_context_size() {
 
 #[tokio::test]
 async fn test_create_llm_kimi_model_parameters() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.lock().await;
     let _guards = vec![
         EnvGuard::set("KIMI_MODEL_TEMPERATURE", "0.2"),
         EnvGuard::set("KIMI_MODEL_TOP_P", "0.8"),
@@ -167,7 +167,7 @@ async fn test_create_llm_kimi_model_parameters() {
 
 #[tokio::test]
 async fn test_create_llm_invalid_temperature_env() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = ENV_LOCK.lock().await;
     let _guard = EnvGuard::set("KIMI_MODEL_TEMPERATURE", "not-a-number");
 
     let provider = LLMProvider {
