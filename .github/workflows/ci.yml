@@ -49,7 +49,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Cargo machete
-        uses: bnjbvr/cargo-machete@v0.9.1
+        uses: bnjbvr/cargo-machete@main
         with:
           args: --with-metadata --skip-target-dir kaos kosong kimi-agent
 
