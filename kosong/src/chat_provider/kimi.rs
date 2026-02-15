@@ -21,6 +21,9 @@ use crate::message::{
 };
 use crate::tooling::Tool;
 
+type ByteStream = Pin<Box<dyn futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+type ParsedKimiResponse = (Vec<StreamedMessagePart>, Option<String>, Option<TokenUsage>);
+
 #[derive(Clone)]
 pub struct Kimi {
     model: String,
@@ -346,7 +349,7 @@ impl KimiFiles {
 }
 
 pub struct KimiStreamedMessage {
-    stream: Option<Pin<Box<dyn futures::Stream<Item = Result<Bytes, reqwest::Error>> + Send>>>,
+    stream: Option<ByteStream>,
     buffer: String,
     parts: VecDeque<StreamedMessagePart>,
     id: Option<String>,
@@ -529,9 +532,7 @@ fn convert_tool(tool: &Tool) -> Value {
     }
 }
 
-fn parse_non_stream_response(
-    value: &Value,
-) -> Result<(Vec<StreamedMessagePart>, Option<String>, Option<TokenUsage>), ChatProviderError> {
+fn parse_non_stream_response(value: &Value) -> Result<ParsedKimiResponse, ChatProviderError> {
     let message_id = value
         .get("id")
         .and_then(|v| v.as_str())
