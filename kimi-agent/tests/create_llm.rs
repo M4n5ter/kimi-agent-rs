@@ -45,7 +45,7 @@ impl Drop for EnvGuard {
 #[test]
 fn test_augment_provider_with_env_vars_kimi() {
     let _lock = ENV_LOCK.blocking_lock();
-    let _guards = vec![
+    let _guards = [
         EnvGuard::set("KIMI_BASE_URL", "https://env.test/v1"),
         EnvGuard::set("KIMI_API_KEY", "env-key"),
         EnvGuard::set("KIMI_MODEL_NAME", "kimi-env-model"),
@@ -123,7 +123,7 @@ fn test_augment_provider_with_env_vars_invalid_max_context_size() {
 #[tokio::test]
 async fn test_create_llm_kimi_model_parameters() {
     let _lock = ENV_LOCK.lock().await;
-    let _guards = vec![
+    let _guards = [
         EnvGuard::set("KIMI_MODEL_TEMPERATURE", "0.2"),
         EnvGuard::set("KIMI_MODEL_TOP_P", "0.8"),
         EnvGuard::set("KIMI_MODEL_MAX_TOKENS", "1234"),
