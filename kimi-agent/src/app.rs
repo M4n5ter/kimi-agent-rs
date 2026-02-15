@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -41,20 +41,34 @@ impl ConfigInput {
     }
 }
 
+pub struct CreateOptions {
+    pub config: Option<ConfigInput>,
+    pub model_name: Option<String>,
+    pub thinking: Option<bool>,
+    pub yolo: bool,
+    pub agent_file: Option<PathBuf>,
+    pub mcp_configs: Vec<serde_json::Value>,
+    pub skills_dir: Option<KaosPath>,
+    pub max_steps_per_turn: Option<i64>,
+    pub max_retries_per_step: Option<i64>,
+    pub max_ralph_iterations: Option<i64>,
+}
+
 impl KimiCLI {
-    pub async fn create(
-        session: Session,
-        config: Option<ConfigInput>,
-        model_name: Option<&str>,
-        thinking: Option<bool>,
-        yolo: bool,
-        agent_file: Option<&Path>,
-        mcp_configs: Vec<serde_json::Value>,
-        skills_dir: Option<KaosPath>,
-        max_steps_per_turn: Option<i64>,
-        max_retries_per_step: Option<i64>,
-        max_ralph_iterations: Option<i64>,
-    ) -> anyhow::Result<KimiCLI> {
+    pub async fn create(session: Session, options: CreateOptions) -> anyhow::Result<KimiCLI> {
+        let CreateOptions {
+            config,
+            model_name,
+            thinking,
+            yolo,
+            agent_file,
+            mcp_configs,
+            skills_dir,
+            max_steps_per_turn,
+            max_retries_per_step,
+            max_ralph_iterations,
+        } = options;
+
         let mut config = match config {
             Some(config) => config.load().await?,
             None => load_config(None).await?,
@@ -85,7 +99,7 @@ impl KimiCLI {
             model = Some(m.clone());
             provider = config.providers.get(&m.provider).cloned();
         }
-        if let Some(name) = model_name
+        if let Some(name) = model_name.as_deref()
             && let Some(m) = config.models.get(name)
         {
             model = Some(m.clone());
@@ -133,9 +147,7 @@ impl KimiCLI {
 
         let runtime = Runtime::create(config, llm, session, yolo, skills_dir).await;
 
-        let agent_file = agent_file
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(default_agent_file);
+        let agent_file = agent_file.unwrap_or_else(default_agent_file);
         let agent = load_agent(&agent_file, runtime.clone(), &mcp_configs).await?;
 
         let mut context = Context::new(runtime.session.context_file.clone());

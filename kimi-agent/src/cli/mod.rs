@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use kaos::KaosPath;
 
 use crate::agentspec::{default_agent_file, okabe_agent_file};
-use crate::app::{ConfigInput, KimiCLI};
+use crate::app::{ConfigInput, CreateOptions, KimiCLI};
 use crate::config::load_config_from_string;
 use crate::constant::VERSION;
 use crate::metadata::{load_metadata, save_metadata};
@@ -226,16 +226,18 @@ pub async fn run() -> Result<()> {
 
     let instance = KimiCLI::create(
         session,
-        config_input,
-        cli.model_name.as_deref(),
-        thinking,
-        cli.yolo,
-        agent_file.as_deref(),
-        mcp_configs,
-        skills_dir,
-        cli.max_steps_per_turn,
-        cli.max_retries_per_step,
-        cli.max_ralph_iterations,
+        CreateOptions {
+            config: config_input,
+            model_name: cli.model_name.clone(),
+            thinking,
+            yolo: cli.yolo,
+            agent_file,
+            mcp_configs,
+            skills_dir,
+            max_steps_per_turn: cli.max_steps_per_turn,
+            max_retries_per_step: cli.max_retries_per_step,
+            max_ralph_iterations: cli.max_ralph_iterations,
+        },
     )
     .await?;
 
