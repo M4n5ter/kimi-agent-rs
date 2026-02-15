@@ -151,7 +151,7 @@ fn strip_unquoted_comment(text: &str) -> String {
     let mut in_single = false;
     let mut in_double = false;
     let mut escape = false;
-    for (idx, ch) in text.chars().enumerate() {
+    for (idx, ch) in text.char_indices() {
         if escape {
             escape = false;
             continue;
