@@ -237,12 +237,11 @@ impl Session {
                         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
                             session_ids.insert(name.to_string());
                         }
-                    } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                        if ext == "jsonl" {
-                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                                session_ids.insert(stem.to_string());
-                            }
-                        }
+                    } else if let Some(ext) = path.extension().and_then(|s| s.to_str())
+                        && ext == "jsonl"
+                        && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                    {
+                        session_ids.insert(stem.to_string());
                     }
                 }
                 Ok(None) => break,

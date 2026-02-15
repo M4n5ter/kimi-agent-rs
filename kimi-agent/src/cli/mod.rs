@@ -201,10 +201,10 @@ pub async fn run() -> Result<()> {
         let config = load_config_from_string(config_string)
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
         Some(ConfigInput::Inline(config))
-    } else if let Some(config_file) = cli.config_file.as_ref() {
-        Some(ConfigInput::Path(config_file.clone()))
     } else {
-        None
+        cli.config_file
+            .as_ref()
+            .map(|config_file| ConfigInput::Path(config_file.clone()))
     };
 
     let mcp_configs = mcp::load_mcp_configs(&cli.mcp_config_file, &cli.mcp_config).await?;
@@ -275,16 +275,16 @@ async fn validate_cli_args(cli: &Cli) -> Result<()> {
         anyhow::bail!("Cannot combine --thinking and --no-thinking.");
     }
 
-    if let Some(session_id) = cli.session_id.as_ref() {
-        if session_id.trim().is_empty() {
-            anyhow::bail!("Session ID cannot be empty.");
-        }
+    if let Some(session_id) = cli.session_id.as_ref()
+        && session_id.trim().is_empty()
+    {
+        anyhow::bail!("Session ID cannot be empty.");
     }
 
-    if let Some(config_string) = cli.config_string.as_ref() {
-        if config_string.trim().is_empty() {
-            anyhow::bail!("Config cannot be empty.");
-        }
+    if let Some(config_string) = cli.config_string.as_ref()
+        && config_string.trim().is_empty()
+    {
+        anyhow::bail!("Config cannot be empty.");
     }
 
     if let Some(work_dir) = cli.work_dir.as_ref() {
@@ -307,22 +307,22 @@ async fn validate_cli_args(cli: &Cli) -> Result<()> {
         ensure_file_exists(path, "MCP config file").await?;
     }
 
-    if let Some(max_steps) = cli.max_steps_per_turn {
-        if max_steps < 1 {
-            anyhow::bail!("max-steps-per-turn must be >= 1.");
-        }
+    if let Some(max_steps) = cli.max_steps_per_turn
+        && max_steps < 1
+    {
+        anyhow::bail!("max-steps-per-turn must be >= 1.");
     }
 
-    if let Some(max_retries) = cli.max_retries_per_step {
-        if max_retries < 1 {
-            anyhow::bail!("max-retries-per-step must be >= 1.");
-        }
+    if let Some(max_retries) = cli.max_retries_per_step
+        && max_retries < 1
+    {
+        anyhow::bail!("max-retries-per-step must be >= 1.");
     }
 
-    if let Some(max_ralph) = cli.max_ralph_iterations {
-        if max_ralph < -1 {
-            anyhow::bail!("max-ralph-iterations must be >= -1.");
-        }
+    if let Some(max_ralph) = cli.max_ralph_iterations
+        && max_ralph < -1
+    {
+        anyhow::bail!("max-ralph-iterations must be >= -1.");
     }
 
     Ok(())

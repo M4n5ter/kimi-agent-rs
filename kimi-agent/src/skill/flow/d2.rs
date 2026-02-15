@@ -469,7 +469,7 @@ fn parse_quoted_label(text: &str, line_no: usize) -> Result<String, FlowParseErr
     let mut escape = false;
     let mut chars = text.char_indices().peekable();
     chars.next();
-    while let Some((idx, ch)) = chars.next() {
+    for (idx, ch) in chars {
         if escape {
             buf.push(ch);
             escape = false;

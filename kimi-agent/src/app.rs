@@ -78,17 +78,18 @@ impl KimiCLI {
         let mut model = None;
         let mut provider = None;
 
-        if model_name.is_none() && !config.default_model.is_empty() {
-            if let Some(m) = config.models.get(&config.default_model) {
-                model = Some(m.clone());
-                provider = config.providers.get(&m.provider).cloned();
-            }
+        if model_name.is_none()
+            && !config.default_model.is_empty()
+            && let Some(m) = config.models.get(&config.default_model)
+        {
+            model = Some(m.clone());
+            provider = config.providers.get(&m.provider).cloned();
         }
-        if let Some(name) = model_name {
-            if let Some(m) = config.models.get(name) {
-                model = Some(m.clone());
-                provider = config.providers.get(&m.provider).cloned();
-            }
+        if let Some(name) = model_name
+            && let Some(m) = config.models.get(name)
+        {
+            model = Some(m.clone());
+            provider = config.providers.get(&m.provider).cloned();
         }
 
         if model.is_none() {

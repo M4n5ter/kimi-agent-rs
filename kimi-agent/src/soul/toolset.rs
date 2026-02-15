@@ -153,22 +153,22 @@ impl KimiToolset {
                 continue;
             }
             for (name, server) in parsed {
-                if let McpServerConfig::Http(http) = &server {
-                    if http.auth.as_deref() == Some("oauth") {
-                        let authorized = has_oauth_tokens(&http.url).await.map_err(|err| {
-                            anyhow::anyhow!("Failed to read MCP auth tokens: {err}")
-                        })?;
-                        if !authorized {
-                            self.mcp_servers.insert(
-                                name.clone(),
-                                McpServerInfo::new(McpServerStatus::Unauthorized, server.clone()),
-                            );
-                            warn!(
-                                "Skipping OAuth MCP server '{}': not authorized. Run 'kimi-agent mcp auth {}' first.",
-                                name, name
-                            );
-                            continue;
-                        }
+                if let McpServerConfig::Http(http) = &server
+                    && http.auth.as_deref() == Some("oauth")
+                {
+                    let authorized = has_oauth_tokens(&http.url)
+                        .await
+                        .map_err(|err| anyhow::anyhow!("Failed to read MCP auth tokens: {err}"))?;
+                    if !authorized {
+                        self.mcp_servers.insert(
+                            name.clone(),
+                            McpServerInfo::new(McpServerStatus::Unauthorized, server.clone()),
+                        );
+                        warn!(
+                            "Skipping OAuth MCP server '{}': not authorized. Run 'kimi-agent mcp auth {}' first.",
+                            name, name
+                        );
+                        continue;
                     }
                 }
 
