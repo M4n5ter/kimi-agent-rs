@@ -196,39 +196,15 @@ impl WireSoulSide {
     }
 
     fn merge_tool_call(&self, call: ToolCall) {
-        let mut buffer = self.merge_buffer.lock().unwrap();
-        match buffer.as_mut() {
-            None => {
-                *buffer = Some(WireMessage::ToolCall(call));
-            }
-            Some(WireMessage::ToolCall(existing)) => {
-                if existing.id != call.id || existing.function.name != call.function.name {
-                    let flushed = buffer.take();
-                    drop(buffer);
-                    if let Some(msg) = flushed {
-                        let _ = self.merged_queue.publish_nowait(msg);
-                    }
-                    let mut buffer = self.merge_buffer.lock().unwrap();
-                    *buffer = Some(WireMessage::ToolCall(call));
-                } else {
-                    let flushed = buffer.take();
-                    drop(buffer);
-                    if let Some(msg) = flushed {
-                        let _ = self.merged_queue.publish_nowait(msg);
-                    }
-                    let mut buffer = self.merge_buffer.lock().unwrap();
-                    *buffer = Some(WireMessage::ToolCall(call));
-                }
-            }
-            _ => {
-                let flushed = buffer.take();
-                drop(buffer);
-                if let Some(msg) = flushed {
-                    let _ = self.merged_queue.publish_nowait(msg);
-                }
-                let mut buffer = self.merge_buffer.lock().unwrap();
-                *buffer = Some(WireMessage::ToolCall(call));
-            }
+        let flushed = {
+            let mut buffer = self.merge_buffer.lock().unwrap();
+            let flushed = buffer.take();
+            *buffer = Some(WireMessage::ToolCall(call));
+            flushed
+        };
+
+        if let Some(msg) = flushed {
+            let _ = self.merged_queue.publish_nowait(msg);
         }
     }
 }
