@@ -142,6 +142,12 @@ impl RuntimeFixture {
     }
 }
 
+impl Default for RuntimeFixture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[allow(dead_code)]
 pub struct TestKaos {
     inner: LocalKaos,
