@@ -462,15 +462,16 @@ pub fn parse_mcp_config(value: &Value) -> Result<HashMap<String, McpServerConfig
 }
 
 fn build_client_info() -> ClientInfo {
-    let mut info = ClientInfo::default();
-    info.client_info = Implementation {
-        name: NAME.to_string(),
-        title: None,
-        version: VERSION.to_string(),
-        icons: None,
-        website_url: None,
-    };
-    info
+    ClientInfo {
+        client_info: Implementation {
+            name: NAME.to_string(),
+            title: None,
+            version: VERSION.to_string(),
+            icons: None,
+            website_url: None,
+        },
+        ..Default::default()
+    }
 }
 
 fn normalize_http_transport(transport: &Option<String>) -> Result<(), String> {
