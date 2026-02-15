@@ -200,7 +200,7 @@ pub async fn run() -> Result<()> {
     let config_input = if let Some(config_string) = cli.config_string.as_ref() {
         let config = load_config_from_string(config_string)
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        Some(ConfigInput::Inline(config))
+        Some(ConfigInput::Inline(Box::new(config)))
     } else {
         cli.config_file
             .as_ref()

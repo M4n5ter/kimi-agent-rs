@@ -29,14 +29,14 @@ pub struct KimiCLI {
 
 pub enum ConfigInput {
     Path(std::path::PathBuf),
-    Inline(Config),
+    Inline(Box<Config>),
 }
 
 impl ConfigInput {
     async fn load(self) -> Result<Config, crate::exception::ConfigError> {
         match self {
             ConfigInput::Path(path) => load_config(Some(path.as_path())).await,
-            ConfigInput::Inline(config) => Ok(config),
+            ConfigInput::Inline(config) => Ok(*config),
         }
     }
 }
