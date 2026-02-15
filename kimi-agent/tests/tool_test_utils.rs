@@ -266,3 +266,8 @@ impl Drop for TestKaosGuard {
 pub fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
+
+#[test]
+fn test_normalize_newlines() {
+    assert_eq!(normalize_newlines("a\r\nb\rc\n"), "a\nb\nc\n");
+}
