@@ -246,19 +246,20 @@ pub async fn run() -> Result<()> {
 }
 
 async fn validate_cli_args(cli: &Cli) -> Result<()> {
-    let mut conflict_sets = Vec::new();
-    conflict_sets.push(vec![
-        ("--agent", cli.agent.is_some()),
-        ("--agent-file", cli.agent_file.is_some()),
-    ]);
-    conflict_sets.push(vec![
-        ("--continue", cli.continue_session),
-        ("--session", cli.session_id.is_some()),
-    ]);
-    conflict_sets.push(vec![
-        ("--config", cli.config_string.is_some()),
-        ("--config-file", cli.config_file.is_some()),
-    ]);
+    let conflict_sets = vec![
+        vec![
+            ("--agent", cli.agent.is_some()),
+            ("--agent-file", cli.agent_file.is_some()),
+        ],
+        vec![
+            ("--continue", cli.continue_session),
+            ("--session", cli.session_id.is_some()),
+        ],
+        vec![
+            ("--config", cli.config_string.is_some()),
+            ("--config-file", cli.config_file.is_some()),
+        ],
+    ];
 
     for option_set in conflict_sets {
         let active: Vec<&str> = option_set
