@@ -172,13 +172,8 @@ impl KimiCLI {
             let tx = tx_for_ui.clone();
             async move {
                 let ui = wire.ui_side(merge_wire_messages);
-                loop {
-                    match ui.receive().await {
-                        Ok(msg) => {
-                            let _ = tx.send(msg);
-                        }
-                        Err(_) => break,
-                    }
+                while let Ok(msg) = ui.receive().await {
+                    let _ = tx.send(msg);
                 }
                 Ok(())
             }

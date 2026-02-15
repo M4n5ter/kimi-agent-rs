@@ -261,16 +261,9 @@ struct WireRecorder {
 impl WireRecorder {
     fn new(wire_file: WireFile, queue: Queue<WireMessage>) -> Self {
         let task = tokio::spawn(async move {
-            loop {
-                match queue.get().await {
-                    Ok(msg) => {
-                        if let Err(err) =
-                            wire_file.append_message(&msg, Some(now_timestamp())).await
-                        {
-                            error!("Failed to append wire message: {}", err);
-                        }
-                    }
-                    Err(_) => break,
+            while let Ok(msg) = queue.get().await {
+                if let Err(err) = wire_file.append_message(&msg, Some(now_timestamp())).await {
+                    error!("Failed to append wire message: {}", err);
                 }
             }
         });
