@@ -123,29 +123,15 @@ pub async fn create_llm(
         return Ok(None);
     }
 
+    let default_headers = build_provider_headers(provider)?;
+
     let chat_provider: Box<dyn ChatProvider> = match provider.provider_type {
         ProviderType::Kimi => {
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::USER_AGENT,
-                reqwest::header::HeaderValue::from_str(&user_agent())
-                    .map_err(|err| LLMError::ChatProvider(err.to_string()))?,
-            );
-            if let Some(custom) = &provider.custom_headers {
-                for (key, value) in custom {
-                    if let (Ok(header_name), Ok(header_value)) = (
-                        reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                        reqwest::header::HeaderValue::from_str(value),
-                    ) {
-                        headers.insert(header_name, header_value);
-                    }
-                }
-            }
             let mut kimi = kosong::chat_provider::kimi::Kimi::new(
                 model.model.clone(),
                 Some(provider.api_key.clone()),
                 Some(provider.base_url.clone()),
-                Some(headers),
+                Some(default_headers.clone()),
             )
             .map_err(map_chat_provider_error)?;
 
@@ -178,6 +164,112 @@ pub async fn create_llm(
                 kimi = kimi.with_generation_kwargs(kwargs);
             }
             Box::new(kimi)
+        }
+        ProviderType::OpenaiLegacy => {
+            let mut openai = kosong::chat_provider::openai_legacy::OpenAILegacy::new(
+                model.model.clone(),
+                Some(provider.api_key.clone()),
+                Some(provider.base_url.clone()),
+                Some(default_headers.clone()),
+            )
+            .map_err(map_chat_provider_error)?;
+            if let Ok(value) = env::var("OPENAI_MODEL_TEMPERATURE")
+                && !value.is_empty()
+            {
+                let parsed = parse_env_f64(&value)?;
+                let mut kwargs = Map::new();
+                kwargs.insert("temperature".to_string(), Value::from(parsed));
+                openai = openai.with_generation_kwargs(kwargs);
+            }
+            Box::new(openai)
+        }
+        ProviderType::OpenaiResponses => {
+            let mut openai = kosong::chat_provider::openai_responses::OpenAIResponses::new(
+                model.model.clone(),
+                Some(provider.api_key.clone()),
+                Some(provider.base_url.clone()),
+                Some(default_headers.clone()),
+            )
+            .map_err(map_chat_provider_error)?;
+            if let Ok(value) = env::var("OPENAI_MODEL_TEMPERATURE")
+                && !value.is_empty()
+            {
+                let parsed = parse_env_f64(&value)?;
+                let mut kwargs = Map::new();
+                kwargs.insert("temperature".to_string(), Value::from(parsed));
+                openai = openai.with_generation_kwargs(kwargs);
+            }
+            Box::new(openai)
+        }
+        ProviderType::Anthropic => {
+            let mut anthropic = kosong::chat_provider::anthropic::Anthropic::new(
+                model.model.clone(),
+                Some(provider.api_key.clone()),
+                Some(provider.base_url.clone()),
+                Some(default_headers.clone()),
+            )
+            .map_err(map_chat_provider_error)?;
+
+            let mut kwargs = Map::new();
+            kwargs.insert("max_tokens".to_string(), Value::from(50_000));
+            if let Ok(value) = env::var("ANTHROPIC_MODEL_TEMPERATURE")
+                && !value.is_empty()
+            {
+                kwargs.insert(
+                    "temperature".to_string(),
+                    Value::from(parse_env_f64(&value)?),
+                );
+            }
+            if let Ok(value) = env::var("ANTHROPIC_MODEL_TOP_P")
+                && !value.is_empty()
+            {
+                kwargs.insert("top_p".to_string(), Value::from(parse_env_f64(&value)?));
+            }
+            if let Ok(value) = env::var("ANTHROPIC_MODEL_MAX_TOKENS")
+                && !value.is_empty()
+            {
+                kwargs.insert(
+                    "max_tokens".to_string(),
+                    Value::from(parse_env_i64(&value)?),
+                );
+            }
+
+            anthropic = anthropic.with_generation_kwargs(kwargs);
+            Box::new(anthropic)
+        }
+        ProviderType::GoogleGenai | ProviderType::Gemini => {
+            // Intentional: use OpenAI-compatible Gemini endpoint via OpenAILegacy for now.
+            Box::new(
+                kosong::chat_provider::openai_legacy::OpenAILegacy::new(
+                    model.model.clone(),
+                    Some(provider.api_key.clone()),
+                    Some(provider.base_url.clone()),
+                    Some(default_headers.clone()),
+                )
+                .map_err(map_chat_provider_error)?
+                .with_provider_name("google_genai"),
+            )
+        }
+        ProviderType::Vertexai => {
+            // Intentional: use Vertex AI OpenAI-compatible endpoint via OpenAILegacy for now.
+            if let Some(envs) = &provider.env {
+                for (key, value) in envs {
+                    // SAFETY: matches Python behavior of mutating process env for provider setup.
+                    unsafe {
+                        env::set_var(key, value);
+                    }
+                }
+            }
+            Box::new(
+                kosong::chat_provider::openai_legacy::OpenAILegacy::new(
+                    model.model.clone(),
+                    Some(provider.api_key.clone()),
+                    Some(provider.base_url.clone()),
+                    Some(default_headers.clone()),
+                )
+                .map_err(map_chat_provider_error)?
+                .with_provider_name("vertexai"),
+            )
         }
         ProviderType::Echo => Box::new(kosong::chat_provider::echo::EchoChatProvider),
         ProviderType::ScriptedEcho => {
@@ -248,6 +340,26 @@ fn apply_thinking(
     } else {
         chat_provider
     }
+}
+
+fn build_provider_headers(provider: &LLMProvider) -> Result<reqwest::header::HeaderMap, LLMError> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_str(&user_agent())
+            .map_err(|err| LLMError::ChatProvider(err.to_string()))?,
+    );
+    if let Some(custom) = &provider.custom_headers {
+        for (key, value) in custom {
+            if let (Ok(header_name), Ok(header_value)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                headers.insert(header_name, header_value);
+            }
+        }
+    }
+    Ok(headers)
 }
 
 fn parse_env_i64(value: &str) -> Result<i64, LLMError> {
