@@ -279,8 +279,6 @@ pub(super) fn is_openai_model(model: &str) -> bool {
         || model.starts_with("o3-")
         || model == "o4"
         || model.starts_with("o4-")
-        || model == "o5"
-        || model.starts_with("o5-")
 }
 
 fn extract_text_from_parts(parts: &[ContentPart], sep: &str) -> String {
