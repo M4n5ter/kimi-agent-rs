@@ -20,16 +20,7 @@ pub(super) fn parse_non_stream_response(value: &Value) -> ParsedResponses {
 
 pub(super) fn parse_parts_from_response(response: &Value) -> Vec<StreamedMessagePart> {
     let mut parts = Vec::new();
-
-    if let Some(output_text) = response
-        .get("output_text")
-        .and_then(|v| v.as_str())
-        .filter(|v| !v.is_empty())
-    {
-        parts.push(StreamedMessagePart::Content(ContentPart::Text(
-            TextPart::new(output_text),
-        )));
-    }
+    let mut saw_message_text = false;
 
     if let Some(output) = response.get("output").and_then(|v| v.as_array()) {
         for item in output {
@@ -52,6 +43,7 @@ pub(super) fn parse_parts_from_response(response: &Value) -> Vec<StreamedMessage
                                     .and_then(|v| v.as_str())
                                     .filter(|v| !v.is_empty())
                             {
+                                saw_message_text = true;
                                 parts.push(StreamedMessagePart::Content(ContentPart::Text(
                                     TextPart::new(text),
                                 )));
@@ -72,6 +64,19 @@ pub(super) fn parse_parts_from_response(response: &Value) -> Vec<StreamedMessage
                 _ => {}
             }
         }
+    }
+
+    // `output_text` is a convenience aggregate of message output text. Use it only
+    // when structured output did not yield any message text.
+    if !saw_message_text
+        && let Some(output_text) = response
+            .get("output_text")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+    {
+        parts.push(StreamedMessagePart::Content(ContentPart::Text(
+            TextPart::new(output_text),
+        )));
     }
 
     parts
@@ -233,6 +238,7 @@ mod tests {
     fn test_parse_non_stream_response_extracts_text_usage_and_tool_call() {
         let value = json!({
             "id": "resp-1",
+            "output_text": "hello",
             "usage": {
                 "input_tokens": 20,
                 "output_tokens": 10,
@@ -268,6 +274,25 @@ mod tests {
     fn test_parse_usage_returns_none_for_null_or_empty_payload() {
         assert_eq!(parse_usage(&Value::Null), None);
         assert_eq!(parse_usage(&json!({})), None);
+    }
+
+    #[test]
+    fn test_parse_non_stream_response_falls_back_to_output_text() {
+        let value = json!({
+            "id": "resp-2",
+            "output_text": "fallback-text",
+            "output": []
+        });
+
+        let (parts, id, usage) = parse_non_stream_response(&value);
+        assert_eq!(id.as_deref(), Some("resp-2"));
+        assert!(usage.is_none());
+        assert_eq!(
+            parts,
+            vec![StreamedMessagePart::Content(ContentPart::Text(
+                TextPart::new("fallback-text")
+            ))]
+        );
     }
 
     #[test]
