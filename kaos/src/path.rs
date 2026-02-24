@@ -157,6 +157,10 @@ impl KaosPath {
         get_current_kaos().write_text(self, data, true).await
     }
 
+    pub async fn chmod(&self, mode: u32) -> Result<()> {
+        get_current_kaos().chmod(self, mode).await
+    }
+
     pub async fn mkdir(&self, parents: bool, exist_ok: bool) -> Result<()> {
         get_current_kaos().mkdir(self, parents, exist_ok).await
     }

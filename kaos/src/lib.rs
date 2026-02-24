@@ -24,6 +24,15 @@ pub enum StrOrKaosPath<'a> {
     KaosPath(&'a KaosPath),
 }
 
+/// Platform information of the active KAOS backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KaosPlatform {
+    pub os: String,
+    pub arch: String,
+    pub abi: Option<String>,
+    pub libc: Option<String>,
+}
+
 /// Async readable stream interface for Kaos process IO.
 #[async_trait::async_trait]
 pub trait AsyncReadable: Send + Sync {
@@ -62,6 +71,7 @@ pub trait KaosProcess: Send + Sync {
 #[async_trait::async_trait]
 pub trait Kaos: Send + Sync {
     fn name(&self) -> &str;
+    fn platform(&self) -> KaosPlatform;
     fn normpath(&self, path: &StrOrKaosPath<'_>) -> KaosPath;
     fn home(&self) -> KaosPath;
     fn cwd(&self) -> KaosPath;
@@ -80,6 +90,7 @@ pub trait Kaos: Send + Sync {
     async fn read_lines_stream(&self, path: &KaosPath) -> Result<LineStream>;
     async fn write_bytes(&self, path: &KaosPath, data: &[u8]) -> Result<usize>;
     async fn write_text(&self, path: &KaosPath, data: &str, append: bool) -> Result<usize>;
+    async fn chmod(&self, path: &KaosPath, mode: u32) -> Result<()>;
     async fn mkdir(&self, path: &KaosPath, parents: bool, exist_ok: bool) -> Result<()>;
     async fn exec(&self, args: &[String]) -> Result<Box<dyn KaosProcess>>;
 }
@@ -111,6 +122,10 @@ pub fn normalize_path_arg(arg: &StrOrKaosPath<'_>) -> KaosPath {
 
 pub fn normpath(path: &StrOrKaosPath<'_>) -> KaosPath {
     get_current_kaos().normpath(path)
+}
+
+pub fn platform() -> KaosPlatform {
+    get_current_kaos().platform()
 }
 
 pub fn gethome() -> KaosPath {
@@ -159,6 +174,10 @@ pub async fn write_bytes(path: &KaosPath, data: &[u8]) -> Result<usize> {
 
 pub async fn write_text(path: &KaosPath, data: &str, append: bool) -> Result<usize> {
     get_current_kaos().write_text(path, data, append).await
+}
+
+pub async fn chmod(path: &KaosPath, mode: u32) -> Result<()> {
+    get_current_kaos().chmod(path, mode).await
 }
 
 pub async fn mkdir(path: &KaosPath, parents: bool, exist_ok: bool) -> Result<()> {

@@ -8,8 +8,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::process::Command;
 
 use crate::{
-    AsyncReadable, AsyncWritable, Kaos, KaosPath, KaosProcess, LineStream, StatResult,
-    StrOrKaosPath,
+    AsyncReadable, AsyncWritable, Kaos, KaosPath, KaosPlatform, KaosProcess, LineStream,
+    StatResult, StrOrKaosPath,
 };
 
 #[cfg(unix)]
@@ -191,6 +191,15 @@ where
 impl Kaos for LocalKaos {
     fn name(&self) -> &str {
         "local"
+    }
+
+    fn platform(&self) -> KaosPlatform {
+        KaosPlatform {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            abi: detect_target_abi().map(str::to_string),
+            libc: detect_target_libc().map(str::to_string),
+        }
     }
 
     fn normpath(&self, path: &StrOrKaosPath<'_>) -> KaosPath {
@@ -413,6 +422,26 @@ impl Kaos for LocalKaos {
         Ok(data.len())
     }
 
+    async fn chmod(&self, path: &KaosPath, mode: u32) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(mode);
+            fs::set_permissions(path.as_path(), permissions).await?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            // Non-Unix platforms do not expose POSIX permission bits; map write bits to readonly.
+            let mut perms = fs::metadata(path.as_path()).await?.permissions();
+            let readonly = (mode & 0o222) == 0;
+            perms.set_readonly(readonly);
+            fs::set_permissions(path.as_path(), perms).await?;
+        }
+
+        Ok(())
+    }
+
     async fn mkdir(&self, path: &KaosPath, parents: bool, exist_ok: bool) -> Result<()> {
         if parents {
             if let Err(err) = fs::create_dir_all(path.as_path()).await
@@ -507,6 +536,34 @@ fn normalize_path(path: &Path) -> PathBuf {
         out.push(".");
     }
     out
+}
+
+fn detect_target_libc() -> Option<&'static str> {
+    if cfg!(target_os = "linux") {
+        if cfg!(target_env = "musl") {
+            return Some("musl");
+        }
+        if cfg!(target_env = "gnu") {
+            return Some("gnu");
+        }
+    }
+    None
+}
+
+fn detect_target_abi() -> Option<&'static str> {
+    if cfg!(target_abi = "eabi") {
+        return Some("eabi");
+    }
+    if cfg!(target_abi = "eabihf") {
+        return Some("eabihf");
+    }
+    if cfg!(target_abi = "macabi") {
+        return Some("macabi");
+    }
+    if cfg!(target_abi = "sim") {
+        return Some("sim");
+    }
+    None
 }
 
 #[cfg(not(unix))]

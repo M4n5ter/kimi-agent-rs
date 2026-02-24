@@ -32,6 +32,10 @@ impl Kaos for FixedHomeKaos {
         "local"
     }
 
+    fn platform(&self) -> kaos::KaosPlatform {
+        self.inner.platform()
+    }
+
     fn normpath(&self, path: &StrOrKaosPath<'_>) -> KaosPath {
         self.inner.normpath(path)
     }
@@ -91,6 +95,10 @@ impl Kaos for FixedHomeKaos {
 
     async fn write_text(&self, path: &KaosPath, data: &str, append: bool) -> anyhow::Result<usize> {
         self.inner.write_text(path, data, append).await
+    }
+
+    async fn chmod(&self, path: &KaosPath, mode: u32) -> anyhow::Result<()> {
+        self.inner.chmod(path, mode).await
     }
 
     async fn mkdir(&self, path: &KaosPath, parents: bool, exist_ok: bool) -> anyhow::Result<()> {

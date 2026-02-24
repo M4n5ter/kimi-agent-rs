@@ -2,15 +2,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use futures::StreamExt;
+use kaos::{AsyncReadable, KaosPath, KaosPlatform};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tracing::{debug, error, info};
 
 use kosong::tooling::{CallableTool2, ToolReturnValue, tool_error};
 
-use crate::share::get_share_dir;
 use crate::soul::agent::Runtime;
 use crate::tools::utils::ToolResultBuilder;
 
@@ -116,8 +114,8 @@ impl CallableTool2 for Grep {
 
     async fn call_typed(&self, params: Self::Params) -> ToolReturnValue {
         let mut builder = ToolResultBuilder::default();
-        let rg_path = match ensure_rg_path().await {
-            Ok(path) => path,
+        let rg_command = match ensure_rg_command().await {
+            Ok(command) => command,
             Err(err) => {
                 return tool_error(
                     "",
@@ -127,49 +125,158 @@ impl CallableTool2 for Grep {
             }
         };
 
-        let mut command = Command::new(&rg_path);
+        let mut args = vec![rg_command];
         if params.ignore_case {
-            command.arg("-i");
+            args.push("-i".to_string());
         }
         if params.multiline {
-            command.arg("-U");
-            command.arg("--multiline-dotall");
+            args.push("-U".to_string());
+            args.push("--multiline-dotall".to_string());
         }
         if params.output_mode == "content" {
             if let Some(before) = params.before_context {
-                command.arg("-B").arg(before.to_string());
+                args.push("-B".to_string());
+                args.push(before.to_string());
             }
             if let Some(after) = params.after_context {
-                command.arg("-A").arg(after.to_string());
+                args.push("-A".to_string());
+                args.push(after.to_string());
             }
             if let Some(context) = params.context {
-                command.arg("-C").arg(context.to_string());
+                args.push("-C".to_string());
+                args.push(context.to_string());
             }
             if params.line_number {
-                command.arg("-n");
+                args.push("-n".to_string());
             }
         }
         if let Some(glob) = &params.glob {
-            command.arg("-g").arg(glob);
+            args.push("-g".to_string());
+            args.push(glob.clone());
         }
         if let Some(file_type) = &params.file_type {
-            command.arg("--type").arg(file_type);
+            args.push("--type".to_string());
+            args.push(file_type.clone());
         }
 
         if params.output_mode == "files_with_matches" {
-            command.arg("-l");
+            args.push("-l".to_string());
         } else if params.output_mode == "count_matches" {
-            command.arg("-c");
+            args.push("-c".to_string());
         }
 
         if params.pattern.starts_with('-') {
-            command.arg("--");
+            args.push("--".to_string());
         }
-        command.arg(&params.pattern);
-        command.arg(&params.path);
+        args.push(params.pattern.clone());
+        args.push(params.path.clone());
 
-        let output = match command.output().await {
-            Ok(output) => output,
+        let mut process = match kaos::exec(&args).await {
+            Ok(process) => process,
+            Err(err) => {
+                return tool_error(
+                    "",
+                    format!("Failed to grep. Error: {err}"),
+                    "Failed to grep",
+                );
+            }
+        };
+        if let Err(err) = process.stdin().close().await {
+            return tool_error(
+                "",
+                format!("Failed to grep. Error: {err}"),
+                "Failed to grep",
+            );
+        }
+
+        let (stdout_bytes, stderr_bytes) = match (process.take_stdout(), process.take_stderr()) {
+            (Some(stdout), Some(stderr)) => {
+                let stdout_fut = read_stream_to_end(stdout);
+                let stderr_fut = read_stream_to_end(stderr);
+                match tokio::try_join!(stdout_fut, stderr_fut) {
+                    Ok(output) => output,
+                    Err(err) => {
+                        return tool_error(
+                            "",
+                            format!("Failed to grep. Error: {err}"),
+                            "Failed to grep",
+                        );
+                    }
+                }
+            }
+            (Some(stdout), None) => {
+                let stdout = match read_stream_to_end(stdout).await {
+                    Ok(output) => output,
+                    Err(err) => {
+                        return tool_error(
+                            "",
+                            format!("Failed to grep. Error: {err}"),
+                            "Failed to grep",
+                        );
+                    }
+                };
+                let stderr = match read_stream_to_end_ref(process.stderr()).await {
+                    Ok(output) => output,
+                    Err(err) => {
+                        return tool_error(
+                            "",
+                            format!("Failed to grep. Error: {err}"),
+                            "Failed to grep",
+                        );
+                    }
+                };
+                (stdout, stderr)
+            }
+            (None, Some(stderr)) => {
+                let stdout = match read_stream_to_end_ref(process.stdout()).await {
+                    Ok(output) => output,
+                    Err(err) => {
+                        return tool_error(
+                            "",
+                            format!("Failed to grep. Error: {err}"),
+                            "Failed to grep",
+                        );
+                    }
+                };
+                let stderr = match read_stream_to_end(stderr).await {
+                    Ok(output) => output,
+                    Err(err) => {
+                        return tool_error(
+                            "",
+                            format!("Failed to grep. Error: {err}"),
+                            "Failed to grep",
+                        );
+                    }
+                };
+                (stdout, stderr)
+            }
+            (None, None) => {
+                let stdout = match read_stream_to_end_ref(process.stdout()).await {
+                    Ok(output) => output,
+                    Err(err) => {
+                        return tool_error(
+                            "",
+                            format!("Failed to grep. Error: {err}"),
+                            "Failed to grep",
+                        );
+                    }
+                };
+                let stderr = match read_stream_to_end_ref(process.stderr()).await {
+                    Ok(output) => output,
+                    Err(err) => {
+                        return tool_error(
+                            "",
+                            format!("Failed to grep. Error: {err}"),
+                            "Failed to grep",
+                        );
+                    }
+                };
+                (stdout, stderr)
+            }
+        };
+
+        let exitcode = match process.wait().await {
+            Ok(code) => code,
             Err(err) => {
                 return tool_error(
                     "",
@@ -179,20 +286,17 @@ impl CallableTool2 for Grep {
             }
         };
 
-        if !output.status.success() && output.status.code() != Some(1) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if exitcode != 0 && exitcode != 1 {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             let message = if stderr.trim().is_empty() {
-                format!(
-                    "Failed to grep. Exit status: {}",
-                    output.status.code().unwrap_or(-1)
-                )
+                format!("Failed to grep. Exit status: {exitcode}")
             } else {
                 format!("Failed to grep. Error: {stderr}")
             };
             return tool_error("", message, "Failed to grep");
         }
 
-        let mut output_text = String::from_utf8_lossy(&output.stdout).to_string();
+        let mut output_text = String::from_utf8_lossy(&stdout_bytes).to_string();
         if output_text.is_empty() {
             return builder.ok("No matches found", "");
         }
@@ -214,25 +318,79 @@ impl CallableTool2 for Grep {
     }
 }
 
+async fn read_stream_to_end(mut stream: Box<dyn AsyncReadable>) -> Result<Vec<u8>, String> {
+    read_stream_to_end_ref(stream.as_mut()).await
+}
+
+async fn read_stream_to_end_ref(stream: &mut dyn AsyncReadable) -> Result<Vec<u8>, String> {
+    let mut output = Vec::new();
+    loop {
+        let chunk = stream
+            .read(8192)
+            .await
+            .map_err(|err| format!("Failed to read process stream: {err}"))?;
+        if chunk.is_empty() {
+            break;
+        }
+        output.extend_from_slice(&chunk);
+    }
+    Ok(output)
+}
+
 fn rg_download_lock() -> &'static tokio::sync::Mutex<()> {
     RG_DOWNLOAD_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn rg_binary_name() -> &'static str {
-    if cfg!(windows) { "rg.exe" } else { "rg" }
+fn rg_binary_name(platform: &KaosPlatform) -> &'static str {
+    if platform.os == "windows" {
+        "rg.exe"
+    } else {
+        "rg"
+    }
 }
 
-fn find_existing_rg(bin_name: &str) -> Option<PathBuf> {
-    let share_bin = get_share_dir().join("bin").join(bin_name);
-    if share_bin.is_file() {
-        return Some(share_bin);
+async fn find_existing_rg(bin_name: &str) -> Option<String> {
+    let share_bin = kaos_share_bin_dir().joinpath(bin_name);
+    if share_bin.is_file(true).await {
+        return Some(share_bin.to_string_lossy());
     }
 
-    if let Some(local_dep) = find_local_dep(bin_name) {
-        return Some(local_dep);
+    // Only local backend can access bundled deps beside the executable.
+    if current_kaos_is_local()
+        && let Some(local_dep) = find_local_dep(bin_name)
+    {
+        return Some(local_dep.to_string_lossy().to_string());
     }
 
-    find_on_path(bin_name)
+    if command_on_backend_available(bin_name).await {
+        return Some(bin_name.to_string());
+    }
+
+    None
+}
+
+fn current_kaos_is_local() -> bool {
+    kaos::get_current_kaos().name() == "local"
+}
+
+fn kaos_share_bin_dir() -> KaosPath {
+    // KIMI_SHARE_DIR is a host-side override and should only affect local backend.
+    if current_kaos_is_local()
+        && let Some(path) = std::env::var_os("KIMI_SHARE_DIR")
+        && !path.is_empty()
+    {
+        return KaosPath::from(PathBuf::from(path)).joinpath("bin");
+    }
+    KaosPath::home().joinpath(".kimi").joinpath("bin")
+}
+
+async fn command_on_backend_available(command: &str) -> bool {
+    let args = vec![command.to_string(), "--version".to_string()];
+    let mut process = match kaos::exec(&args).await {
+        Ok(process) => process,
+        Err(_) => return false,
+    };
+    matches!(process.wait().await, Ok(0))
 }
 
 fn find_local_dep(bin_name: &str) -> Option<PathBuf> {
@@ -259,19 +417,8 @@ fn find_local_dep(bin_name: &str) -> Option<PathBuf> {
     None
 }
 
-fn find_on_path(bin_name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for path in std::env::split_paths(&path_var) {
-        let candidate = path.join(bin_name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn detect_target() -> Option<String> {
-    let arch = match std::env::consts::ARCH {
+fn detect_target(platform: &KaosPlatform) -> Option<String> {
+    let arch = match platform.arch.as_str() {
         "x86_64" | "amd64" => "x86_64",
         "aarch64" | "arm64" => "aarch64",
         other => {
@@ -280,10 +427,10 @@ fn detect_target() -> Option<String> {
         }
     };
 
-    let os = match std::env::consts::OS {
+    let os = match platform.os.as_str() {
         "macos" => "apple-darwin",
         "linux" => {
-            if arch == "x86_64" {
+            if arch == "x86_64" || platform.libc.as_deref() == Some("musl") {
                 "unknown-linux-musl"
             } else {
                 "unknown-linux-gnu"
@@ -299,36 +446,34 @@ fn detect_target() -> Option<String> {
     Some(format!("{arch}-{os}"))
 }
 
-async fn ensure_rg_path() -> Result<PathBuf, String> {
-    let bin_name = rg_binary_name();
-    if let Some(existing) = find_existing_rg(bin_name) {
-        debug!("Using ripgrep binary: {}", existing.display());
+async fn ensure_rg_command() -> Result<String, String> {
+    let platform = kaos::platform();
+    let bin_name = rg_binary_name(&platform);
+    if let Some(existing) = find_existing_rg(bin_name).await {
+        debug!("Using ripgrep binary: {}", existing);
         return Ok(existing);
     }
 
     let _guard = rg_download_lock().lock().await;
-    if let Some(existing) = find_existing_rg(bin_name) {
-        debug!("Using ripgrep binary: {}", existing.display());
+    if let Some(existing) = find_existing_rg(bin_name).await {
+        debug!("Using ripgrep binary: {}", existing);
         return Ok(existing);
     }
 
-    download_and_install_rg(bin_name).await
+    download_and_install_rg(bin_name, &platform).await
 }
 
-async fn download_and_install_rg(bin_name: &str) -> Result<PathBuf, String> {
-    let target =
-        detect_target().ok_or_else(|| "Unsupported platform for ripgrep download".to_string())?;
+async fn download_and_install_rg(
+    bin_name: &str,
+    platform: &KaosPlatform,
+) -> Result<String, String> {
+    let target = detect_target(platform)
+        .ok_or_else(|| "Unsupported platform for ripgrep download".to_string())?;
     let is_windows = target.contains("windows");
     let archive_ext = if is_windows { "zip" } else { "tar.gz" };
     let filename = format!("ripgrep-{RG_VERSION}-{target}.{archive_ext}");
     let url = format!("{RG_BASE_URL}/{filename}");
     info!("Downloading ripgrep from {}", url);
-
-    let temp_dir = std::env::temp_dir().join(format!("kimi-rg-{}", uuid::Uuid::new_v4()));
-    tokio::fs::create_dir_all(&temp_dir)
-        .await
-        .map_err(|err| format!("Failed to create temp dir: {err}"))?;
-    let archive_path = temp_dir.join(&filename);
 
     let response = reqwest::get(&url)
         .await
@@ -340,27 +485,20 @@ async fn download_and_install_rg(bin_name: &str) -> Result<PathBuf, String> {
         ));
     }
 
-    let mut file = tokio::fs::File::create(&archive_path)
-        .await
-        .map_err(|err| format!("Failed to create download file: {err}"))?;
+    let mut archive_bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|err| format!("Failed to download ripgrep: {err}"))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|err| format!("Failed to write download: {err}"))?;
+        archive_bytes.extend_from_slice(&chunk);
     }
 
-    let share_bin = get_share_dir().join("bin");
-    tokio::fs::create_dir_all(&share_bin)
+    let share_bin = kaos_share_bin_dir();
+    kaos::mkdir(&share_bin, true, true)
         .await
         .map_err(|err| format!("Failed to create share bin dir: {err}"))?;
-    let destination = share_bin.join(bin_name);
+    let destination = share_bin.joinpath(bin_name);
 
     let bin_name_owned = bin_name.to_string();
-    let archive_bytes = tokio::fs::read(&archive_path)
-        .await
-        .map_err(|err| format!("Failed to read ripgrep archive: {err}"))?;
     let bin_bytes = tokio::task::spawn_blocking(move || {
         if is_windows {
             extract_zip_bytes(&archive_bytes, &bin_name_owned)
@@ -372,27 +510,18 @@ async fn download_and_install_rg(bin_name: &str) -> Result<PathBuf, String> {
     .map_err(|err| format!("Failed to extract ripgrep: {err}"))?
     .map_err(|err| format!("Failed to extract ripgrep: {err}"))?;
 
-    tokio::fs::write(&destination, bin_bytes)
+    destination
+        .write_bytes(&bin_bytes)
         .await
         .map_err(|err| format!("Failed to write ripgrep binary: {err}"))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = tokio::fs::metadata(&destination)
-            .await
-            .map_err(|err| format!("Failed to read permissions: {err}"))?
-            .permissions();
-        perms.set_mode(perms.mode() | 0o111);
-        tokio::fs::set_permissions(&destination, perms)
-            .await
-            .map_err(|err| format!("Failed to set permissions: {err}"))?;
-    }
+    kaos::chmod(&destination, 0o755)
+        .await
+        .map_err(|err| format!("Failed to set permissions: {err}"))?;
 
-    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-    info!("Installed ripgrep to {}", destination.display());
+    info!("Installed ripgrep to {}", destination);
 
-    Ok(destination)
+    Ok(destination.to_string_lossy())
 }
 
 fn extract_zip_bytes(archive_bytes: &[u8], bin_name: &str) -> Result<Vec<u8>, String> {
