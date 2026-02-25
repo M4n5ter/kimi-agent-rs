@@ -1,4 +1,4 @@
-use kaos::KaosPath;
+use kaos::{KaosPath, get_current_kaos};
 
 #[derive(Clone, Debug)]
 pub struct Environment {
@@ -11,7 +11,8 @@ pub struct Environment {
 
 impl Environment {
     pub async fn detect() -> Self {
-        let os_kind = match std::env::consts::OS {
+        let platform = kaos::platform();
+        let os_kind = match platform.os.as_str() {
             "macos" => "macOS",
             "windows" => "Windows",
             "linux" => "Linux",
@@ -19,8 +20,12 @@ impl Environment {
         }
         .to_string();
 
-        let os_arch = std::env::consts::ARCH.to_string();
-        let os_version = sysinfo::System::long_os_version().unwrap_or_default();
+        let os_arch = platform.arch;
+        let os_version = if get_current_kaos().name() == "local" {
+            sysinfo::System::long_os_version().unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         if os_kind == "Windows" {
             return Environment {
@@ -28,14 +33,14 @@ impl Environment {
                 os_arch,
                 os_version,
                 shell_name: "Windows PowerShell".to_string(),
-                shell_path: KaosPath::from("powershell.exe".into()),
+                shell_path: KaosPath::new("powershell.exe"),
             };
         }
 
         let mut shell_name = "sh".to_string();
-        let mut shell_path = KaosPath::from("/bin/sh".into());
+        let mut shell_path = KaosPath::new("/bin/sh");
         for candidate in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-            let path = KaosPath::from(candidate.into());
+            let path = KaosPath::new(candidate);
             if path.is_file(true).await {
                 shell_name = "bash".to_string();
                 shell_path = path;

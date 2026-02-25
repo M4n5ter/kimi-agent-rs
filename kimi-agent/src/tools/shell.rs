@@ -215,6 +215,17 @@ impl CallableTool2 for Shell {
                     Ok(code) => code,
                     Err(err) => return tool_runtime_error(&err.to_string()),
                 };
+                if let Some(overflow) = process.output_overflow_summary() {
+                    return tool_runtime_error(&format!(
+                        "Command output overflowed process buffers and is not trustworthy (dropped {} chunks / {} bytes; stdout: {} chunks / {} bytes, stderr: {} chunks / {} bytes).",
+                        overflow.total_dropped_chunks(),
+                        overflow.total_dropped_bytes(),
+                        overflow.stdout_dropped_chunks,
+                        overflow.stdout_dropped_bytes,
+                        overflow.stderr_dropped_chunks,
+                        overflow.stderr_dropped_bytes,
+                    ));
+                }
                 if exitcode == 0 {
                     builder.ok("Command executed successfully.", "")
                 } else {

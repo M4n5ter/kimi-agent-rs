@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use kaos::SshKaosOptions;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -140,6 +141,26 @@ pub struct MCPConfig {
     pub client: MCPClientConfig,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum KaosConfig {
+    #[default]
+    Local,
+    Ssh {
+        #[serde(flatten)]
+        options: SshKaosOptions,
+    },
+}
+
+impl KaosConfig {
+    pub fn ssh_options(&self) -> Option<SshKaosOptions> {
+        match self {
+            Self::Local => None,
+            Self::Ssh { options } => Some(options.clone()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(skip)]
@@ -158,6 +179,8 @@ pub struct Config {
     pub services: Services,
     #[serde(default)]
     pub mcp: MCPConfig,
+    #[serde(default)]
+    pub kaos: KaosConfig,
 }
 
 impl Config {
@@ -177,6 +200,11 @@ impl Config {
                 )));
             }
         }
+        if let KaosConfig::Ssh { options } = &self.kaos
+            && options.host.trim().is_empty()
+        {
+            return Err(ConfigError::new("kaos.ssh host cannot be empty"));
+        }
         Ok(())
     }
 }
@@ -195,6 +223,7 @@ pub fn get_default_config() -> Config {
         loop_control: LoopControl::default(),
         services: Services::default(),
         mcp: MCPConfig::default(),
+        kaos: KaosConfig::default(),
     }
 }
 

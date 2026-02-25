@@ -2,17 +2,19 @@
 
 pub mod local;
 pub mod path;
+pub mod ssh;
 
 mod current;
+mod line_stream;
 
 pub use current::{
     CurrentKaosToken, get_current_kaos, reset_current_kaos, set_current_kaos,
     with_current_kaos_scope,
 };
 pub use local::LocalKaos;
-pub use path::KaosPath;
+pub use path::{KaosPath, KaosPathStyle};
+pub use ssh::{SshHostKeyPolicy, SshKaos, SshKaosOptions};
 
-use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::Result;
@@ -49,6 +51,29 @@ pub trait AsyncWritable: Send + Sync {
     async fn close(&mut self) -> Result<()>;
 }
 
+/// Summary of output dropped by a process transport layer under backpressure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessOutputOverflow {
+    pub stdout_dropped_chunks: u64,
+    pub stdout_dropped_bytes: u64,
+    pub stderr_dropped_chunks: u64,
+    pub stderr_dropped_bytes: u64,
+}
+
+impl ProcessOutputOverflow {
+    pub fn total_dropped_chunks(self) -> u64 {
+        self.stdout_dropped_chunks + self.stderr_dropped_chunks
+    }
+
+    pub fn total_dropped_bytes(self) -> u64 {
+        self.stdout_dropped_bytes + self.stderr_dropped_bytes
+    }
+
+    pub fn has_drops(self) -> bool {
+        self.total_dropped_chunks() > 0
+    }
+}
+
 /// Process handle returned by Kaos exec.
 #[async_trait::async_trait]
 pub trait KaosProcess: Send + Sync {
@@ -65,13 +90,28 @@ pub trait KaosProcess: Send + Sync {
     fn take_stderr(&mut self) -> Option<Box<dyn AsyncReadable>> {
         None
     }
+    fn output_overflow_summary(&self) -> Option<ProcessOutputOverflow> {
+        None
+    }
 }
 
 /// Kaos filesystem/process abstraction.
 #[async_trait::async_trait]
 pub trait Kaos: Send + Sync {
     fn name(&self) -> &str;
+    fn storage_name(&self) -> String {
+        self.name().to_string()
+    }
+
     fn platform(&self) -> KaosPlatform;
+
+    fn path_style(&self) -> KaosPathStyle {
+        match self.platform().os.as_str() {
+            "windows" => KaosPathStyle::Windows,
+            _ => KaosPathStyle::Posix,
+        }
+    }
+
     fn normpath(&self, path: &StrOrKaosPath<'_>) -> KaosPath;
     fn home(&self) -> KaosPath;
     fn cwd(&self) -> KaosPath;
@@ -115,7 +155,7 @@ pub type LineStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
 /// Helper to map string/KaosPath to KaosPath.
 pub fn normalize_path_arg(arg: &StrOrKaosPath<'_>) -> KaosPath {
     match arg {
-        StrOrKaosPath::Str(s) => KaosPath::from(PathBuf::from(s)),
+        StrOrKaosPath::Str(s) => KaosPath::from_style(get_current_kaos().path_style(), *s),
         StrOrKaosPath::KaosPath(p) => (*p).clone(),
     }
 }
