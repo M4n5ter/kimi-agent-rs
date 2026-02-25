@@ -285,6 +285,21 @@ impl CallableTool2 for Grep {
                 );
             }
         };
+        if let Some(overflow) = process.output_overflow_summary() {
+            return tool_error(
+                "",
+                format!(
+                    "Failed to grep. Process output overflowed and may be incomplete (dropped {} chunks / {} bytes; stdout: {} chunks / {} bytes, stderr: {} chunks / {} bytes).",
+                    overflow.total_dropped_chunks(),
+                    overflow.total_dropped_bytes(),
+                    overflow.stdout_dropped_chunks,
+                    overflow.stdout_dropped_bytes,
+                    overflow.stderr_dropped_chunks,
+                    overflow.stderr_dropped_bytes,
+                ),
+                "Failed to grep",
+            );
+        }
 
         if exitcode != 0 && exitcode != 1 {
             let stderr = String::from_utf8_lossy(&stderr_bytes);

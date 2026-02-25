@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,7 +22,8 @@ use typed_path::Utf8TypedPathBuf;
 
 use crate::{
     AsyncReadable, AsyncWritable, Kaos, KaosPath, KaosPathStyle, KaosPlatform, KaosProcess,
-    LineStream, StatResult, StrOrKaosPath, line_stream::line_stream_from_async_read,
+    LineStream, ProcessOutputOverflow, StatResult, StrOrKaosPath,
+    line_stream::line_stream_from_async_read,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -67,6 +69,12 @@ const fn default_connect_timeout_seconds() -> u64 {
 const MAX_AGENT_IDENTITIES_TO_TRY: usize = 8;
 const PROCESS_OUTPUT_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_SSH_EXIT_CODE: i32 = 1;
+
+#[derive(Clone, Copy)]
+enum ProcessStreamKind {
+    Stdout,
+    Stderr,
+}
 
 impl SshKaosOptions {
     fn known_hosts_path(&self) -> PathBuf {
@@ -572,29 +580,40 @@ impl Kaos for SshKaos {
         let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(PROCESS_OUTPUT_QUEUE_CAPACITY);
         let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(PROCESS_OUTPUT_QUEUE_CAPACITY);
         let (exit_code_tx, exit_code_rx) = watch::channel(None);
+        let overflow_state = Arc::new(ProcessOutputOverflowState::default());
+        let overflow_state_bg = Arc::clone(&overflow_state);
 
         tokio::spawn(async move {
             let mut exit_code: Option<i32> = None;
             while let Some(msg) = read_half.wait().await {
                 match msg {
                     ChannelMsg::Data { data } => {
-                        if let Err(err) = stdout_tx.try_send(data.as_ref().to_vec())
-                            && matches!(err, TrySendError::Closed(_))
-                        {
+                        if !forward_process_output_chunk(
+                            &stdout_tx,
+                            data.as_ref(),
+                            &overflow_state_bg,
+                            ProcessStreamKind::Stdout,
+                        ) {
                             break;
                         }
                     }
                     ChannelMsg::ExtendedData { data, ext: 1 } => {
-                        if let Err(err) = stderr_tx.try_send(data.as_ref().to_vec())
-                            && matches!(err, TrySendError::Closed(_))
-                        {
+                        if !forward_process_output_chunk(
+                            &stderr_tx,
+                            data.as_ref(),
+                            &overflow_state_bg,
+                            ProcessStreamKind::Stderr,
+                        ) {
                             break;
                         }
                     }
                     ChannelMsg::ExtendedData { data, .. } => {
-                        if let Err(err) = stdout_tx.try_send(data.as_ref().to_vec())
-                            && matches!(err, TrySendError::Closed(_))
-                        {
+                        if !forward_process_output_chunk(
+                            &stdout_tx,
+                            data.as_ref(),
+                            &overflow_state_bg,
+                            ProcessStreamKind::Stdout,
+                        ) {
                             break;
                         }
                     }
@@ -616,8 +635,44 @@ impl Kaos for SshKaos {
             null_stdout: QueueReader::empty(),
             null_stderr: QueueReader::empty(),
             exit_code_rx,
+            overflow_state,
             write_half,
         }))
+    }
+}
+
+#[derive(Default)]
+struct ProcessOutputOverflowState {
+    stdout_dropped_chunks: AtomicU64,
+    stdout_dropped_bytes: AtomicU64,
+    stderr_dropped_chunks: AtomicU64,
+    stderr_dropped_bytes: AtomicU64,
+}
+
+impl ProcessOutputOverflowState {
+    fn record_drop(&self, stream: ProcessStreamKind, bytes: usize) {
+        let bytes = bytes as u64;
+        match stream {
+            ProcessStreamKind::Stdout => {
+                self.stdout_dropped_chunks.fetch_add(1, Ordering::Relaxed);
+                self.stdout_dropped_bytes
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+            ProcessStreamKind::Stderr => {
+                self.stderr_dropped_chunks.fetch_add(1, Ordering::Relaxed);
+                self.stderr_dropped_bytes
+                    .fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> ProcessOutputOverflow {
+        ProcessOutputOverflow {
+            stdout_dropped_chunks: self.stdout_dropped_chunks.load(Ordering::Relaxed),
+            stdout_dropped_bytes: self.stdout_dropped_bytes.load(Ordering::Relaxed),
+            stderr_dropped_chunks: self.stderr_dropped_chunks.load(Ordering::Relaxed),
+            stderr_dropped_bytes: self.stderr_dropped_bytes.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -628,7 +683,24 @@ struct SshProcess {
     null_stdout: QueueReader,
     null_stderr: QueueReader,
     exit_code_rx: watch::Receiver<Option<i32>>,
+    overflow_state: Arc<ProcessOutputOverflowState>,
     write_half: Arc<AsyncMutex<Option<russh::ChannelWriteHalf<client::Msg>>>>,
+}
+
+fn forward_process_output_chunk(
+    tx: &mpsc::Sender<Vec<u8>>,
+    data: &[u8],
+    overflow_state: &ProcessOutputOverflowState,
+    stream: ProcessStreamKind,
+) -> bool {
+    match tx.try_send(data.to_vec()) {
+        Ok(()) => true,
+        Err(TrySendError::Closed(_)) => false,
+        Err(TrySendError::Full(chunk)) => {
+            overflow_state.record_drop(stream, chunk.len());
+            true
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -690,6 +762,11 @@ impl KaosProcess for SshProcess {
         self.stderr
             .take()
             .map(|stream| Box::new(stream) as Box<dyn AsyncReadable>)
+    }
+
+    fn output_overflow_summary(&self) -> Option<ProcessOutputOverflow> {
+        let summary = self.overflow_state.snapshot();
+        summary.has_drops().then_some(summary)
     }
 }
 

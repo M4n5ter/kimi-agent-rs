@@ -51,6 +51,29 @@ pub trait AsyncWritable: Send + Sync {
     async fn close(&mut self) -> Result<()>;
 }
 
+/// Summary of output dropped by a process transport layer under backpressure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessOutputOverflow {
+    pub stdout_dropped_chunks: u64,
+    pub stdout_dropped_bytes: u64,
+    pub stderr_dropped_chunks: u64,
+    pub stderr_dropped_bytes: u64,
+}
+
+impl ProcessOutputOverflow {
+    pub fn total_dropped_chunks(self) -> u64 {
+        self.stdout_dropped_chunks + self.stderr_dropped_chunks
+    }
+
+    pub fn total_dropped_bytes(self) -> u64 {
+        self.stdout_dropped_bytes + self.stderr_dropped_bytes
+    }
+
+    pub fn has_drops(self) -> bool {
+        self.total_dropped_chunks() > 0
+    }
+}
+
 /// Process handle returned by Kaos exec.
 #[async_trait::async_trait]
 pub trait KaosProcess: Send + Sync {
@@ -65,6 +88,9 @@ pub trait KaosProcess: Send + Sync {
         None
     }
     fn take_stderr(&mut self) -> Option<Box<dyn AsyncReadable>> {
+        None
+    }
+    fn output_overflow_summary(&self) -> Option<ProcessOutputOverflow> {
         None
     }
 }
