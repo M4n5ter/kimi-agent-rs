@@ -1,15 +1,13 @@
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
-use futures::stream;
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::{
     AsyncReadable, AsyncWritable, Kaos, KaosPath, KaosPlatform, KaosProcess, LineStream,
-    StatResult, StrOrKaosPath,
+    StatResult, StrOrKaosPath, line_stream::line_stream_from_async_read,
 };
 
 #[cfg(unix)]
@@ -202,10 +200,14 @@ impl Kaos for LocalKaos {
         }
     }
 
+    fn path_style(&self) -> crate::KaosPathStyle {
+        crate::KaosPathStyle::local_default()
+    }
+
     fn normpath(&self, path: &StrOrKaosPath<'_>) -> KaosPath {
         let path = match path {
             StrOrKaosPath::Str(s) => PathBuf::from(s),
-            StrOrKaosPath::KaosPath(p) => p.as_path().to_path_buf(),
+            StrOrKaosPath::KaosPath(p) => p.unsafe_to_local_path(),
         };
         KaosPath::from(normalize_path(&path))
     }
@@ -219,15 +221,16 @@ impl Kaos for LocalKaos {
     }
 
     async fn chdir(&self, path: &KaosPath) -> Result<()> {
-        std::env::set_current_dir(path.as_path())?;
+        std::env::set_current_dir(path.unsafe_to_local_path())?;
         Ok(())
     }
 
     async fn stat(&self, path: &KaosPath, follow_symlinks: bool) -> Result<StatResult> {
+        let local_path = path.unsafe_to_local_path();
         let metadata = if follow_symlinks {
-            fs::metadata(path.as_path()).await?
+            fs::metadata(&local_path).await?
         } else {
-            fs::symlink_metadata(path.as_path()).await?
+            fs::symlink_metadata(&local_path).await?
         };
 
         let st_size = metadata.len();
@@ -298,8 +301,9 @@ impl Kaos for LocalKaos {
     }
 
     async fn iterdir(&self, path: &KaosPath) -> Result<Vec<KaosPath>> {
+        let local_path = path.unsafe_to_local_path();
         let mut entries = Vec::new();
-        let mut dir = fs::read_dir(path.as_path()).await?;
+        let mut dir = fs::read_dir(&local_path).await?;
         while let Some(entry) = dir.next_entry().await? {
             entries.push(KaosPath::from(entry.path()));
         }
@@ -312,7 +316,11 @@ impl Kaos for LocalKaos {
         pattern: &str,
         case_sensitive: bool,
     ) -> Result<Vec<KaosPath>> {
-        let search = path.as_path().join(pattern).to_string_lossy().to_string();
+        let search = path
+            .unsafe_to_local_path()
+            .join(pattern)
+            .to_string_lossy()
+            .to_string();
         let options = glob::MatchOptions {
             case_sensitive,
             require_literal_separator: true,
@@ -328,7 +336,7 @@ impl Kaos for LocalKaos {
     }
 
     async fn read_bytes(&self, path: &KaosPath, limit: Option<usize>) -> Result<Vec<u8>> {
-        let mut data = fs::read(path.as_path()).await?;
+        let mut data = fs::read(path.unsafe_to_local_path()).await?;
         if let Some(n) = limit {
             data.truncate(n);
         }
@@ -336,11 +344,11 @@ impl Kaos for LocalKaos {
     }
 
     async fn read_text(&self, path: &KaosPath) -> Result<String> {
-        Ok(fs::read_to_string(path.as_path()).await?)
+        Ok(fs::read_to_string(path.unsafe_to_local_path()).await?)
     }
 
     async fn read_lines(&self, path: &KaosPath) -> Result<Vec<String>> {
-        let text = fs::read_to_string(path.as_path()).await?;
+        let text = fs::read_to_string(path.unsafe_to_local_path()).await?;
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         Ok(normalized
             .split_inclusive('\n')
@@ -349,107 +357,60 @@ impl Kaos for LocalKaos {
     }
 
     async fn read_lines_stream(&self, path: &KaosPath) -> Result<LineStream> {
-        struct LineStreamState<R>
-        where
-            R: AsyncRead + Unpin + Send,
-        {
-            reader: BufReader<R>,
-            buf: Vec<u8>,
-            pending: VecDeque<String>,
-            done: bool,
-        }
-
-        let file = fs::File::open(path.as_path()).await?;
-        let state = LineStreamState {
-            reader: BufReader::new(file),
-            buf: Vec::new(),
-            pending: VecDeque::new(),
-            done: false,
-        };
-
-        let stream = stream::unfold(state, |mut state| async move {
-            loop {
-                if let Some(line) = state.pending.pop_front() {
-                    return Some((Ok(line), state));
-                }
-                if state.done {
-                    return None;
-                }
-
-                state.buf.clear();
-                match state.reader.read_until(b'\n', &mut state.buf).await {
-                    Ok(0) => {
-                        state.done = true;
-                    }
-                    Ok(_) => {
-                        let text = String::from_utf8_lossy(&state.buf);
-                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                        let lines: Vec<String> = normalized
-                            .split_inclusive('\n')
-                            .map(str::to_string)
-                            .collect();
-                        if lines.is_empty() {
-                            continue;
-                        }
-                        for line in lines {
-                            state.pending.push_back(line);
-                        }
-                    }
-                    Err(err) => return Some((Err(err.into()), state)),
-                }
-            }
-        });
-
-        Ok(Box::pin(stream))
+        let file = fs::File::open(path.unsafe_to_local_path()).await?;
+        Ok(line_stream_from_async_read(file))
     }
 
     async fn write_bytes(&self, path: &KaosPath, data: &[u8]) -> Result<usize> {
-        fs::write(path.as_path(), data).await?;
+        fs::write(path.unsafe_to_local_path(), data).await?;
         Ok(data.len())
     }
 
     async fn write_text(&self, path: &KaosPath, data: &str, append: bool) -> Result<usize> {
+        let local_path = path.unsafe_to_local_path();
         if append {
             let mut file = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path.as_path())
+                .open(&local_path)
                 .await?;
             file.write_all(data.as_bytes()).await?;
         } else {
-            fs::write(path.as_path(), data).await?;
+            fs::write(&local_path, data).await?;
         }
         Ok(data.len())
     }
 
     async fn chmod(&self, path: &KaosPath, mode: u32) -> Result<()> {
+        let local_path = path.unsafe_to_local_path();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let permissions = std::fs::Permissions::from_mode(mode);
-            fs::set_permissions(path.as_path(), permissions).await?;
+            fs::set_permissions(&local_path, permissions).await?;
         }
 
         #[cfg(not(unix))]
         {
             // Non-Unix platforms do not expose POSIX permission bits; map write bits to readonly.
-            let mut perms = fs::metadata(path.as_path()).await?.permissions();
+            let mut perms = fs::metadata(&local_path).await?.permissions();
             let readonly = (mode & 0o222) == 0;
             perms.set_readonly(readonly);
-            fs::set_permissions(path.as_path(), perms).await?;
+            fs::set_permissions(&local_path, perms).await?;
         }
 
         Ok(())
     }
 
     async fn mkdir(&self, path: &KaosPath, parents: bool, exist_ok: bool) -> Result<()> {
+        let local_path = path.unsafe_to_local_path();
         if parents {
-            if let Err(err) = fs::create_dir_all(path.as_path()).await
+            if let Err(err) = fs::create_dir_all(&local_path).await
                 && !exist_ok
             {
                 return Err(err.into());
             }
-        } else if let Err(err) = fs::create_dir(path.as_path()).await
+        } else if let Err(err) = fs::create_dir(&local_path).await
             && !exist_ok
         {
             return Err(err.into());

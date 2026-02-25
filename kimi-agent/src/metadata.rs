@@ -49,7 +49,7 @@ pub struct Metadata {
 
 impl Metadata {
     pub fn get_work_dir_meta(&self, path: &KaosPath) -> Option<WorkDirMeta> {
-        let kaos_name = get_current_kaos().name().to_string();
+        let kaos_name = get_current_kaos().storage_name();
         self.work_dirs
             .iter()
             .find(|wd| wd.path == path.to_string() && wd.kaos == kaos_name)
@@ -59,7 +59,7 @@ impl Metadata {
     pub fn new_work_dir_meta(&mut self, path: &KaosPath) -> WorkDirMeta {
         let meta = WorkDirMeta {
             path: path.to_string(),
-            kaos: get_current_kaos().name().to_string(),
+            kaos: get_current_kaos().storage_name(),
             last_session_id: None,
         };
         self.work_dirs.push(meta.clone());
@@ -114,5 +114,5 @@ pub async fn save_metadata(metadata: &Metadata) {
 }
 
 fn default_kaos_name() -> String {
-    LocalKaos::new().name().to_string()
+    LocalKaos::new().storage_name()
 }

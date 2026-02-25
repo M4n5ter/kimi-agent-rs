@@ -2,17 +2,19 @@
 
 pub mod local;
 pub mod path;
+pub mod ssh;
 
 mod current;
+mod line_stream;
 
 pub use current::{
     CurrentKaosToken, get_current_kaos, reset_current_kaos, set_current_kaos,
     with_current_kaos_scope,
 };
 pub use local::LocalKaos;
-pub use path::KaosPath;
+pub use path::{KaosPath, KaosPathStyle};
+pub use ssh::{SshHostKeyPolicy, SshKaos, SshKaosOptions};
 
-use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::Result;
@@ -71,7 +73,19 @@ pub trait KaosProcess: Send + Sync {
 #[async_trait::async_trait]
 pub trait Kaos: Send + Sync {
     fn name(&self) -> &str;
+    fn storage_name(&self) -> String {
+        self.name().to_string()
+    }
+
     fn platform(&self) -> KaosPlatform;
+
+    fn path_style(&self) -> KaosPathStyle {
+        match self.platform().os.as_str() {
+            "windows" => KaosPathStyle::Windows,
+            _ => KaosPathStyle::Posix,
+        }
+    }
+
     fn normpath(&self, path: &StrOrKaosPath<'_>) -> KaosPath;
     fn home(&self) -> KaosPath;
     fn cwd(&self) -> KaosPath;
@@ -115,7 +129,7 @@ pub type LineStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
 /// Helper to map string/KaosPath to KaosPath.
 pub fn normalize_path_arg(arg: &StrOrKaosPath<'_>) -> KaosPath {
     match arg {
-        StrOrKaosPath::Str(s) => KaosPath::from(PathBuf::from(s)),
+        StrOrKaosPath::Str(s) => KaosPath::from_style(get_current_kaos().path_style(), *s),
         StrOrKaosPath::KaosPath(p) => (*p).clone(),
     }
 }

@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -6,7 +7,7 @@ use kaos::KaosPath;
 
 use crate::agentspec::{default_agent_file, okabe_agent_file};
 use crate::app::{ConfigInput, CreateOptions, KimiCLI};
-use crate::config::load_config_from_string;
+use crate::config::{Config, KaosConfig, load_config, load_config_from_string};
 use crate::constant::VERSION;
 use crate::metadata::{load_metadata, save_metadata};
 use crate::session::Session;
@@ -43,7 +44,7 @@ pub struct Cli {
         value_name = "PATH",
         help = "Working directory for the agent. Default: current directory."
     )]
-    work_dir: Option<PathBuf>,
+    work_dir: Option<String>,
 
     #[arg(
         long = "session",
@@ -137,7 +138,7 @@ pub struct Cli {
         value_name = "PATH",
         help = "Path to the skills directory. Overrides discovery."
     )]
-    skills_dir: Option<PathBuf>,
+    skills_dir: Option<String>,
 
     #[arg(
         long = "max-steps-per-turn",
@@ -175,6 +176,24 @@ enum Commands {
     Mcp(mcp::McpArgs),
 }
 
+struct KaosScopeGuard {
+    token: Option<kaos::CurrentKaosToken>,
+}
+
+impl KaosScopeGuard {
+    fn new(token: kaos::CurrentKaosToken) -> Self {
+        Self { token: Some(token) }
+    }
+}
+
+impl Drop for KaosScopeGuard {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            kaos::reset_current_kaos(token);
+        }
+    }
+}
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -197,25 +216,19 @@ pub async fn run() -> Result<()> {
 
     validate_cli_args(&cli).await?;
 
-    let config_input = if let Some(config_string) = cli.config_string.as_ref() {
-        let config = load_config_from_string(config_string)
-            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        Some(ConfigInput::Inline(Box::new(config)))
-    } else {
-        cli.config_file
-            .as_ref()
-            .map(|config_file| ConfigInput::Path(config_file.clone()))
-    };
+    let config = load_effective_config(&cli).await?;
+    let _kaos_guard = init_current_kaos(&config).await?;
+    validate_runtime_paths(&cli).await?;
 
     let mcp_configs = mcp::load_mcp_configs(&cli.mcp_config_file, &cli.mcp_config).await?;
 
     let skills_dir = cli
         .skills_dir
         .as_ref()
-        .map(|path| KaosPath::unsafe_from_local_path(path));
+        .map(|path| cli_path_to_kaos_path(path));
 
     let work_dir = match cli.work_dir.as_ref() {
-        Some(path) => KaosPath::unsafe_from_local_path(path),
+        Some(path) => cli_path_to_kaos_path(path),
         None => KaosPath::cwd(),
     };
 
@@ -227,7 +240,7 @@ pub async fn run() -> Result<()> {
     let instance = KimiCLI::create(
         session,
         CreateOptions {
-            config: config_input,
+            config: Some(ConfigInput::Inline(Box::new(config))),
             model_name: cli.model_name.clone(),
             thinking,
             yolo: cli.yolo,
@@ -244,6 +257,61 @@ pub async fn run() -> Result<()> {
     let session = instance.session().clone();
     instance.run_wire_stdio().await?;
     post_run(&session).await?;
+    Ok(())
+}
+
+async fn load_effective_config(cli: &Cli) -> Result<Config> {
+    if let Some(config_string) = cli.config_string.as_ref() {
+        return load_config_from_string(config_string).map_err(anyhow::Error::new);
+    }
+    if let Some(config_file) = cli.config_file.as_ref() {
+        return load_config(Some(config_file))
+            .await
+            .map_err(anyhow::Error::new);
+    }
+    load_config(None).await.map_err(anyhow::Error::new)
+}
+
+async fn init_current_kaos(config: &Config) -> Result<KaosScopeGuard> {
+    let kaos: Arc<dyn kaos::Kaos> = match &config.kaos {
+        KaosConfig::Local => Arc::new(kaos::LocalKaos::new()),
+        KaosConfig::Ssh { options } => Arc::new(
+            kaos::SshKaos::connect(options.clone())
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed to connect ssh kaos {}:{}",
+                        options.host, options.port
+                    )
+                })?,
+        ),
+    };
+    Ok(KaosScopeGuard::new(kaos::set_current_kaos(kaos)))
+}
+
+fn cli_path_to_kaos_path(path: &str) -> KaosPath {
+    KaosPath::new(path)
+}
+
+async fn validate_runtime_paths(cli: &Cli) -> Result<()> {
+    if let Some(work_dir) = cli.work_dir.as_ref() {
+        ensure_kaos_dir_exists(&cli_path_to_kaos_path(work_dir), "work dir").await?;
+    }
+
+    if let Some(skills_dir) = cli.skills_dir.as_ref() {
+        ensure_kaos_dir_exists(&cli_path_to_kaos_path(skills_dir), "skills dir").await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_kaos_dir_exists(path: &KaosPath, label: &str) -> Result<()> {
+    if !path.exists(true).await {
+        anyhow::bail!("{label} does not exist: {}", path.to_string_lossy());
+    }
+    if !path.is_dir(true).await {
+        anyhow::bail!("{label} is not a directory: {}", path.to_string_lossy());
+    }
     Ok(())
 }
 
@@ -290,14 +358,6 @@ async fn validate_cli_args(cli: &Cli) -> Result<()> {
         anyhow::bail!("Config cannot be empty.");
     }
 
-    if let Some(work_dir) = cli.work_dir.as_ref() {
-        ensure_dir_exists(work_dir, "work dir").await?;
-    }
-
-    if let Some(skills_dir) = cli.skills_dir.as_ref() {
-        ensure_dir_exists(skills_dir, "skills dir").await?;
-    }
-
     if let Some(config_file) = cli.config_file.as_ref() {
         ensure_file_exists(config_file, "config file").await?;
     }
@@ -331,17 +391,7 @@ async fn validate_cli_args(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_dir_exists(path: &PathBuf, label: &str) -> Result<()> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .with_context(|| format!("{label} does not exist: {}", path.display()))?;
-    if !metadata.is_dir() {
-        anyhow::bail!("{label} is not a directory: {}", path.display());
-    }
-    Ok(())
-}
-
-async fn ensure_file_exists(path: &PathBuf, label: &str) -> Result<()> {
+async fn ensure_file_exists(path: &Path, label: &str) -> Result<()> {
     let metadata = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("{label} does not exist: {}", path.display()))?;

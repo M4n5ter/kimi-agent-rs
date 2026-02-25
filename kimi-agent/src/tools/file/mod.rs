@@ -502,7 +502,7 @@ pub(super) fn resolve_tool_path(path: &KaosPath, work_dir: &KaosPath) -> KaosPat
     if path.is_absolute() {
         path.canonical()
     } else {
-        KaosPath::from(work_dir.as_path().join(path.as_path())).canonical()
+        work_dir.joinpath(&path.to_string_lossy()).canonical()
     }
 }
 

@@ -12,6 +12,10 @@ futures.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
 glob.workspace = true
+typed-path = "0.12"
+russh = "0.57"
+russh-sftp = "2.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio.workspace = true

@@ -87,11 +87,7 @@ pub fn shorten_home(path: &KaosPath) -> KaosPath {
 }
 
 pub fn is_within_directory(path: &KaosPath, directory: &KaosPath) -> bool {
-    let path_str = path.to_string_lossy();
-    let dir_str = directory.to_string_lossy();
-    Path::new(&path_str)
-        .strip_prefix(Path::new(&dir_str))
-        .is_ok()
+    path.relative_to(directory).is_ok()
 }
 
 fn parse_rotation_suffix(name: &str, base_name: &str, suffix: &str) -> Option<u64> {

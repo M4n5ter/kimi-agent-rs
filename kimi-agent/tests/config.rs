@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use kimi_agent::config::{
-    Config, LoopControl, MCPConfig, Services, get_default_config, load_config_from_string,
+    Config, KaosConfig, LoopControl, MCPConfig, Services, get_default_config,
+    load_config_from_string,
 };
 
 #[test]
@@ -16,6 +17,7 @@ fn test_default_config() {
         loop_control: LoopControl::default(),
         services: Services::default(),
         mcp: MCPConfig::default(),
+        kaos: KaosConfig::default(),
     };
     assert_eq!(config, expected);
 }
@@ -43,6 +45,9 @@ fn test_default_config_dump() {
                 "client": {
                     "tool_call_timeout_ms": 60000,
                 },
+            },
+            "kaos": {
+                "type": "local",
             },
         })
     );
@@ -85,4 +90,28 @@ fn test_load_config_reserved_context_size_too_low() {
     let err = load_config_from_string("{\"loop_control\": {\"reserved_context_size\": 500}}")
         .expect_err("reserved_context_size too low");
     assert!(err.to_string().contains("reserved_context_size"));
+}
+
+#[test]
+fn test_load_config_with_ssh_kaos() {
+    let config = load_config_from_string(
+        r#"{
+            "kaos": {
+                "type": "ssh",
+                "host": "example.com",
+                "port": 2222,
+                "username": "alice"
+            }
+        }"#,
+    )
+    .expect("load config");
+
+    match config.kaos {
+        KaosConfig::Local => panic!("expected ssh kaos"),
+        KaosConfig::Ssh { options } => {
+            assert_eq!(options.host, "example.com");
+            assert_eq!(options.port, 2222);
+            assert_eq!(options.username.as_deref(), Some("alice"));
+        }
+    }
 }

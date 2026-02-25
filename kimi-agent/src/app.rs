@@ -178,6 +178,7 @@ impl KimiCLI {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let tx_for_ui = tx.clone();
         let work_dir = self.runtime.session.work_dir.clone();
+        let original_cwd = KaosPath::cwd();
         let wire_file = self.runtime.session.wire_file();
 
         let ui_loop = move |wire: Arc<crate::wire::Wire>| {
@@ -200,6 +201,7 @@ impl KimiCLI {
             Some(wire_file),
         )
         .await;
+        let _ = kaos::chdir(&original_cwd).await;
 
         drop(tx);
         let mut messages = Vec::new();
