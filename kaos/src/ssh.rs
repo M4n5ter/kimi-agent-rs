@@ -16,7 +16,7 @@ use russh_sftp::protocol::{OpenFlags, StatusCode};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use typed_path::Utf8TypedPathBuf;
 
 use crate::{
@@ -66,6 +66,7 @@ const fn default_connect_timeout_seconds() -> u64 {
 
 const MAX_AGENT_IDENTITIES_TO_TRY: usize = 8;
 const PROCESS_OUTPUT_QUEUE_CAPACITY: usize = 64;
+const DEFAULT_SSH_EXIT_CODE: i32 = 1;
 
 impl SshKaosOptions {
     fn known_hosts_path(&self) -> PathBuf {
@@ -570,8 +571,7 @@ impl Kaos for SshKaos {
 
         let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(PROCESS_OUTPUT_QUEUE_CAPACITY);
         let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(PROCESS_OUTPUT_QUEUE_CAPACITY);
-        let exit_state = Arc::new(ProcessExitState::default());
-        let exit_state_bg = Arc::clone(&exit_state);
+        let (exit_code_tx, exit_code_rx) = watch::channel(None);
 
         tokio::spawn(async move {
             let mut exit_code: Option<i32> = None;
@@ -606,11 +606,7 @@ impl Kaos for SshKaos {
                     _ => {}
                 }
             }
-            *exit_state_bg
-                .code
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(exit_code.unwrap_or(1));
-            exit_state_bg.notify.notify_waiters();
+            let _ = exit_code_tx.send(Some(exit_code.unwrap_or(DEFAULT_SSH_EXIT_CODE)));
         });
 
         Ok(Box::new(SshProcess {
@@ -619,16 +615,10 @@ impl Kaos for SshKaos {
             stderr: Some(QueueReader::new(stderr_rx)),
             null_stdout: QueueReader::empty(),
             null_stderr: QueueReader::empty(),
-            exit_state,
+            exit_code_rx,
             write_half,
         }))
     }
-}
-
-#[derive(Default)]
-struct ProcessExitState {
-    code: Mutex<Option<i32>>,
-    notify: Notify,
 }
 
 struct SshProcess {
@@ -637,7 +627,7 @@ struct SshProcess {
     stderr: Option<QueueReader>,
     null_stdout: QueueReader,
     null_stderr: QueueReader,
-    exit_state: Arc<ProcessExitState>,
+    exit_code_rx: watch::Receiver<Option<i32>>,
     write_half: Arc<AsyncMutex<Option<russh::ChannelWriteHalf<client::Msg>>>>,
 }
 
@@ -648,11 +638,7 @@ impl KaosProcess for SshProcess {
     }
 
     fn returncode(&mut self) -> Option<i32> {
-        *self
-            .exit_state
-            .code
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        *self.exit_code_rx.borrow()
     }
 
     async fn wait(&mut self) -> Result<i32> {
@@ -660,7 +646,9 @@ impl KaosProcess for SshProcess {
             if let Some(code) = self.returncode() {
                 return Ok(code);
             }
-            self.exit_state.notify.notified().await;
+            if self.exit_code_rx.changed().await.is_err() {
+                return Ok(self.returncode().unwrap_or(DEFAULT_SSH_EXIT_CODE));
+            }
         }
     }
 
