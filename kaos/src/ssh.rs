@@ -1202,6 +1202,11 @@ fn sftp_error(err: SftpError) -> anyhow::Error {
 
 fn expand_home(path: impl AsRef<str>) -> PathBuf {
     let path = path.as_ref();
+    if path == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
     if let Some(stripped) = path.strip_prefix("~/")
         && let Some(home) = dirs::home_dir()
     {
