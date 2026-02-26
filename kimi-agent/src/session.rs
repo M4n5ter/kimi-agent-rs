@@ -321,6 +321,42 @@ impl Session {
     }
 }
 
+pub async fn post_run(session: &Session) -> anyhow::Result<()> {
+    let mut metadata = load_metadata().await;
+    let mut index = metadata.work_dirs.iter().position(|meta| {
+        meta.path == session.work_dir.to_string() && meta.kaos == session.work_dir_meta.kaos
+    });
+
+    if index.is_none() {
+        warn!(
+            "Work dir metadata missing when marking last session, recreating: {}",
+            session.work_dir.to_string_lossy()
+        );
+        let meta = session.work_dir_meta.clone();
+        metadata.work_dirs.push(meta);
+        index = Some(metadata.work_dirs.len() - 1);
+    }
+
+    let Some(idx) = index else {
+        save_metadata(&metadata).await;
+        return Ok(());
+    };
+
+    let meta = &mut metadata.work_dirs[idx];
+    if session.is_empty().await {
+        info!("Session {} has empty context, removing it", session.id);
+        session.delete().await;
+        if meta.last_session_id.as_deref() == Some(&session.id) {
+            meta.last_session_id = None;
+        }
+    } else {
+        meta.last_session_id = Some(session.id.clone());
+    }
+
+    save_metadata(&metadata).await;
+    Ok(())
+}
+
 async fn migrate_session_context_file(sessions_dir: &Path, session_id: &str) {
     let old_context_file = sessions_dir.join(format!("{session_id}.jsonl"));
     let new_context_file = sessions_dir.join(session_id).join("context.jsonl");

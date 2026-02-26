@@ -10,10 +10,9 @@ use crate::agentspec::{default_agent_file, okabe_agent_file};
 use crate::app::{ConfigInput, CreateOptions, KimiCLI};
 use crate::config::{Config, KaosConfig, load_config, load_config_from_string};
 use crate::constant::VERSION;
-use crate::metadata::{load_metadata, save_metadata};
-use crate::session::Session;
+use crate::session::{Session, post_run};
 use crate::utils::init_logging;
-use tracing::{info, warn};
+use tracing::info;
 
 pub mod info;
 pub mod mcp;
@@ -263,37 +262,58 @@ pub async fn run() -> Result<()> {
         None => KaosPath::cwd(),
     };
 
-    let session = resolve_session(&work_dir, cli.session_id.as_ref(), cli.continue_session).await?;
+    let default_session =
+        resolve_session(&work_dir, cli.session_id.as_ref(), cli.continue_session).await?;
 
     let agent_file = resolve_agent_file(cli.agent, cli.agent_file.as_ref())?;
     let thinking = resolve_thinking(cli.thinking, cli.no_thinking)?;
 
-    let instance = KimiCLI::create(
-        session,
-        CreateOptions {
-            config: Some(ConfigInput::Inline(Box::new(config))),
-            model_name: cli.model_name.clone(),
-            thinking,
-            yolo: cli.yolo,
-            agent_file,
-            mcp_configs,
-            skills_dir,
-            max_steps_per_turn: cli.max_steps_per_turn,
-            max_retries_per_step: cli.max_retries_per_step,
-            max_ralph_iterations: cli.max_ralph_iterations,
-        },
-    )
-    .await?;
-
-    let session = instance.session().clone();
     match cli.wire_transport {
-        WireTransport::Stdio => instance.run_wire_stdio().await?,
+        WireTransport::Stdio => {
+            let instance = KimiCLI::create(
+                default_session,
+                CreateOptions {
+                    config: Some(ConfigInput::Inline(Box::new(config))),
+                    model_name: cli.model_name.clone(),
+                    thinking,
+                    yolo: cli.yolo,
+                    agent_file,
+                    mcp_configs,
+                    skills_dir,
+                    max_steps_per_turn: cli.max_steps_per_turn,
+                    max_retries_per_step: cli.max_retries_per_step,
+                    max_ralph_iterations: cli.max_ralph_iterations,
+                },
+            )
+            .await?;
+
+            let session = instance.session().clone();
+            instance.run_wire_stdio().await?;
+            post_run(&session).await?;
+        }
         WireTransport::Ws => {
             let listen_addr = parse_wire_listen_addr(&cli.wire_listen)?;
-            instance.run_wire_ws(listen_addr, &cli.wire_path).await?;
+            let server = crate::wire::server::WireWsServer::new_multi(
+                crate::wire::server::WsSessionRuntimeOptions {
+                    work_dir,
+                    default_session_id: default_session.id.clone(),
+                    config,
+                    model_name: cli.model_name.clone(),
+                    thinking,
+                    yolo: cli.yolo,
+                    agent_file,
+                    mcp_configs,
+                    skills_dir,
+                    max_steps_per_turn: cli.max_steps_per_turn,
+                    max_retries_per_step: cli.max_retries_per_step,
+                    max_ralph_iterations: cli.max_ralph_iterations,
+                },
+                listen_addr,
+                &cli.wire_path,
+            )?;
+            server.serve().await?;
         }
     }
-    post_run(&session).await?;
     Ok(())
 }
 
@@ -518,40 +538,4 @@ async fn resolve_session(
     let session = Session::create(work_dir.clone(), None, None).await;
     info!("Created new session: {}", session.id);
     Ok(session)
-}
-
-async fn post_run(session: &Session) -> Result<()> {
-    let mut metadata = load_metadata().await;
-    let mut index = metadata.work_dirs.iter().position(|meta| {
-        meta.path == session.work_dir.to_string() && meta.kaos == session.work_dir_meta.kaos
-    });
-
-    if index.is_none() {
-        warn!(
-            "Work dir metadata missing when marking last session, recreating: {}",
-            session.work_dir.to_string_lossy()
-        );
-        let meta = session.work_dir_meta.clone();
-        metadata.work_dirs.push(meta);
-        index = Some(metadata.work_dirs.len() - 1);
-    }
-
-    let Some(idx) = index else {
-        save_metadata(&metadata).await;
-        return Ok(());
-    };
-
-    let meta = &mut metadata.work_dirs[idx];
-    if session.is_empty().await {
-        info!("Session {} has empty context, removing it", session.id);
-        session.delete().await;
-        if meta.last_session_id.as_deref() == Some(&session.id) {
-            meta.last_session_id = None;
-        }
-    } else {
-        meta.last_session_id = Some(session.id.clone());
-    }
-
-    save_metadata(&metadata).await;
-    Ok(())
 }

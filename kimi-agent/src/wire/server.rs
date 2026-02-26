@@ -1,8 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
+use axum::extract::Query;
 use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
@@ -11,14 +13,17 @@ use axum::{Router, http::StatusCode};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use kaos::KaosPath;
 use kosong::chat_provider::ChatProviderError;
 use kosong::tooling::tool_error;
 
+use crate::app::{ConfigInput, CreateOptions, KimiCLI};
+use crate::config::Config;
 use crate::constant::{NAME, VERSION};
+use crate::session::{Session, post_run as post_run_session};
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::{LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul};
 use crate::utils::{Queue, QueueShutDown};
@@ -59,6 +64,10 @@ impl WireRpcState {
 
     fn write_queue(&self) -> Queue<Value> {
         self.write_queue.clone()
+    }
+
+    fn session(&self) -> Session {
+        self.soul.runtime().session.clone()
     }
 
     async fn handle_json_line(&self, line: &str) {
@@ -621,9 +630,32 @@ impl WireServer {
 }
 
 pub struct WireWsServer {
-    rpc: WireRpcState,
+    runtime_mode: WsRuntimeMode,
     listen_addr: SocketAddr,
     path: String,
+    default_session_id: String,
+}
+
+#[derive(Clone)]
+pub struct WsSessionRuntimeOptions {
+    pub work_dir: KaosPath,
+    pub default_session_id: String,
+    pub config: Config,
+    pub model_name: Option<String>,
+    pub thinking: Option<bool>,
+    pub yolo: bool,
+    pub agent_file: Option<PathBuf>,
+    pub mcp_configs: Vec<Value>,
+    pub skills_dir: Option<KaosPath>,
+    pub max_steps_per_turn: Option<i64>,
+    pub max_retries_per_step: Option<i64>,
+    pub max_ralph_iterations: Option<i64>,
+}
+
+#[derive(Clone)]
+enum WsRuntimeMode {
+    SingleSoul(Arc<KimiSoul>),
+    SessionFactory(Arc<WsSessionRuntimeOptions>),
 }
 
 impl WireWsServer {
@@ -634,10 +666,29 @@ impl WireWsServer {
     ) -> anyhow::Result<Self> {
         let path = path.into();
         let path = normalize_ws_path(&path)?;
+        let default_session_id = normalize_session_id(&soul.runtime().session.id)?;
         Ok(Self {
-            rpc: WireRpcState::new(soul),
+            runtime_mode: WsRuntimeMode::SingleSoul(soul),
             listen_addr,
             path,
+            default_session_id,
+        })
+    }
+
+    pub fn new_multi(
+        options: WsSessionRuntimeOptions,
+        listen_addr: SocketAddr,
+        path: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let path = path.into();
+        let path = normalize_ws_path(&path)?;
+        let mut options = options;
+        options.default_session_id = normalize_session_id(&options.default_session_id)?;
+        Ok(Self {
+            runtime_mode: WsRuntimeMode::SessionFactory(Arc::new(options.clone())),
+            listen_addr,
+            path,
+            default_session_id: options.default_session_id,
         })
     }
 
@@ -657,74 +708,163 @@ impl WireWsServer {
             "Starting Wire server on websocket"
         );
 
-        let state = Arc::new(WsServerState::new(self.rpc.clone()));
+        let state = Arc::new(WsServerState::new(
+            self.runtime_mode.clone(),
+            self.default_session_id.clone(),
+        ));
         let app = Router::new()
             .route(&self.path, get(ws_upgrade_handler))
             .with_state(Arc::clone(&state));
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(wait_for_ws_shutdown(Arc::clone(&state)))
-            .await?;
-
-        self.rpc.shutdown().await;
+        axum::serve(listener, app).await?;
         Ok(())
     }
 }
 
 struct WsServerState {
-    rpc: WireRpcState,
-    active_client: AtomicBool,
-    shutdown: Notify,
+    runtime_mode: WsRuntimeMode,
+    default_session_id: String,
+    active_sessions: Mutex<HashSet<String>>,
 }
 
 impl WsServerState {
-    fn new(rpc: WireRpcState) -> Self {
+    fn new(runtime_mode: WsRuntimeMode, default_session_id: String) -> Self {
         Self {
-            rpc,
-            active_client: AtomicBool::new(false),
-            shutdown: Notify::new(),
+            runtime_mode,
+            default_session_id,
+            active_sessions: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn resolve_session_id(&self, requested_session_id: Option<&str>) -> anyhow::Result<String> {
+        match (&self.runtime_mode, requested_session_id) {
+            (WsRuntimeMode::SingleSoul(_), Some(requested)) => {
+                let normalized = normalize_session_id(requested)?;
+                if normalized != self.default_session_id {
+                    anyhow::bail!(
+                        "single-session websocket server only accepts session_id `{}`",
+                        self.default_session_id
+                    );
+                }
+                Ok(normalized)
+            }
+            (_, Some(requested)) => normalize_session_id(requested),
+            (_, None) => Ok(self.default_session_id.clone()),
+        }
+    }
+
+    fn lock_active_sessions(&self) -> MutexGuard<'_, HashSet<String>> {
+        match self.active_sessions.lock() {
+            Ok(guard) => guard,
+            Err(err) => err.into_inner(),
+        }
+    }
+
+    fn try_acquire_session(&self, session_id: &str) -> bool {
+        let mut sessions = self.lock_active_sessions();
+        if sessions.contains(session_id) {
+            return false;
+        }
+        sessions.insert(session_id.to_string());
+        true
+    }
+
+    fn release_session(&self, session_id: &str) {
+        self.lock_active_sessions().remove(session_id);
+    }
+
+    async fn create_rpc(&self, session_id: &str) -> anyhow::Result<WireRpcState> {
+        match &self.runtime_mode {
+            WsRuntimeMode::SingleSoul(soul) => Ok(WireRpcState::new(Arc::clone(soul))),
+            WsRuntimeMode::SessionFactory(options) => {
+                let session = match Session::find(options.work_dir.clone(), session_id).await {
+                    Some(session) => session,
+                    None => {
+                        Session::create(
+                            options.work_dir.clone(),
+                            Some(session_id.to_string()),
+                            None,
+                        )
+                        .await
+                    }
+                };
+
+                let cli = KimiCLI::create(
+                    session,
+                    CreateOptions {
+                        config: Some(ConfigInput::Inline(Box::new(options.config.clone()))),
+                        model_name: options.model_name.clone(),
+                        thinking: options.thinking,
+                        yolo: options.yolo,
+                        agent_file: options.agent_file.clone(),
+                        mcp_configs: options.mcp_configs.clone(),
+                        skills_dir: options.skills_dir.clone(),
+                        max_steps_per_turn: options.max_steps_per_turn,
+                        max_retries_per_step: options.max_retries_per_step,
+                        max_ralph_iterations: options.max_ralph_iterations,
+                    },
+                )
+                .await?;
+
+                Ok(WireRpcState::new(cli.soul()))
+            }
         }
     }
 }
 
-async fn wait_for_ws_shutdown(state: Arc<WsServerState>) {
-    state.shutdown.notified().await;
-}
-
 async fn ws_upgrade_handler(
     State(state): State<Arc<WsServerState>>,
+    Query(query): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if state
-        .active_client
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let session_id = match state.resolve_session_id(query.get("session_id").map(String::as_str)) {
+        Ok(session_id) => session_id,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    if !state.try_acquire_session(&session_id) {
         return (
             StatusCode::CONFLICT,
-            "Only one websocket client is allowed for this wire server.",
+            format!("Session `{session_id}` already has an active websocket client."),
         )
             .into_response();
     }
 
     let state_for_upgrade = Arc::clone(&state);
+    let session_id_for_upgrade = session_id.clone();
     let state_for_failed_upgrade = Arc::clone(&state);
+    let session_id_for_failed_upgrade = session_id.clone();
     ws.on_failed_upgrade(move |err| {
-        warn!("Wire websocket upgrade failed: {}", err);
-        state_for_failed_upgrade
-            .active_client
-            .store(false, Ordering::SeqCst);
+        warn!(
+            session_id = %session_id_for_failed_upgrade,
+            "Wire websocket upgrade failed: {}",
+            err
+        );
+        state_for_failed_upgrade.release_session(&session_id_for_failed_upgrade);
     })
     .on_upgrade(move |socket| async move {
-        handle_ws_socket(socket, state_for_upgrade).await;
+        handle_ws_socket(socket, state_for_upgrade, session_id_for_upgrade).await;
     })
     .into_response()
 }
 
-async fn handle_ws_socket(socket: WebSocket, state: Arc<WsServerState>) {
+async fn handle_ws_socket(socket: WebSocket, state: Arc<WsServerState>, session_id: String) {
+    let rpc = match state.create_rpc(&session_id).await {
+        Ok(rpc) => rpc,
+        Err(err) => {
+            error!(
+                session_id = %session_id,
+                "Failed to create wire session runtime: {}",
+                err
+            );
+            state.release_session(&session_id);
+            return;
+        }
+    };
+
     let (mut sender, mut receiver) = socket.split();
 
-    let write_queue = state.rpc.write_queue();
+    let write_queue = rpc.write_queue();
     let write_task = tokio::spawn(async move {
         loop {
             let msg = match write_queue.get().await {
@@ -753,32 +893,41 @@ async fn handle_ws_socket(socket: WebSocket, state: Arc<WsServerState>) {
     while let Some(frame) = receiver.next().await {
         match frame {
             Ok(WsMessage::Text(text)) => {
-                state.rpc.handle_json_line(text.as_str()).await;
+                rpc.handle_json_line(text.as_str()).await;
             }
             Ok(WsMessage::Binary(binary)) => match std::str::from_utf8(binary.as_ref()) {
-                Ok(text) => state.rpc.handle_json_line(text).await,
+                Ok(text) => rpc.handle_json_line(text).await,
                 Err(_) => {
-                    state
-                        .rpc
-                        .send_error_nullable(error_codes::INVALID_REQUEST, "Invalid request", None)
+                    rpc.send_error_nullable(error_codes::INVALID_REQUEST, "Invalid request", None)
                         .await;
                 }
             },
             Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
             Ok(WsMessage::Close(_)) => {
-                info!("websocket closed by client, Wire server exiting");
+                info!(session_id = %session_id, "websocket closed by client");
                 break;
             }
             Err(err) => {
-                error!("Wire websocket read loop error: {:?}", err);
+                error!(
+                    session_id = %session_id,
+                    "Wire websocket read loop error: {:?}",
+                    err
+                );
                 break;
             }
         }
     }
 
-    // Stop accepting new connections before tearing down RPC state.
-    state.shutdown.notify_waiters();
-    state.rpc.shutdown().await;
+    let session = rpc.session();
+    rpc.shutdown().await;
+    if let Err(err) = post_run_session(&session).await {
+        warn!(
+            session_id = %session_id,
+            "Failed to finalize session metadata after websocket close: {}",
+            err
+        );
+    }
+    state.release_session(&session_id);
     let _ = write_task.await;
 }
 
@@ -792,6 +941,17 @@ fn normalize_ws_path(path: &str) -> anyhow::Result<String> {
     }
     if normalized.contains('?') || normalized.contains('#') {
         anyhow::bail!("wire path cannot contain query or fragment");
+    }
+    Ok(normalized.to_string())
+}
+
+fn normalize_session_id(session_id: &str) -> anyhow::Result<String> {
+    let normalized = session_id.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("session_id cannot be empty");
+    }
+    if normalized.contains('/') || normalized.contains('\\') {
+        anyhow::bail!("session_id cannot contain path separators");
     }
     Ok(normalized.to_string())
 }
@@ -856,7 +1016,7 @@ async fn request_tool_call(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_ws_path;
+    use super::{normalize_session_id, normalize_ws_path};
 
     #[test]
     fn normalize_ws_path_accepts_valid_path() {
@@ -870,5 +1030,19 @@ mod tests {
         assert!(normalize_ws_path("wire").is_err());
         assert!(normalize_ws_path("/wire?x=1").is_err());
         assert!(normalize_ws_path("/wire#frag").is_err());
+    }
+
+    #[test]
+    fn normalize_session_id_accepts_valid_session_id() {
+        assert_eq!(normalize_session_id("abc").unwrap(), "abc");
+        assert_eq!(normalize_session_id(" abc-def ").unwrap(), "abc-def");
+    }
+
+    #[test]
+    fn normalize_session_id_rejects_invalid_session_id() {
+        assert!(normalize_session_id("").is_err());
+        assert!(normalize_session_id("   ").is_err());
+        assert!(normalize_session_id("a/b").is_err());
+        assert!(normalize_session_id("a\\b").is_err());
     }
 }
