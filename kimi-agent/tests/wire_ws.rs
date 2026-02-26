@@ -1,0 +1,418 @@
+use std::path::Path;
+use std::time::Duration;
+
+use futures::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use tokio::sync::Mutex;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+
+use kaos::KaosPath;
+use kimi_agent::app::{ConfigInput, CreateOptions, KimiCLI};
+use kimi_agent::config::{LLMModel, LLMProvider, ProviderType, get_default_config};
+use kimi_agent::constant::{NAME, VERSION};
+use kimi_agent::session::Session;
+use kimi_agent::wire::protocol::WIRE_PROTOCOL_VERSION;
+use kimi_agent::wire::server::WireWsServer;
+
+static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        // SAFETY: tests serialize env access via ENV_LOCK to avoid races.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = &self.prev {
+            // SAFETY: tests serialize env access via ENV_LOCK to avoid races.
+            unsafe {
+                std::env::set_var(self.key, prev);
+            }
+        } else {
+            // SAFETY: tests serialize env access via ENV_LOCK to avoid races.
+            unsafe {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
+
+fn set_home_env(path: &Path) -> Vec<EnvGuard> {
+    let share_dir = path.join(".kimi");
+    vec![
+        EnvGuard::set("HOME", path.to_str().expect("home path")),
+        EnvGuard::set("USERPROFILE", path.to_str().expect("home path")),
+        EnvGuard::set(
+            "KIMI_SHARE_DIR",
+            share_dir.to_str().expect("share dir path"),
+        ),
+    ]
+}
+
+async fn connect_ws_with_retry(
+    url: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut last_err = String::new();
+    for _ in 0..50 {
+        match connect_async(url).await {
+            Ok((stream, _resp)) => return stream,
+            Err(err) => {
+                last_err = err.to_string();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    panic!("failed to connect websocket {url}: {last_err}");
+}
+
+async fn recv_json(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Value {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("timed out waiting for ws frame")
+            .expect("ws stream closed")
+            .expect("ws frame error");
+        match frame {
+            Message::Text(text) => {
+                return serde_json::from_str(text.as_str()).expect("valid json text frame");
+            }
+            Message::Binary(bin) => {
+                return serde_json::from_slice(&bin).expect("valid json binary frame");
+            }
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+            Message::Close(close) => panic!("unexpected ws close frame: {close:?}"),
+        }
+    }
+}
+
+async fn create_scripted_cli(
+    scripts: &[&str],
+    home_dir: &TempDir,
+    work_dir: &TempDir,
+) -> (KimiCLI, Vec<EnvGuard>) {
+    let mut env = set_home_env(home_dir.path());
+    let scripts_path = home_dir.path().join("scripts.json");
+    let scripts_json: Vec<String> = scripts.iter().map(|script| script.to_string()).collect();
+    std::fs::write(
+        &scripts_path,
+        serde_json::to_string(&scripts_json).expect("serialize scripts"),
+    )
+    .expect("write scripted echo file");
+    env.push(EnvGuard::set(
+        "KIMI_SCRIPTED_ECHO_SCRIPTS",
+        scripts_path.to_str().expect("scripts path"),
+    ));
+
+    let mut config = get_default_config();
+    config.default_model = "scripted".to_string();
+    config.models.insert(
+        "scripted".to_string(),
+        LLMModel {
+            provider: "scripted_provider".to_string(),
+            model: "scripted_echo".to_string(),
+            max_context_size: 100_000,
+            capabilities: None,
+        },
+    );
+    config.providers.insert(
+        "scripted_provider".to_string(),
+        LLMProvider {
+            provider_type: ProviderType::ScriptedEcho,
+            base_url: String::new(),
+            api_key: String::new(),
+            env: None,
+            custom_headers: None,
+        },
+    );
+
+    let work_path = KaosPath::from(work_dir.path().to_path_buf());
+    let session = Session::create(work_path, None, None).await;
+    let cli = KimiCLI::create(
+        session,
+        CreateOptions {
+            config: Some(ConfigInput::Inline(Box::new(config))),
+            model_name: None,
+            thinking: Some(false),
+            yolo: true,
+            agent_file: None,
+            mcp_configs: vec![],
+            skills_dir: None,
+            max_steps_per_turn: None,
+            max_retries_per_step: None,
+            max_ralph_iterations: None,
+        },
+    )
+    .await
+    .expect("create kimi cli");
+
+    (cli, env)
+}
+
+#[tokio::test]
+async fn test_wire_ws_initialize_and_prompt() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let work_dir = TempDir::new().expect("work dir");
+    let (cli, _env) = create_scripted_cli(&["text: hello from ws"], &home_dir, &work_dir).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(cli.soul(), listen_addr, "/wire").expect("wire ws server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
+
+    let mut ws = connect_ws_with_retry(&format!("ws://{listen_addr}/wire")).await;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": { "protocol_version": WIRE_PROTOCOL_VERSION }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send initialize");
+
+    let init_resp = recv_json(&mut ws).await;
+    assert_eq!(
+        init_resp.get("id"),
+        Some(&Value::String("init".to_string()))
+    );
+    assert_eq!(
+        init_resp
+            .get("result")
+            .and_then(|v| v.get("protocol_version"))
+            .and_then(Value::as_str),
+        Some(WIRE_PROTOCOL_VERSION)
+    );
+    assert_eq!(
+        init_resp
+            .get("result")
+            .and_then(|v| v.get("server"))
+            .and_then(|v| v.get("name"))
+            .and_then(Value::as_str),
+        Some(NAME)
+    );
+    assert_eq!(
+        init_resp
+            .get("result")
+            .and_then(|v| v.get("server"))
+            .and_then(|v| v.get("version"))
+            .and_then(Value::as_str),
+        Some(VERSION)
+    );
+
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-1",
+            "method": "prompt",
+            "params": { "user_input": "hello" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send prompt");
+
+    let mut saw_event = false;
+    let mut prompt_resp: Option<Value> = None;
+    for _ in 0..200 {
+        let msg = recv_json(&mut ws).await;
+        if msg.get("method").and_then(Value::as_str) == Some("event") {
+            saw_event = true;
+        }
+        if msg.get("id").and_then(Value::as_str) == Some("prompt-1") {
+            prompt_resp = Some(msg);
+            break;
+        }
+    }
+
+    assert!(saw_event, "expected at least one event message");
+    let prompt_resp = prompt_resp.expect("prompt response");
+    assert_eq!(
+        prompt_resp
+            .get("result")
+            .and_then(|v| v.get("status"))
+            .and_then(Value::as_str),
+        Some("finished")
+    );
+
+    ws.close(None).await.expect("close ws");
+    let server_result = tokio::time::timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server task timeout")
+        .expect("server task join");
+    assert!(
+        server_result.is_ok(),
+        "server returned error: {server_result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_wire_ws_external_tool_request_roundtrip() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let work_dir = TempDir::new().expect("work dir");
+    let (cli, _env) = create_scripted_cli(
+        &[
+            r#"tool_call: {"id":"tc-1","name":"open_in_ide","arguments":"{\"path\":\"/tmp/a\"}"}"#,
+            "text: tool handled",
+        ],
+        &home_dir,
+        &work_dir,
+    )
+    .await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(cli.soul(), listen_addr, "/wire").expect("wire ws server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
+
+    let mut ws = connect_ws_with_retry(&format!("ws://{listen_addr}/wire")).await;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": {
+                "protocol_version": WIRE_PROTOCOL_VERSION,
+                "external_tools": [
+                    {
+                        "name": "open_in_ide",
+                        "description": "Open file in IDE",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" }
+                            },
+                            "required": ["path"],
+                            "additionalProperties": false
+                        }
+                    }
+                ]
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send initialize");
+
+    let init_resp = recv_json(&mut ws).await;
+    assert_eq!(
+        init_resp.get("id"),
+        Some(&Value::String("init".to_string()))
+    );
+    assert_eq!(
+        init_resp
+            .get("result")
+            .and_then(|v| v.get("external_tools"))
+            .and_then(|v| v.get("accepted"))
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+        Some(vec!["open_in_ide"])
+    );
+
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-1",
+            "method": "prompt",
+            "params": { "user_input": "use tool" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send prompt");
+
+    let mut saw_tool_request = false;
+    let mut prompt_resp: Option<Value> = None;
+    for _ in 0..200 {
+        let msg = recv_json(&mut ws).await;
+        if msg.get("method").and_then(Value::as_str) == Some("request") {
+            let request_id = msg
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("request id")
+                .to_string();
+            let payload = msg
+                .get("params")
+                .and_then(|v| v.get("payload"))
+                .expect("request payload");
+            let tool_call_id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("tool call id")
+                .to_string();
+            saw_tool_request = true;
+
+            ws.send(Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "tool_call_id": tool_call_id,
+                        "return_value": {
+                            "is_error": false,
+                            "output": "ok",
+                            "message": "ok",
+                            "display": []
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send tool result");
+        }
+        if msg.get("id").and_then(Value::as_str) == Some("prompt-1") {
+            prompt_resp = Some(msg);
+            break;
+        }
+    }
+
+    assert!(saw_tool_request, "expected tool call request over wire ws");
+    let prompt_resp = prompt_resp.expect("prompt response");
+    assert_eq!(
+        prompt_resp
+            .get("result")
+            .and_then(|v| v.get("status"))
+            .and_then(Value::as_str),
+        Some("finished")
+    );
+
+    ws.close(None).await.expect("close ws");
+    let server_result = tokio::time::timeout(Duration::from_secs(10), server_task)
+        .await
+        .expect("server task timeout")
+        .expect("server task join");
+    assert!(
+        server_result.is_ok(),
+        "server returned error: {server_result:?}"
+    );
+}

@@ -49,6 +49,7 @@ tempfile = "3"
 
 kaos = { path = "../kaos" }
 kosong = { path = "../kosong" }
+axum = { version = "0.8", features = ["ws"] }
 
 [dev-dependencies]
 serde_json.workspace = true
@@ -56,3 +57,4 @@ tokio.workspace = true
 wiremock = "0.6"
 filetime = "0.2"
 rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
+tokio-tungstenite = "0.28"

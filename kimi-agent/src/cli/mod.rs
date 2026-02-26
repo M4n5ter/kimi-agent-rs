@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -106,6 +107,30 @@ pub struct Cli {
     wire: bool,
 
     #[arg(
+        long = "wire-transport",
+        value_enum,
+        default_value = "stdio",
+        help = "Wire transport to use. Default: stdio."
+    )]
+    wire_transport: WireTransport,
+
+    #[arg(
+        long = "wire-listen",
+        value_name = "ADDR",
+        default_value = "127.0.0.1:8765",
+        help = "Listen address for websocket wire transport. Used only when --wire-transport ws."
+    )]
+    wire_listen: String,
+
+    #[arg(
+        long = "wire-path",
+        value_name = "PATH",
+        default_value = "/wire",
+        help = "HTTP path for websocket wire transport. Used only when --wire-transport ws."
+    )]
+    wire_path: String,
+
+    #[arg(
         long = "agent",
         value_enum,
         help = "Builtin agent specification to use. Default: builtin default agent."
@@ -166,6 +191,12 @@ pub struct Cli {
 enum AgentKind {
     Default,
     Okabe,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum WireTransport {
+    Stdio,
+    Ws,
 }
 
 #[derive(Subcommand, Debug)]
@@ -255,7 +286,13 @@ pub async fn run() -> Result<()> {
     .await?;
 
     let session = instance.session().clone();
-    instance.run_wire_stdio().await?;
+    match cli.wire_transport {
+        WireTransport::Stdio => instance.run_wire_stdio().await?,
+        WireTransport::Ws => {
+            let listen_addr = parse_wire_listen_addr(&cli.wire_listen)?;
+            instance.run_wire_ws(listen_addr, &cli.wire_path).await?;
+        }
+    }
     post_run(&session).await?;
     Ok(())
 }
@@ -388,6 +425,11 @@ async fn validate_cli_args(cli: &Cli) -> Result<()> {
         anyhow::bail!("max-ralph-iterations must be >= -1.");
     }
 
+    if matches!(cli.wire_transport, WireTransport::Ws) {
+        parse_wire_listen_addr(&cli.wire_listen)?;
+        validate_wire_path(&cli.wire_path)?;
+    }
+
     Ok(())
 }
 
@@ -426,6 +468,25 @@ fn resolve_thinking(thinking: bool, no_thinking: bool) -> Result<Option<bool>> {
     } else {
         Ok(None)
     }
+}
+
+fn parse_wire_listen_addr(addr: &str) -> Result<SocketAddr> {
+    addr.parse()
+        .with_context(|| format!("Invalid --wire-listen address: {addr}"))
+}
+
+fn validate_wire_path(path: &str) -> Result<()> {
+    let path = path.trim();
+    if path.is_empty() {
+        anyhow::bail!("--wire-path cannot be empty.");
+    }
+    if !path.starts_with('/') {
+        anyhow::bail!("--wire-path must start with '/'.");
+    }
+    if path.contains('?') || path.contains('#') {
+        anyhow::bail!("--wire-path cannot contain query or fragment.");
+    }
+    Ok(())
 }
 
 async fn resolve_session(

@@ -1,8 +1,17 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use axum::extract::State;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Router, http::StatusCode};
+use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -13,16 +22,15 @@ use crate::constant::{NAME, VERSION};
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::{LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul};
 use crate::utils::{Queue, QueueShutDown};
-use crate::wire::{
-    ApprovalRequest, ApprovalResponse, ToolCallRequest, ToolResult, Wire, WireMessage,
-};
-
 use crate::wire::jsonrpc::{
     InitializeParams, JsonRpcErrorObject, JsonRpcErrorResponse, JsonRpcErrorResponseNullableId,
     JsonRpcMessage, JsonRpcSuccessResponse, PromptParams, build_event_message,
     build_request_message, error_codes, statuses,
 };
 use crate::wire::protocol::WIRE_PROTOCOL_VERSION;
+use crate::wire::{
+    ApprovalRequest, ApprovalResponse, ToolCallRequest, ToolResult, Wire, WireMessage,
+};
 
 const STDIO_BUFFER_LIMIT: usize = 100 * 1024 * 1024;
 
@@ -31,17 +39,16 @@ enum PendingRequest {
     ToolCall(ToolCallRequest),
 }
 
-pub struct WireServer {
+#[derive(Clone)]
+struct WireRpcState {
     soul: Arc<KimiSoul>,
     write_queue: Queue<Value>,
     pending: Arc<tokio::sync::Mutex<HashMap<String, PendingRequest>>>,
     cancel_token: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
 }
 
-pub type WireOverStdio = WireServer;
-
-impl WireServer {
-    pub fn new(soul: Arc<KimiSoul>) -> Self {
+impl WireRpcState {
+    fn new(soul: Arc<KimiSoul>) -> Self {
         Self {
             soul,
             write_queue: Queue::new(),
@@ -50,144 +57,101 @@ impl WireServer {
         }
     }
 
-    pub async fn serve(&mut self) -> anyhow::Result<()> {
-        info!("Starting Wire server on stdio");
-        let stdin = tokio::io::stdin();
-        let stdout = tokio::io::stdout();
-        let mut reader = BufReader::with_capacity(STDIO_BUFFER_LIMIT, stdin);
-        let mut writer = stdout;
+    fn write_queue(&self) -> Queue<Value> {
+        self.write_queue.clone()
+    }
 
-        let write_queue = self.write_queue.clone();
-        let write_task = tokio::spawn(async move {
-            loop {
-                let msg = match write_queue.get().await {
-                    Ok(msg) => msg,
-                    Err(_) => {
-                        debug!("Send queue shut down, stopping Wire server write loop");
-                        break;
-                    }
-                };
-                let line = match serde_json::to_string(&msg) {
-                    Ok(line) => line,
-                    Err(err) => {
-                        error!("Wire server write loop error: {:?}", err);
-                        continue;
-                    }
-                };
-                if let Err(err) = writer.write_all(line.as_bytes()).await {
-                    error!("Wire server write loop error: {:?}", err);
-                    break;
-                }
-                if let Err(err) = writer.write_all(b"\n").await {
-                    error!("Wire server write loop error: {:?}", err);
-                    break;
-                }
-                let _ = writer.flush().await;
-            }
-        });
+    async fn handle_json_line(&self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
 
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            let n = reader.read_until(b'\n', &mut buf).await?;
-            if n == 0 {
-                info!("stdin closed, Wire server exiting");
-                break;
-            }
-            let line = String::from_utf8_lossy(&buf);
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let msg_json: Value = match serde_json::from_str(line) {
-                Ok(value) => value,
-                Err(_) => {
-                    error!("Invalid JSON line: {}", line);
-                    self.send_error_nullable(error_codes::PARSE_ERROR, "Invalid JSON format", None)
-                        .await;
-                    continue;
-                }
-            };
-            let response_hint = msg_json.get("method").is_none() && msg_json.get("id").is_some();
-            let msg: JsonRpcMessage = match serde_json::from_value(msg_json.clone()) {
-                Ok(msg) => msg,
-                Err(err) => {
-                    if response_hint {
-                        error!("Invalid JSON-RPC response: {:?}", err);
-                    } else {
-                        error!("Invalid JSON-RPC message: {:?}", err);
-                    }
-                    let (code, message) = if response_hint {
-                        (error_codes::INVALID_REQUEST, "Invalid response")
-                    } else {
-                        (error_codes::INVALID_REQUEST, "Invalid request")
-                    };
-                    self.send_error_nullable(code, message, None).await;
-                    continue;
-                }
-            };
-
-            if let Some(version) = &msg.jsonrpc
-                && version != "2.0"
-            {
-                self.send_error_nullable(error_codes::INVALID_REQUEST, "Invalid request", None)
+        let msg_json: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => {
+                error!("Invalid JSON line: {}", line);
+                self.send_error_nullable(error_codes::PARSE_ERROR, "Invalid JSON format", None)
                     .await;
-                continue;
+                return;
             }
+        };
 
-            if msg.is_response() {
-                if msg.result.is_none() && msg.error.is_none() {
-                    self.send_error_nullable(
-                        error_codes::INVALID_REQUEST,
-                        "Invalid response",
-                        None,
+        self.handle_json_value(msg_json).await;
+    }
+
+    async fn handle_json_value(&self, msg_json: Value) {
+        let response_hint = msg_json.get("method").is_none() && msg_json.get("id").is_some();
+        let msg: JsonRpcMessage = match serde_json::from_value(msg_json.clone()) {
+            Ok(msg) => msg,
+            Err(err) => {
+                if response_hint {
+                    error!("Invalid JSON-RPC response: {:?}", err);
+                } else {
+                    error!("Invalid JSON-RPC message: {:?}", err);
+                }
+                let (code, message) = if response_hint {
+                    (error_codes::INVALID_REQUEST, "Invalid response")
+                } else {
+                    (error_codes::INVALID_REQUEST, "Invalid request")
+                };
+                self.send_error_nullable(code, message, None).await;
+                return;
+            }
+        };
+
+        if let Some(version) = &msg.jsonrpc
+            && version != "2.0"
+        {
+            self.send_error_nullable(error_codes::INVALID_REQUEST, "Invalid request", None)
+                .await;
+            return;
+        }
+
+        if msg.is_response() {
+            if msg.result.is_none() && msg.error.is_none() {
+                self.send_error_nullable(error_codes::INVALID_REQUEST, "Invalid response", None)
+                    .await;
+                return;
+            }
+            self.handle_response(&msg).await;
+            return;
+        }
+
+        let method = match msg.method.as_deref() {
+            Some(method) => method.to_string(),
+            None => {
+                error!("Invalid JSON-RPC inbound message: {:?}", msg);
+                if let Some(id) = msg.id.clone() {
+                    self.send_error(
+                        id,
+                        error_codes::METHOD_NOT_FOUND,
+                        "Unexpected method received: None",
                     )
                     .await;
-                    continue;
                 }
-                self.handle_response(&msg).await;
-                continue;
+                return;
             }
+        };
 
-            let method = match msg.method.as_deref() {
-                Some(method) => method.to_string(),
-                None => {
-                    error!("Invalid JSON-RPC inbound message: {:?}", msg);
-                    if let Some(id) = msg.id.clone() {
-                        self.send_error(
-                            id,
-                            error_codes::METHOD_NOT_FOUND,
-                            "Unexpected method received: None",
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-            };
-
-            match method.as_str() {
-                "initialize" => self.handle_initialize(msg).await,
-                "prompt" => self.handle_prompt(msg).await,
-                "cancel" => self.handle_cancel(msg).await,
-                _ => {
-                    if let Some(id) = msg.id.clone() {
-                        self.send_error(
-                            id,
-                            error_codes::METHOD_NOT_FOUND,
-                            format!("Unexpected method received: {method}"),
-                        )
-                        .await;
-                    }
+        match method.as_str() {
+            "initialize" => self.handle_initialize(msg).await,
+            "prompt" => self.handle_prompt(msg).await,
+            "cancel" => self.handle_cancel(msg).await,
+            _ => {
+                if let Some(id) = msg.id.clone() {
+                    self.send_error(
+                        id,
+                        error_codes::METHOD_NOT_FOUND,
+                        format!("Unexpected method received: {method}"),
+                    )
+                    .await;
                 }
             }
         }
-
-        self.shutdown().await;
-        let _ = write_task.await;
-        Ok(())
     }
 
-    async fn handle_initialize(&mut self, msg: JsonRpcMessage) {
+    async fn handle_initialize(&self, msg: JsonRpcMessage) {
         let Some(id) = msg.id.clone() else {
             return;
         };
@@ -270,7 +234,7 @@ impl WireServer {
             .put_nowait(serde_json::to_value(response).unwrap_or(Value::Null));
     }
 
-    async fn handle_prompt(&mut self, msg: JsonRpcMessage) {
+    async fn handle_prompt(&self, msg: JsonRpcMessage) {
         let Some(id) = msg.id.clone() else {
             return;
         };
@@ -421,7 +385,7 @@ impl WireServer {
         });
     }
 
-    async fn handle_cancel(&mut self, msg: JsonRpcMessage) {
+    async fn handle_cancel(&self, msg: JsonRpcMessage) {
         let Some(id) = msg.id.clone() else {
             return;
         };
@@ -446,7 +410,7 @@ impl WireServer {
             .put_nowait(serde_json::to_value(response).unwrap_or(Value::Null));
     }
 
-    async fn handle_response(&mut self, msg: &JsonRpcMessage) {
+    async fn handle_response(&self, msg: &JsonRpcMessage) {
         let Some(id) = msg.id.clone() else {
             return;
         };
@@ -589,6 +553,249 @@ impl WireServer {
     }
 }
 
+pub struct WireServer {
+    rpc: WireRpcState,
+}
+
+pub type WireOverStdio = WireServer;
+
+impl WireServer {
+    pub fn new(soul: Arc<KimiSoul>) -> Self {
+        Self {
+            rpc: WireRpcState::new(soul),
+        }
+    }
+
+    pub async fn serve(&self) -> anyhow::Result<()> {
+        info!("Starting Wire server on stdio");
+        let stdin = tokio::io::stdin();
+        let stdout = tokio::io::stdout();
+        let mut reader = BufReader::with_capacity(STDIO_BUFFER_LIMIT, stdin);
+        let mut writer = stdout;
+
+        let write_queue = self.rpc.write_queue();
+        let write_task = tokio::spawn(async move {
+            loop {
+                let msg = match write_queue.get().await {
+                    Ok(msg) => msg,
+                    Err(_) => {
+                        debug!("Send queue shut down, stopping Wire server write loop");
+                        break;
+                    }
+                };
+                let line = match serde_json::to_string(&msg) {
+                    Ok(line) => line,
+                    Err(err) => {
+                        error!("Wire server write loop error: {:?}", err);
+                        continue;
+                    }
+                };
+                if let Err(err) = writer.write_all(line.as_bytes()).await {
+                    error!("Wire server write loop error: {:?}", err);
+                    break;
+                }
+                if let Err(err) = writer.write_all(b"\n").await {
+                    error!("Wire server write loop error: {:?}", err);
+                    break;
+                }
+                let _ = writer.flush().await;
+            }
+        });
+
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf).await?;
+            if n == 0 {
+                info!("stdin closed, Wire server exiting");
+                break;
+            }
+            let line = String::from_utf8_lossy(&buf);
+            self.rpc.handle_json_line(&line).await;
+        }
+
+        self.rpc.shutdown().await;
+        let _ = write_task.await;
+        Ok(())
+    }
+}
+
+pub struct WireWsServer {
+    rpc: WireRpcState,
+    listen_addr: SocketAddr,
+    path: String,
+}
+
+impl WireWsServer {
+    pub fn new(
+        soul: Arc<KimiSoul>,
+        listen_addr: SocketAddr,
+        path: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let path = path.into();
+        let path = normalize_ws_path(&path)?;
+        Ok(Self {
+            rpc: WireRpcState::new(soul),
+            listen_addr,
+            path,
+        })
+    }
+
+    pub async fn serve(&self) -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind(self.listen_addr).await?;
+        self.serve_with_listener(listener).await
+    }
+
+    pub async fn serve_with_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+    ) -> anyhow::Result<()> {
+        let bound_addr = listener.local_addr()?;
+        info!(
+            address = %bound_addr,
+            path = %self.path,
+            "Starting Wire server on websocket"
+        );
+
+        let state = Arc::new(WsServerState::new(self.rpc.clone()));
+        let app = Router::new()
+            .route(&self.path, get(ws_upgrade_handler))
+            .with_state(Arc::clone(&state));
+
+        axum::serve(listener, app)
+            .with_graceful_shutdown(wait_for_ws_shutdown(Arc::clone(&state)))
+            .await?;
+
+        self.rpc.shutdown().await;
+        Ok(())
+    }
+}
+
+struct WsServerState {
+    rpc: WireRpcState,
+    active_client: AtomicBool,
+    shutdown: Notify,
+}
+
+impl WsServerState {
+    fn new(rpc: WireRpcState) -> Self {
+        Self {
+            rpc,
+            active_client: AtomicBool::new(false),
+            shutdown: Notify::new(),
+        }
+    }
+}
+
+async fn wait_for_ws_shutdown(state: Arc<WsServerState>) {
+    state.shutdown.notified().await;
+}
+
+async fn ws_upgrade_handler(
+    State(state): State<Arc<WsServerState>>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if state
+        .active_client
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            "Only one websocket client is allowed for this wire server.",
+        )
+            .into_response();
+    }
+
+    let state_for_upgrade = Arc::clone(&state);
+    let state_for_failed_upgrade = Arc::clone(&state);
+    ws.on_failed_upgrade(move |err| {
+        warn!("Wire websocket upgrade failed: {}", err);
+        state_for_failed_upgrade
+            .active_client
+            .store(false, Ordering::SeqCst);
+    })
+    .on_upgrade(move |socket| async move {
+        handle_ws_socket(socket, state_for_upgrade).await;
+    })
+    .into_response()
+}
+
+async fn handle_ws_socket(socket: WebSocket, state: Arc<WsServerState>) {
+    let (mut sender, mut receiver) = socket.split();
+
+    let write_queue = state.rpc.write_queue();
+    let write_task = tokio::spawn(async move {
+        loop {
+            let msg = match write_queue.get().await {
+                Ok(msg) => msg,
+                Err(_) => {
+                    debug!("Send queue shut down, stopping websocket write loop");
+                    break;
+                }
+            };
+
+            let line = match serde_json::to_string(&msg) {
+                Ok(line) => line,
+                Err(err) => {
+                    error!("Wire websocket write loop error: {:?}", err);
+                    continue;
+                }
+            };
+
+            if let Err(err) = sender.send(WsMessage::Text(line.into())).await {
+                error!("Wire websocket write loop error: {:?}", err);
+                break;
+            }
+        }
+    });
+
+    while let Some(frame) = receiver.next().await {
+        match frame {
+            Ok(WsMessage::Text(text)) => {
+                state.rpc.handle_json_line(text.as_str()).await;
+            }
+            Ok(WsMessage::Binary(binary)) => match std::str::from_utf8(binary.as_ref()) {
+                Ok(text) => state.rpc.handle_json_line(text).await,
+                Err(_) => {
+                    state
+                        .rpc
+                        .send_error_nullable(error_codes::INVALID_REQUEST, "Invalid request", None)
+                        .await;
+                }
+            },
+            Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
+            Ok(WsMessage::Close(_)) => {
+                info!("websocket closed by client, Wire server exiting");
+                break;
+            }
+            Err(err) => {
+                error!("Wire websocket read loop error: {:?}", err);
+                break;
+            }
+        }
+    }
+
+    // Stop accepting new connections before tearing down RPC state.
+    state.shutdown.notify_waiters();
+    state.rpc.shutdown().await;
+    let _ = write_task.await;
+}
+
+fn normalize_ws_path(path: &str) -> anyhow::Result<String> {
+    let normalized = path.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("wire path cannot be empty");
+    }
+    if !normalized.starts_with('/') {
+        anyhow::bail!("wire path must start with '/'");
+    }
+    if normalized.contains('?') || normalized.contains('#') {
+        anyhow::bail!("wire path cannot contain query or fragment");
+    }
+    Ok(normalized.to_string())
+}
+
 async fn stream_wire_messages(
     write_queue: Queue<Value>,
     pending: Arc<tokio::sync::Mutex<HashMap<String, PendingRequest>>>,
@@ -645,4 +852,23 @@ async fn request_tool_call(
     let out = build_request_message(msg_id, WireMessage::ToolCallRequest(request.clone()));
     let _ = write_queue.put_nowait(serde_json::to_value(out).unwrap_or(Value::Null));
     let _ = request.wait().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_ws_path;
+
+    #[test]
+    fn normalize_ws_path_accepts_valid_path() {
+        assert_eq!(normalize_ws_path("/wire").unwrap(), "/wire");
+        assert_eq!(normalize_ws_path(" /api/ws ").unwrap(), "/api/ws");
+    }
+
+    #[test]
+    fn normalize_ws_path_rejects_invalid_path() {
+        assert!(normalize_ws_path("").is_err());
+        assert!(normalize_ws_path("wire").is_err());
+        assert!(normalize_ws_path("/wire?x=1").is_err());
+        assert!(normalize_ws_path("/wire#frag").is_err());
+    }
 }
