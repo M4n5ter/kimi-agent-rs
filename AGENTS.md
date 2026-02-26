@@ -44,7 +44,7 @@ version number must not diverge from the corresponding Python release.
 
 - Three crates: `kimi-agent`, `kosong`, `kaos`.
 - Rust edition 2024, async runtime `tokio`, serde, anyhow/thiserror, clap, reqwest.
-- Only WireOverStdio UI; no Shell/Print/ACP UI.
+- Only Wire transports (stdio/WebSocket); no Shell/Print/ACP UI.
 - Full parity with Python for data formats and wire behavior.
 - Tests are ported for core runtime/tools/wire; UI-only tests are omitted.
 
@@ -77,7 +77,7 @@ version number must not diverge from the corresponding Python release.
 - `kimi-agent/src/cli/` - CLI parsing and subcommands (`info`, `mcp`).
 - `kimi-agent/src/app.rs` - `KimiCLI::create` and runtime wiring.
 - `kimi-agent/src/soul/` - core agent loop, approvals, compaction, context, toolset.
-- `kimi-agent/src/wire/` - wire types, serde, WireOverStdio JSON-RPC server.
+- `kimi-agent/src/wire/` - wire types, serde, JSON-RPC wire servers (stdio/WebSocket).
 - `kimi-agent/src/tools/` - built-in tools (shell/file/web/todo/multiagent/dmail/think).
 - `kimi-agent/src/skill/` - skills + flow parsing (mermaid/d2).
 - `kimi-agent/src/config.rs`, `metadata.rs`, `session.rs`, `share.rs` - persistence.
@@ -85,7 +85,7 @@ version number must not diverge from the corresponding Python release.
 
 ## Wire protocol and data compatibility
 
-- Wire protocol version `1.1` with JSON-RPC over stdio.
+- Wire protocol version `1.2` with JSON-RPC payload compatibility across stdio/WebSocket transports.
 - Data layout under `~/.kimi` must match Python:
   - `config.toml`, `kimi.json`, session directories, context JSONL, wire JSONL.
 - `Message.content` string/parts serde rules must match Python exactly.

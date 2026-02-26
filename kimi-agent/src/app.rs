@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use crate::soul::context::Context;
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::run_soul;
 use crate::wire::WireMessage;
-use crate::wire::server::WireServer;
+use crate::wire::server::{WireServer, WireWsServer};
 
 pub struct KimiCLI {
     soul: Arc<KimiSoul>,
@@ -214,7 +215,12 @@ impl KimiCLI {
     }
 
     pub async fn run_wire_stdio(&self) -> anyhow::Result<()> {
-        let mut server = WireServer::new(Arc::clone(&self.soul));
+        let server = WireServer::new(Arc::clone(&self.soul));
+        server.serve().await
+    }
+
+    pub async fn run_wire_ws(&self, listen_addr: SocketAddr, path: &str) -> anyhow::Result<()> {
+        let server = WireWsServer::new(Arc::clone(&self.soul), listen_addr, path)?;
         server.serve().await
     }
 }

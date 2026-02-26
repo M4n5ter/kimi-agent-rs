@@ -7,7 +7,7 @@
 - `file.rs`: `WireFile` JSONL persistence, metadata header, `WireMessageRecord`.
 - `protocol.rs`: wire protocol version constants.
 - `jsonrpc.rs`: JSON-RPC models/utilities for wire server.
-- `server.rs`: stdio JSON-RPC wire server.
+- `server.rs`: JSON-RPC wire servers for stdio and WebSocket transports.
 - `channel.rs`: `Wire`, `WireSoulSide`, `WireUISide`, merge + recording logic.
 
 ## Compatibility Rules
