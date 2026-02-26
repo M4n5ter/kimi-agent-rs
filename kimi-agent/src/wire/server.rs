@@ -776,10 +776,10 @@ async fn handle_ws_socket(socket: WebSocket, state: Arc<WsServerState>) {
         }
     }
 
+    // Stop accepting new connections before tearing down RPC state.
+    state.shutdown.notify_waiters();
     state.rpc.shutdown().await;
     let _ = write_task.await;
-    state.active_client.store(false, Ordering::SeqCst);
-    state.shutdown.notify_waiters();
 }
 
 fn normalize_ws_path(path: &str) -> anyhow::Result<String> {
