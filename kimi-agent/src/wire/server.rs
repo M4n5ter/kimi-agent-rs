@@ -642,13 +642,21 @@ impl WireWsServer {
     }
 
     pub async fn serve(&self) -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind(self.listen_addr).await?;
+        self.serve_with_listener(listener).await
+    }
+
+    pub async fn serve_with_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+    ) -> anyhow::Result<()> {
+        let bound_addr = listener.local_addr()?;
         info!(
-            address = %self.listen_addr,
+            address = %bound_addr,
             path = %self.path,
             "Starting Wire server on websocket"
         );
 
-        let listener = tokio::net::TcpListener::bind(self.listen_addr).await?;
         let state = Arc::new(WsServerState::new(self.rpc.clone()));
         let app = Router::new()
             .route(&self.path, get(ws_upgrade_handler))
@@ -687,7 +695,11 @@ async fn ws_upgrade_handler(
     State(state): State<Arc<WsServerState>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if state.active_client.swap(true, Ordering::SeqCst) {
+    if state
+        .active_client
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return (
             StatusCode::CONFLICT,
             "Only one websocket client is allowed for this wire server.",
@@ -695,8 +707,16 @@ async fn ws_upgrade_handler(
             .into_response();
     }
 
-    ws.on_upgrade(move |socket| async move {
-        handle_ws_socket(socket, Arc::clone(&state)).await;
+    let state_for_upgrade = Arc::clone(&state);
+    let state_for_failed_upgrade = Arc::clone(&state);
+    ws.on_failed_upgrade(move |err| {
+        warn!("Wire websocket upgrade failed: {}", err);
+        state_for_failed_upgrade
+            .active_client
+            .store(false, Ordering::SeqCst);
+    })
+    .on_upgrade(move |socket| async move {
+        handle_ws_socket(socket, state_for_upgrade).await;
     })
     .into_response()
 }

@@ -14,6 +14,7 @@ use kimi_agent::config::{LLMModel, LLMProvider, ProviderType, get_default_config
 use kimi_agent::constant::{NAME, VERSION};
 use kimi_agent::session::Session;
 use kimi_agent::wire::protocol::WIRE_PROTOCOL_VERSION;
+use kimi_agent::wire::server::WireWsServer;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -59,11 +60,6 @@ fn set_home_env(path: &Path) -> Vec<EnvGuard> {
             share_dir.to_str().expect("share dir path"),
         ),
     ]
-}
-
-fn reserve_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
-    listener.local_addr().expect("local addr").port()
 }
 
 async fn connect_ws_with_retry(
@@ -176,11 +172,14 @@ async fn test_wire_ws_initialize_and_prompt() {
     let work_dir = TempDir::new().expect("work dir");
     let (cli, _env) = create_scripted_cli(&["text: hello from ws"], &home_dir, &work_dir).await;
 
-    let port = reserve_free_port();
-    let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    let server_task = tokio::spawn(async move { cli.run_wire_ws(listen_addr, "/wire").await });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(cli.soul(), listen_addr, "/wire").expect("wire ws server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
 
-    let mut ws = connect_ws_with_retry(&format!("ws://127.0.0.1:{port}/wire")).await;
+    let mut ws = connect_ws_with_retry(&format!("ws://{listen_addr}/wire")).await;
     ws.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
@@ -285,11 +284,14 @@ async fn test_wire_ws_external_tool_request_roundtrip() {
     )
     .await;
 
-    let port = reserve_free_port();
-    let listen_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    let server_task = tokio::spawn(async move { cli.run_wire_ws(listen_addr, "/wire").await });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(cli.soul(), listen_addr, "/wire").expect("wire ws server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
 
-    let mut ws = connect_ws_with_retry(&format!("ws://127.0.0.1:{port}/wire")).await;
+    let mut ws = connect_ws_with_retry(&format!("ws://{listen_addr}/wire")).await;
     ws.send(Message::Text(
         json!({
             "jsonrpc": "2.0",
