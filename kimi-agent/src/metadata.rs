@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,12 +75,16 @@ impl Metadata {
 pub async fn load_metadata() -> Metadata {
     let _ = ensure_share_dir().await;
     let metadata_file = get_metadata_file();
+    load_metadata_from_path(&metadata_file).await
+}
+
+async fn load_metadata_from_path(metadata_file: &Path) -> Metadata {
     debug!("Loading metadata from file: {}", metadata_file.display());
-    if tokio::fs::metadata(&metadata_file).await.is_err() {
+    if tokio::fs::metadata(metadata_file).await.is_err() {
         debug!("No metadata file found, creating empty metadata");
         return Metadata::default();
     }
-    let text = tokio::fs::read_to_string(&metadata_file)
+    let text = tokio::fs::read_to_string(metadata_file)
         .await
         .unwrap_or_else(|err| {
             panic!(
@@ -94,6 +98,10 @@ pub async fn load_metadata() -> Metadata {
 
 pub async fn save_metadata(metadata: &Metadata) {
     let metadata_file = get_metadata_file();
+    save_metadata_to_path(&metadata_file, metadata).await;
+}
+
+async fn save_metadata_to_path(metadata_file: &Path, metadata: &Metadata) {
     debug!("Saving metadata to file: {}", metadata_file.display());
     if let Some(parent) = metadata_file.parent() {
         tokio::fs::create_dir_all(parent)
@@ -122,7 +130,7 @@ pub async fn save_metadata(metadata: &Metadata) {
                 temp_file.display()
             )
         });
-    tokio::fs::rename(&temp_file, &metadata_file)
+    tokio::fs::rename(&temp_file, metadata_file)
         .await
         .unwrap_or_else(|err| {
             panic!(
@@ -134,10 +142,19 @@ pub async fn save_metadata(metadata: &Metadata) {
 }
 
 pub async fn update_metadata<R>(update: impl FnOnce(&mut Metadata) -> R) -> R {
+    let _ = ensure_share_dir().await;
+    let metadata_file = get_metadata_file();
+    update_metadata_with_path(&metadata_file, update).await
+}
+
+async fn update_metadata_with_path<R>(
+    metadata_file: &Path,
+    update: impl FnOnce(&mut Metadata) -> R,
+) -> R {
     let _guard = METADATA_UPDATE_LOCK.lock().await;
-    let mut metadata = load_metadata().await;
+    let mut metadata = load_metadata_from_path(metadata_file).await;
     let result = update(&mut metadata);
-    save_metadata(&metadata).await;
+    save_metadata_to_path(metadata_file, &metadata).await;
     result
 }
 
@@ -147,64 +164,25 @@ fn default_kaos_name() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::LazyLock;
-
     use tempfile::TempDir;
-    use tokio::sync::{Barrier, Mutex};
+    use tokio::sync::Barrier;
 
-    use super::{WorkDirMeta, load_metadata, update_metadata};
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::const_new(()));
-
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            // SAFETY: tests serialize env access with ENV_LOCK.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, prev }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(prev) = &self.prev {
-                // SAFETY: tests serialize env access with ENV_LOCK.
-                unsafe {
-                    std::env::set_var(self.key, prev);
-                }
-            } else {
-                // SAFETY: tests serialize env access with ENV_LOCK.
-                unsafe {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
+    use super::{WorkDirMeta, load_metadata_from_path, update_metadata_with_path};
 
     #[tokio::test]
     async fn update_metadata_serializes_concurrent_writes() {
-        let _lock = ENV_LOCK.lock().await;
         let share_dir = TempDir::new().expect("share dir");
-        let _env = EnvGuard::set(
-            "KIMI_SHARE_DIR",
-            share_dir.path().to_str().expect("share dir path"),
-        );
+        let metadata_file = share_dir.path().join("kimi.json");
 
         let n_tasks = 24usize;
         let barrier = std::sync::Arc::new(Barrier::new(n_tasks));
         let mut tasks = Vec::new();
         for idx in 0..n_tasks {
             let barrier = std::sync::Arc::clone(&barrier);
+            let metadata_file = metadata_file.clone();
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                update_metadata(move |metadata| {
+                update_metadata_with_path(&metadata_file, move |metadata| {
                     metadata.work_dirs.push(WorkDirMeta {
                         path: format!("/tmp/work-{idx}"),
                         kaos: "local".to_string(),
@@ -218,7 +196,7 @@ mod tests {
             task.await.expect("join metadata task");
         }
 
-        let metadata = load_metadata().await;
+        let metadata = load_metadata_from_path(&metadata_file).await;
         assert_eq!(metadata.work_dirs.len(), n_tasks);
     }
 }

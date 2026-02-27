@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -26,6 +25,7 @@ use crate::app::{ConfigInput, CreateOptions, KimiCLI};
 use crate::config::Config;
 use crate::constant::{NAME, VERSION};
 use crate::session::{Session, post_run as post_run_session};
+use crate::session_id::normalize_session_id;
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::{LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul};
 use crate::utils::{Queue, QueueShutDown};
@@ -940,36 +940,6 @@ fn normalize_ws_path(path: &str) -> anyhow::Result<String> {
     Ok(normalized.to_string())
 }
 
-fn normalize_session_id(session_id: &str) -> anyhow::Result<String> {
-    let normalized = session_id.trim();
-    if normalized.is_empty() {
-        anyhow::bail!("session_id cannot be empty");
-    }
-    if normalized.len() > 128 {
-        anyhow::bail!("session_id is too long (max 128 chars)");
-    }
-    if normalized.contains('/') || normalized.contains('\\') {
-        anyhow::bail!("session_id cannot contain path separators");
-    }
-    if normalized == "." || normalized == ".." {
-        anyhow::bail!("session_id cannot be dot segments");
-    }
-    if !normalized
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-    {
-        anyhow::bail!("session_id contains invalid characters");
-    }
-
-    let mut components = Path::new(normalized).components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(_)), None) => {}
-        _ => anyhow::bail!("session_id must be a single path segment"),
-    }
-
-    Ok(normalized.to_string())
-}
-
 async fn stream_wire_messages(
     write_queue: Queue<Value>,
     pending: Arc<tokio::sync::Mutex<HashMap<String, PendingRequest>>>,
@@ -1035,7 +1005,7 @@ mod tests {
 
     use tokio_util::sync::CancellationToken;
 
-    use super::{ActiveTurn, cancel_and_wait_active_turn, normalize_session_id, normalize_ws_path};
+    use super::{ActiveTurn, cancel_and_wait_active_turn, normalize_ws_path};
 
     #[test]
     fn normalize_ws_path_accepts_valid_path() {
@@ -1049,25 +1019,6 @@ mod tests {
         assert!(normalize_ws_path("wire").is_err());
         assert!(normalize_ws_path("/wire?x=1").is_err());
         assert!(normalize_ws_path("/wire#frag").is_err());
-    }
-
-    #[test]
-    fn normalize_session_id_accepts_valid_session_id() {
-        assert_eq!(normalize_session_id("abc").unwrap(), "abc");
-        assert_eq!(normalize_session_id(" abc-def ").unwrap(), "abc-def");
-    }
-
-    #[test]
-    fn normalize_session_id_rejects_invalid_session_id() {
-        assert!(normalize_session_id("").is_err());
-        assert!(normalize_session_id("   ").is_err());
-        assert!(normalize_session_id(".").is_err());
-        assert!(normalize_session_id("..").is_err());
-        assert!(normalize_session_id("a/b").is_err());
-        assert!(normalize_session_id("a\\b").is_err());
-        assert!(normalize_session_id("a:b").is_err());
-        assert!(normalize_session_id("a b").is_err());
-        assert!(normalize_session_id(&"a".repeat(129)).is_err());
     }
 
     #[tokio::test]

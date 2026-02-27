@@ -11,6 +11,7 @@ use crate::app::{ConfigInput, CreateOptions, KimiCLI};
 use crate::config::{Config, KaosConfig, load_config, load_config_from_string};
 use crate::constant::VERSION;
 use crate::session::{Session, post_run};
+use crate::session_id::normalize_session_id;
 use crate::utils::init_logging;
 use tracing::info;
 
@@ -262,14 +263,13 @@ pub async fn run() -> Result<()> {
         None => KaosPath::cwd(),
     };
 
-    let default_session =
-        resolve_session(&work_dir, cli.session_id.as_ref(), cli.continue_session).await?;
-
     let agent_file = resolve_agent_file(cli.agent, cli.agent_file.as_ref())?;
     let thinking = resolve_thinking(cli.thinking, cli.no_thinking)?;
 
     match cli.wire_transport {
         WireTransport::Stdio => {
+            let default_session =
+                resolve_session(&work_dir, cli.session_id.as_ref(), cli.continue_session).await?;
             let instance = KimiCLI::create(
                 default_session,
                 CreateOptions {
@@ -293,10 +293,16 @@ pub async fn run() -> Result<()> {
         }
         WireTransport::Ws => {
             let listen_addr = parse_wire_listen_addr(&cli.wire_listen)?;
+            let default_session_id = resolve_ws_default_session_id(
+                &work_dir,
+                cli.session_id.as_ref(),
+                cli.continue_session,
+            )
+            .await?;
             let server = crate::wire::server::WireWsServer::new(
                 crate::wire::server::WsSessionRuntimeOptions {
                     work_dir,
-                    default_session_id: default_session.id.clone(),
+                    default_session_id,
                     config,
                     model_name: cli.model_name.clone(),
                     thinking,
@@ -515,14 +521,15 @@ async fn resolve_session(
     continue_session: bool,
 ) -> Result<Session> {
     if let Some(session_id) = session_id {
-        let trimmed = session_id.trim();
-        let found = Session::find(work_dir.clone(), trimmed).await;
+        let normalized = normalize_session_id(session_id)
+            .map_err(|err| anyhow::anyhow!("Invalid --session value: {err}"))?;
+        let found = Session::find(work_dir.clone(), &normalized).await;
         if let Some(session) = found {
             info!("Switching to session: {}", session.id);
             return Ok(session);
         }
-        info!("Session {} not found, creating new session", trimmed);
-        let session = Session::create(work_dir.clone(), Some(trimmed.to_string()), None).await;
+        info!("Session {} not found, creating new session", normalized);
+        let session = Session::create(work_dir.clone(), Some(normalized), None).await;
         info!("Switching to session: {}", session.id);
         return Ok(session);
     }
@@ -538,4 +545,45 @@ async fn resolve_session(
     let session = Session::create(work_dir.clone(), None, None).await;
     info!("Created new session: {}", session.id);
     Ok(session)
+}
+
+async fn resolve_ws_default_session_id(
+    work_dir: &KaosPath,
+    session_id: Option<&String>,
+    continue_session: bool,
+) -> Result<String> {
+    if let Some(session_id) = session_id {
+        return normalize_session_id(session_id)
+            .map_err(|err| anyhow::anyhow!("Invalid --session value: {err}"));
+    }
+
+    if continue_session {
+        if let Some(session) = Session::continue_(work_dir.clone()).await {
+            return normalize_session_id(&session.id).map_err(|err| {
+                anyhow::anyhow!("Invalid session ID in previous session metadata: {err}")
+            });
+        }
+        anyhow::bail!("No previous session found for the working directory.");
+    }
+
+    Ok(uuid::Uuid::new_v4().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use kaos::KaosPath;
+
+    use super::resolve_ws_default_session_id;
+
+    #[tokio::test]
+    async fn ws_default_session_id_rejects_invalid_custom_session() {
+        let work_dir = TempDir::new().expect("work dir");
+        let work_path = KaosPath::from(work_dir.path().to_path_buf());
+        let invalid_session = "bad:id".to_string();
+
+        let result = resolve_ws_default_session_id(&work_path, Some(&invalid_session), false).await;
+        assert!(result.is_err());
+    }
 }
