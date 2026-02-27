@@ -168,7 +168,7 @@ pub async fn create_llm(
         ProviderType::OpenaiLegacy => {
             let mut openai = kosong::chat_provider::openai_legacy::OpenAILegacy::new(
                 model.model.clone(),
-                Some(provider.api_key.clone()),
+                non_empty_provider_value(&provider.api_key),
                 Some(provider.base_url.clone()),
                 Some(default_headers.clone()),
             )
@@ -242,7 +242,7 @@ pub async fn create_llm(
             Box::new(
                 kosong::chat_provider::openai_legacy::OpenAILegacy::new(
                     model.model.clone(),
-                    Some(provider.api_key.clone()),
+                    non_empty_provider_value(&provider.api_key),
                     Some(provider.base_url.clone()),
                     Some(default_headers.clone()),
                 )
@@ -252,8 +252,11 @@ pub async fn create_llm(
         }
         ProviderType::Vertexai => {
             // Intentional: use Vertex AI OpenAI-compatible endpoint via OpenAILegacy for now.
-            let api_key =
-                resolve_provider_value(&provider.api_key, provider.env.as_ref(), "OPENAI_API_KEY");
+            let api_key = resolve_provider_value_with_explicit_env(
+                &provider.api_key,
+                provider.env.as_ref(),
+                "OPENAI_API_KEY",
+            );
             let base_url = resolve_provider_value(
                 &provider.base_url,
                 provider.env.as_ref(),
@@ -262,7 +265,7 @@ pub async fn create_llm(
             Box::new(
                 kosong::chat_provider::openai_legacy::OpenAILegacy::new(
                     model.model.clone(),
-                    Some(api_key),
+                    api_key,
                     Some(base_url),
                     Some(default_headers.clone()),
                 )
@@ -375,6 +378,14 @@ fn read_env_var(provider_env: Option<&HashMap<String, String>>, key: &str) -> Op
         .or_else(|| env::var(key).ok())
 }
 
+fn non_empty_provider_value(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 fn resolve_provider_value(
     value: &str,
     provider_env: Option<&HashMap<String, String>>,
@@ -384,6 +395,17 @@ fn resolve_provider_value(
         return value.to_string();
     }
     read_env_var(provider_env, env_key).unwrap_or_default()
+}
+
+fn resolve_provider_value_with_explicit_env(
+    value: &str,
+    provider_env: Option<&HashMap<String, String>>,
+    env_key: &str,
+) -> Option<String> {
+    if !value.is_empty() {
+        return Some(value.to_string());
+    }
+    provider_env.and_then(|envs| envs.get(env_key)).cloned()
 }
 
 async fn load_scripted_echo_scripts(
