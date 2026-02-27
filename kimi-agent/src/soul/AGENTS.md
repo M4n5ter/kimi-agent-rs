@@ -29,3 +29,4 @@
 - Pending D-Mail triggers a context revert + checkpoint + D-Mail message append on the next loop iteration.
 - Compaction retries use the same backoff rules as step retries.
 - Flow runners warn on extra args and otherwise ignore them.
+- Skill-declared MCP servers are loaded lazily when `/skill:*` or `/flow:*` executes and are cleaned up on wire session shutdown.

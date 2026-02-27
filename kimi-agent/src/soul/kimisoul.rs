@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use crate::config::ModelCapability;
 use crate::skill::flow::{Flow, FlowEdge, FlowLabel, FlowNode, FlowNodeKind, parse_choice};
 use crate::skill::{Skill, SkillType, read_skill_text};
 use crate::soul::agent::{Agent, Runtime};
+use crate::soul::toolset::{McpServerStatus, wait_mcp_loading_tasks};
 use crate::soul::{
     LLMNotSet, LLMNotSupported, MaxStepsReached, Soul, StatusSnapshot,
     approval::Approval,
@@ -70,7 +71,7 @@ pub struct KimiSoul {
 enum SlashHandler {
     Builtin(BuiltinSlash),
     Skill(Skill),
-    Flow(FlowRunner),
+    Flow(Skill, FlowRunner),
 }
 
 #[derive(Clone, Copy)]
@@ -211,7 +212,7 @@ impl KimiSoul {
                 description: skill.description.clone(),
                 aliases: Vec::new(),
             });
-            handlers.insert(name.clone(), SlashHandler::Flow(runner));
+            handlers.insert(name.clone(), SlashHandler::Flow(skill.clone(), runner));
             seen.insert(name);
         }
 
@@ -236,7 +237,12 @@ impl KimiSoul {
                 BuiltinSlash::Yolo => self.slash_yolo().await,
             },
             Some(SlashHandler::Skill(skill)) => self.run_skill(skill, args).await,
-            Some(SlashHandler::Flow(runner)) => runner.run(self, args).await,
+            Some(SlashHandler::Flow(skill, runner)) => {
+                if !self.ensure_skill_mcp_ready(skill).await? {
+                    return Ok(());
+                }
+                runner.run(self, args).await
+            }
             None => {
                 wire_send(WireMessage::ContentPart(ContentPart::Text(TextPart::new(
                     format!("Unknown slash command \"/{}\".", name),
@@ -334,6 +340,9 @@ impl KimiSoul {
     }
 
     async fn run_skill(&self, skill: &Skill, args: &str) -> anyhow::Result<()> {
+        if !self.ensure_skill_mcp_ready(skill).await? {
+            return Ok(());
+        }
         let Some(mut skill_text) = read_skill_text(skill).await else {
             wire_send(WireMessage::ContentPart(ContentPart::Text(TextPart::new(
                 format!(
@@ -356,6 +365,75 @@ impl KimiSoul {
         Ok(())
     }
 
+    async fn ensure_skill_mcp_ready(&self, skill: &Skill) -> anyhow::Result<bool> {
+        if skill.mcp_servers.is_empty() {
+            return Ok(true);
+        }
+
+        let mut mcp_servers = serde_json::Map::new();
+        let mut required_server_names = Vec::new();
+        for server in &skill.mcp_servers {
+            let scoped_name = server.scoped_name(&skill.name);
+            mcp_servers.insert(scoped_name.clone(), server.to_mcp_config_entry());
+            required_server_names.push(scoped_name);
+        }
+        let mcp_config = serde_json::json!({ "mcpServers": mcp_servers });
+
+        let pending_tasks = {
+            let mut toolset = self.agent.toolset.lock().await;
+            toolset
+                .load_mcp_tools(
+                    &[mcp_config],
+                    &self.runtime,
+                    Arc::clone(&self.agent.toolset),
+                )
+                .await?;
+            toolset.take_mcp_loading_tasks()
+        };
+        let _ = wait_mcp_loading_tasks(pending_tasks).await;
+
+        let failures = {
+            let toolset = self.agent.toolset.lock().await;
+            required_server_names
+                .iter()
+                .filter_map(|name| {
+                    let info = toolset.mcp_servers().get(name);
+                    match info {
+                        None => Some(format!("{} (missing): not loaded", name)),
+                        Some(info) => match info.status {
+                            McpServerStatus::Connected => None,
+                            McpServerStatus::Unauthorized
+                            | McpServerStatus::Failed
+                            | McpServerStatus::Pending
+                            | McpServerStatus::Connecting => Some(format!(
+                                "{} ({:?}): {}",
+                                name,
+                                info.status,
+                                info.last_error
+                                    .clone()
+                                    .unwrap_or_else(|| "unknown error".to_string())
+                            )),
+                        },
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if failures.is_empty() {
+            return Ok(true);
+        }
+
+        wire_send(WireMessage::ContentPart(ContentPart::Text(TextPart::new(
+            format!(
+                "Failed to load MCP server(s) required by skill `/{}{}:`\n{}",
+                SKILL_COMMAND_PREFIX,
+                skill.name,
+                failures.join("\n")
+            ),
+        ))));
+        Ok(false)
+    }
+
     async fn turn(&self, user_message: Message) -> Result<TurnOutcome, anyhow::Error> {
         let llm = self.runtime.llm.as_ref().ok_or(LLMNotSet)?;
         let missing = check_message(&user_message, &llm.capabilities);
@@ -376,12 +454,12 @@ impl KimiSoul {
     }
 
     async fn agent_loop(&self) -> Result<TurnOutcome, anyhow::Error> {
-        let mcp_task = {
+        let mcp_tasks = {
             let mut toolset = self.agent.toolset.lock().await;
-            toolset.take_mcp_loading_task()
+            toolset.take_mcp_loading_tasks()
         };
-        if let Some(task) = mcp_task {
-            let _ = task.await;
+        if !mcp_tasks.is_empty() {
+            let _ = wait_mcp_loading_tasks(mcp_tasks).await;
         }
 
         let mut step_no = 0;
@@ -690,6 +768,35 @@ impl KimiSoul {
         }
         wire_send(WireMessage::CompactionEnd(CompactionEnd {}));
         Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        let toolsets = {
+            let mut seen = HashSet::new();
+            let market = self.runtime.labor_market.lock().await;
+            let mut toolsets = Vec::new();
+
+            let mut push_toolset =
+                |toolset: &Arc<tokio::sync::Mutex<crate::soul::toolset::KimiToolset>>| {
+                    let ptr = Arc::as_ptr(toolset) as usize;
+                    if seen.insert(ptr) {
+                        toolsets.push(Arc::clone(toolset));
+                    }
+                };
+
+            push_toolset(&self.agent.toolset);
+            for agent in market.fixed_subagents().values() {
+                push_toolset(&agent.toolset);
+            }
+            for agent in market.dynamic_subagents().values() {
+                push_toolset(&agent.toolset);
+            }
+            toolsets
+        };
+
+        for toolset in toolsets {
+            toolset.lock().await.cleanup().await;
+        }
     }
 }
 

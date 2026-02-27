@@ -8,8 +8,8 @@ use kaos::{
     reset_current_kaos, set_current_kaos, with_current_kaos_scope,
 };
 use kimi_agent::skill::{
-    Skill, SkillType, discover_skills, discover_skills_from_roots, find_user_skills_dir,
-    get_builtin_skills_dir, resolve_skills_roots,
+    Skill, SkillMcpServer, SkillType, discover_skills, discover_skills_from_roots,
+    find_user_skills_dir, get_builtin_skills_dir, resolve_skills_roots,
 };
 
 struct FixedHomeKaos {
@@ -164,6 +164,7 @@ async fn test_discover_skills_parses_frontmatter_and_defaults() {
                 skill_type: SkillType::Standard,
                 dir: KaosPath::unsafe_from_local_path(Path::new("/path/to/alpha")),
                 flow: None,
+                mcp_servers: Vec::new(),
             },
             Skill {
                 name: "beta".to_string(),
@@ -171,6 +172,7 @@ async fn test_discover_skills_parses_frontmatter_and_defaults() {
                 skill_type: SkillType::Standard,
                 dir: KaosPath::unsafe_from_local_path(Path::new("/path/to/beta")),
                 flow: None,
+                mcp_servers: Vec::new(),
             },
         ]
     );
@@ -193,6 +195,55 @@ async fn test_discover_skills_parses_flow_type() {
     assert_eq!(skills[0].skill_type, SkillType::Flow);
     assert!(skills[0].flow.is_some());
     assert_eq!(skills[0].flow.as_ref().unwrap().begin_id, "BEGIN");
+}
+
+#[tokio::test]
+async fn test_discover_skills_parses_mcp_servers() {
+    let root = TempDir::new().expect("temp dir");
+    let root_path = root.path().join("skills");
+    std::fs::create_dir_all(&root_path).expect("create skills root");
+
+    write_skill(
+        &root_path.join("mcp"),
+        "---\nname: mcp\ndescription: MCP skill\nmcp:\n  - name: local\n    type: stdio\n    command: npx\n    args: [\"-y\", \"my-mcp\"]\n  - name: remote\n    type: http\n    url: https://example.com/mcp\n    transport: streamable-http\n---\n# body\n",
+    );
+
+    let skills = discover_skills(&KaosPath::unsafe_from_local_path(&root_path)).await;
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].mcp_servers.len(), 2);
+
+    match &skills[0].mcp_servers[0] {
+        SkillMcpServer::Stdio(server) => {
+            assert_eq!(server.name, "local");
+            assert_eq!(server.command, "npx");
+            assert_eq!(server.args, vec!["-y".to_string(), "my-mcp".to_string()]);
+        }
+        _ => panic!("expected stdio mcp server"),
+    }
+
+    match &skills[0].mcp_servers[1] {
+        SkillMcpServer::Http(server) => {
+            assert_eq!(server.name, "remote");
+            assert_eq!(server.url, "https://example.com/mcp");
+            assert_eq!(server.transport.as_deref(), Some("streamable-http"));
+        }
+        _ => panic!("expected http mcp server"),
+    }
+}
+
+#[tokio::test]
+async fn test_discover_skills_rejects_duplicate_mcp_server_names() {
+    let root = TempDir::new().expect("temp dir");
+    let root_path = root.path().join("skills");
+    std::fs::create_dir_all(&root_path).expect("create skills root");
+
+    write_skill(
+        &root_path.join("dup-mcp"),
+        "---\nname: dup\ndescription: duplicated mcp names\nmcp:\n  - name: same\n    type: stdio\n    command: cmd-a\n  - name: SAME\n    type: stdio\n    command: cmd-b\n---\n# body\n",
+    );
+
+    let skills = discover_skills(&KaosPath::unsafe_from_local_path(&root_path)).await;
+    assert!(skills.is_empty());
 }
 
 #[tokio::test]
@@ -251,6 +302,7 @@ async fn test_discover_skills_from_roots_prefers_later_dirs() {
             skill_type: SkillType::Standard,
             dir: KaosPath::unsafe_from_local_path(Path::new("/path/to/user/shared")),
             flow: None,
+            mcp_servers: Vec::new(),
         }]
     );
 }

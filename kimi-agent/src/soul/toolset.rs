@@ -58,7 +58,8 @@ pub struct KimiToolset {
     tools: HashMap<String, Arc<dyn CallableTool>>,
     external_tools: HashSet<String>,
     mcp_servers: HashMap<String, McpServerInfo>,
-    mcp_loading_task: Option<tokio::task::JoinHandle<Result<(), MCPRuntimeError>>>,
+    mcp_loading_tasks: Vec<tokio::task::JoinHandle<Result<(), MCPRuntimeError>>>,
+    mcp_tool_owners: HashMap<String, String>,
 }
 
 impl KimiToolset {
@@ -67,7 +68,8 @@ impl KimiToolset {
             tools: HashMap::new(),
             external_tools: HashSet::new(),
             mcp_servers: HashMap::new(),
-            mcp_loading_task: None,
+            mcp_loading_tasks: Vec::new(),
+            mcp_tool_owners: HashMap::new(),
         }
     }
 
@@ -104,6 +106,34 @@ impl KimiToolset {
         self.add(Arc::new(tool));
         self.external_tools.insert(name.to_string());
         Ok(())
+    }
+
+    fn register_mcp_tool(&mut self, server_name: &str, tool: McpTool) -> bool {
+        let base = tool.base();
+        let name = base.name.clone();
+        let previous_owner = self.mcp_tool_owners.get(&name).cloned();
+
+        if previous_owner.is_none() && self.tools.contains_key(&name) {
+            warn!(
+                "Skipping MCP tool '{}' from server '{}': name conflicts with non-MCP tool",
+                name, server_name
+            );
+            return false;
+        }
+
+        if let Some(owner) = previous_owner
+            && owner != server_name
+        {
+            warn!(
+                "MCP tool '{}' from server '{}' overrides MCP tool from server '{}'",
+                name, server_name, owner
+            );
+        }
+
+        self.tools
+            .insert(name.clone(), Arc::new(tool) as Arc<dyn CallableTool>);
+        self.mcp_tool_owners.insert(name, server_name.to_string());
+        true
     }
 
     pub fn load_tools(
@@ -153,6 +183,22 @@ impl KimiToolset {
                 continue;
             }
             for (name, server) in parsed {
+                if let Some(existing) = self.mcp_servers.get(&name) {
+                    if existing.config != server {
+                        return Err(anyhow::Error::new(MCPConfigError::new(format!(
+                            "Conflicting MCP config for server '{}'",
+                            name
+                        ))));
+                    }
+
+                    match existing.status {
+                        McpServerStatus::Connected
+                        | McpServerStatus::Connecting
+                        | McpServerStatus::Pending => continue,
+                        McpServerStatus::Failed | McpServerStatus::Unauthorized => {}
+                    }
+                }
+
                 if let McpServerConfig::Http(http) = &server
                     && http.auth.as_deref() == Some("oauth")
                 {
@@ -160,10 +206,20 @@ impl KimiToolset {
                         .await
                         .map_err(|err| anyhow::anyhow!("Failed to read MCP auth tokens: {err}"))?;
                     if !authorized {
-                        self.mcp_servers.insert(
-                            name.clone(),
-                            McpServerInfo::new(McpServerStatus::Unauthorized, server.clone()),
-                        );
+                        self.mcp_servers
+                            .entry(name.clone())
+                            .and_modify(|info| {
+                                info.status = McpServerStatus::Unauthorized;
+                                info.last_error = Some("OAuth authorization required".to_string());
+                            })
+                            .or_insert_with(|| {
+                                let mut info = McpServerInfo::new(
+                                    McpServerStatus::Unauthorized,
+                                    server.clone(),
+                                );
+                                info.last_error = Some("OAuth authorization required".to_string());
+                                info
+                            });
                         warn!(
                             "Skipping OAuth MCP server '{}': not authorized. Run 'kimi-agent mcp auth {}' first.",
                             name, name
@@ -175,10 +231,13 @@ impl KimiToolset {
                 if std::env::var("KIMI_TEST_TRACE").as_deref() == Ok("1") {
                     eprintln!("MCP config loaded server: {name}");
                 }
-                self.mcp_servers.insert(
-                    name.clone(),
-                    McpServerInfo::new(McpServerStatus::Pending, server),
-                );
+                self.mcp_servers
+                    .entry(name.clone())
+                    .and_modify(|info| {
+                        info.status = McpServerStatus::Pending;
+                        info.last_error = None;
+                    })
+                    .or_insert_with(|| McpServerInfo::new(McpServerStatus::Pending, server));
                 servers_to_connect.push(name);
             }
         }
@@ -207,21 +266,59 @@ impl KimiToolset {
                 )))
             }
         });
-        self.mcp_loading_task = Some(task);
+        self.mcp_loading_tasks.push(task);
         Ok(())
     }
 
     pub async fn wait_for_mcp_tools(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(task) = self.mcp_loading_task.take() {
-            task.await??;
-        }
-        Ok(())
+        wait_mcp_loading_tasks(self.take_mcp_loading_tasks()).await
     }
 
-    pub fn take_mcp_loading_task(
+    pub fn take_mcp_loading_tasks(
         &mut self,
-    ) -> Option<tokio::task::JoinHandle<Result<(), MCPRuntimeError>>> {
-        self.mcp_loading_task.take()
+    ) -> Vec<tokio::task::JoinHandle<Result<(), MCPRuntimeError>>> {
+        std::mem::take(&mut self.mcp_loading_tasks)
+    }
+
+    pub async fn cleanup(&mut self) {
+        let tasks = self.take_mcp_loading_tasks();
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+
+        let mut servers = std::mem::take(&mut self.mcp_servers);
+        for info in servers.values_mut() {
+            if let Some(client) = info.client.take() {
+                let mut service = client.service.lock().await;
+                let _ = service.close().await;
+            }
+        }
+
+        for name in self.mcp_tool_owners.keys().cloned().collect::<Vec<_>>() {
+            self.tools.remove(&name);
+        }
+        self.mcp_tool_owners.clear();
+    }
+}
+
+pub async fn wait_mcp_loading_tasks(
+    tasks: Vec<tokio::task::JoinHandle<Result<(), MCPRuntimeError>>>,
+) -> Result<(), anyhow::Error> {
+    let mut failures = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => failures.push(err.to_string()),
+            Err(err) => failures.push(err.to_string()),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "Failed to connect MCP servers: {failures:?}"
+        ))
     }
 }
 
@@ -426,7 +523,7 @@ struct McpConfig {
     mcp_servers: HashMap<String, McpServerConfig>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum McpServerConfig {
     Stdio(StdioServerConfig),
@@ -435,7 +532,7 @@ pub enum McpServerConfig {
 
 pub type McpToolSpec = rmcp::model::Tool;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct StdioServerConfig {
     command: String,
     #[serde(default)]
@@ -444,7 +541,7 @@ pub struct StdioServerConfig {
     env: Option<HashMap<String, String>>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct HttpServerConfig {
     pub url: String,
     #[serde(default)]
@@ -629,6 +726,8 @@ async fn connect_mcp_server(
     let tools = match client.peer.list_all_tools().await {
         Ok(tools) => tools,
         Err(err) => {
+            let mut service = client.service.lock().await;
+            let _ = service.close().await;
             let mut guard = toolset.lock().await;
             if let Some(info) = guard.mcp_servers.get_mut(server_name) {
                 info.status = McpServerStatus::Failed;
@@ -645,19 +744,39 @@ async fn connect_mcp_server(
     }
 
     let mut guard = toolset.lock().await;
-    let info = guard
-        .mcp_servers
-        .get_mut(server_name)
-        .ok_or_else(|| MCPRuntimeError::new("MCP server not found"))?;
-    info.status = McpServerStatus::Connected;
-    info!("Connected MCP server: {}", server_name);
-    info.tools = tools.iter().map(|tool| tool.name.to_string()).collect();
-    info.last_error = None;
-    info.client = Some(client.clone());
+    let previous_tools = {
+        let info = guard
+            .mcp_servers
+            .get_mut(server_name)
+            .ok_or_else(|| MCPRuntimeError::new("MCP server not found"))?;
+        info.status = McpServerStatus::Connected;
+        info!("Connected MCP server: {}", server_name);
+        info.last_error = None;
+        info.client = Some(client.clone());
+        std::mem::take(&mut info.tools)
+    };
 
+    let mut registered_tools = Vec::new();
     for tool in tools {
+        let tool_name = tool.name.to_string();
         let wrapper = McpTool::new(server_name, tool, client.peer.clone(), runtime.clone());
-        guard.add(Arc::new(wrapper));
+        if guard.register_mcp_tool(server_name, wrapper) {
+            registered_tools.push(tool_name);
+        }
+    }
+    let registered_set: HashSet<_> = registered_tools.iter().cloned().collect();
+
+    for old_tool in previous_tools {
+        if registered_set.contains(&old_tool) {
+            continue;
+        }
+        if guard.mcp_tool_owners.get(&old_tool).map(String::as_str) == Some(server_name) {
+            guard.mcp_tool_owners.remove(&old_tool);
+            guard.tools.remove(&old_tool);
+        }
+    }
+    if let Some(info) = guard.mcp_servers.get_mut(server_name) {
+        info.tools = registered_tools;
     }
 
     Ok(())

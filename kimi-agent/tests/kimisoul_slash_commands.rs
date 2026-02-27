@@ -50,6 +50,7 @@ fn test_flow_skill_registers_skill_and_flow_commands() {
         skill_type: SkillType::Flow,
         dir: KaosPath::unsafe_from_local_path(&skill_dir),
         flow: Some(flow),
+        mcp_servers: Vec::new(),
     };
 
     let mut runtime = fixture.runtime.clone();

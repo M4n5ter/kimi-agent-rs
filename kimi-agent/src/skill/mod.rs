@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use kaos::{KaosPath, get_current_kaos};
+use serde::Deserialize;
 use serde_yaml::Value;
 use tracing::{error, info, warn};
 
@@ -18,6 +19,85 @@ pub enum SkillType {
     Flow,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkillMcpServer {
+    Stdio(SkillMcpStdioServer),
+    Http(SkillMcpHttpServer),
+}
+
+impl SkillMcpServer {
+    pub fn name(&self) -> &str {
+        match self {
+            SkillMcpServer::Stdio(server) => &server.name,
+            SkillMcpServer::Http(server) => &server.name,
+        }
+    }
+
+    pub fn scoped_name(&self, skill_name: &str) -> String {
+        format!(
+            "skill::{}::{}",
+            normalize_skill_name(skill_name),
+            normalize_skill_name(self.name())
+        )
+    }
+
+    pub fn to_mcp_config_entry(&self) -> serde_json::Value {
+        match self {
+            SkillMcpServer::Stdio(server) => serde_json::json!({
+                "command": server.command,
+                "args": server.args,
+                "env": server.env,
+            }),
+            SkillMcpServer::Http(server) => serde_json::json!({
+                "url": server.url,
+                "transport": server.transport,
+                "headers": server.headers,
+                "auth": server.auth,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillMcpStdioServer {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Option<HashMap<String, String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillMcpHttpServer {
+    pub name: String,
+    pub url: String,
+    pub transport: Option<String>,
+    pub headers: Option<HashMap<String, String>>,
+    pub auth: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum SkillMcpServerRaw {
+    Stdio {
+        name: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: Option<HashMap<String, String>>,
+    },
+    Http {
+        name: String,
+        url: String,
+        #[serde(default)]
+        transport: Option<String>,
+        #[serde(default)]
+        headers: Option<HashMap<String, String>>,
+        #[serde(default)]
+        auth: Option<String>,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Skill {
     pub name: String,
@@ -25,6 +105,7 @@ pub struct Skill {
     pub skill_type: SkillType,
     pub dir: KaosPath,
     pub flow: Option<Flow>,
+    pub mcp_servers: Vec<SkillMcpServer>,
 }
 
 impl Skill {
@@ -192,6 +273,7 @@ pub fn parse_skill_text(content: &str, dir_path: &KaosPath) -> Result<Skill, Str
         .and_then(|map| map.get("type"))
         .and_then(value_as_string)
         .unwrap_or_else(|| "standard".to_string());
+    let mcp_servers = parse_skill_mcp_servers(&frontmatter)?;
 
     let mut flow = None;
     let mut resolved_type = SkillType::Standard;
@@ -215,7 +297,56 @@ pub fn parse_skill_text(content: &str, dir_path: &KaosPath) -> Result<Skill, Str
         skill_type: resolved_type,
         dir: dir_path.clone(),
         flow,
+        mcp_servers,
     })
+}
+
+fn parse_skill_mcp_servers(
+    frontmatter: &Option<HashMap<String, Value>>,
+) -> Result<Vec<SkillMcpServer>, String> {
+    let Some(raw_value) = frontmatter.as_ref().and_then(|map| map.get("mcp")) else {
+        return Ok(Vec::new());
+    };
+    let raw_servers: Vec<SkillMcpServerRaw> = serde_yaml::from_value(raw_value.clone())
+        .map_err(|err| format!("Invalid mcp frontmatter: {err}"))?;
+
+    let mut servers = Vec::new();
+    let mut names = HashSet::new();
+    for raw in raw_servers {
+        let server = match raw {
+            SkillMcpServerRaw::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => SkillMcpServer::Stdio(SkillMcpStdioServer {
+                name,
+                command,
+                args,
+                env,
+            }),
+            SkillMcpServerRaw::Http {
+                name,
+                url,
+                transport,
+                headers,
+                auth,
+            } => SkillMcpServer::Http(SkillMcpHttpServer {
+                name,
+                url,
+                transport,
+                headers,
+                auth,
+            }),
+        };
+        let normalized_name = normalize_skill_name(server.name());
+        if !names.insert(normalized_name) {
+            return Err(format!("Duplicate mcp server name '{}'.", server.name()));
+        }
+        servers.push(server);
+    }
+
+    Ok(servers)
 }
 
 fn parse_flow_from_skill(content: &str) -> Result<Flow, FlowError> {
