@@ -43,10 +43,10 @@ impl OpenAILegacy {
         base_url: Option<String>,
         default_headers: Option<HeaderMap>,
     ) -> Result<Self, ChatProviderError> {
-        let api_key = api_key
-            .filter(|value| !value.is_empty())
-            .or_else(|| env::var("OPENAI_API_KEY").ok())
-            .unwrap_or_default();
+        let api_key = match api_key {
+            Some(value) => value,
+            None => env::var("OPENAI_API_KEY").unwrap_or_default(),
+        };
         let mut base_url = base_url
             .filter(|value| !value.is_empty())
             .or_else(|| env::var("OPENAI_BASE_URL").ok())

@@ -168,7 +168,7 @@ pub async fn create_llm(
         ProviderType::OpenaiLegacy => {
             let mut openai = kosong::chat_provider::openai_legacy::OpenAILegacy::new(
                 model.model.clone(),
-                Some(provider.api_key.clone()),
+                non_empty_provider_value(&provider.api_key),
                 Some(provider.base_url.clone()),
                 Some(default_headers.clone()),
             )
@@ -242,7 +242,7 @@ pub async fn create_llm(
             Box::new(
                 kosong::chat_provider::openai_legacy::OpenAILegacy::new(
                     model.model.clone(),
-                    Some(provider.api_key.clone()),
+                    non_empty_provider_value(&provider.api_key),
                     Some(provider.base_url.clone()),
                     Some(default_headers.clone()),
                 )
@@ -252,19 +252,21 @@ pub async fn create_llm(
         }
         ProviderType::Vertexai => {
             // Intentional: use Vertex AI OpenAI-compatible endpoint via OpenAILegacy for now.
-            if let Some(envs) = &provider.env {
-                for (key, value) in envs {
-                    // SAFETY: matches Python behavior of mutating process env for provider setup.
-                    unsafe {
-                        env::set_var(key, value);
-                    }
-                }
-            }
+            let api_key = resolve_provider_value_with_explicit_env(
+                &provider.api_key,
+                provider.env.as_ref(),
+                "OPENAI_API_KEY",
+            );
+            let base_url = resolve_provider_value(
+                &provider.base_url,
+                provider.env.as_ref(),
+                "OPENAI_BASE_URL",
+            );
             Box::new(
                 kosong::chat_provider::openai_legacy::OpenAILegacy::new(
                     model.model.clone(),
-                    Some(provider.api_key.clone()),
-                    Some(provider.base_url.clone()),
+                    api_key,
+                    Some(base_url),
                     Some(default_headers.clone()),
                 )
                 .map_err(map_chat_provider_error)?
@@ -273,16 +275,8 @@ pub async fn create_llm(
         }
         ProviderType::Echo => Box::new(kosong::chat_provider::echo::EchoChatProvider),
         ProviderType::ScriptedEcho => {
-            if let Some(envs) = &provider.env {
-                for (key, value) in envs {
-                    // SAFETY: matches Python behavior of mutating process env for provider setup.
-                    unsafe {
-                        env::set_var(key, value);
-                    }
-                }
-            }
-            let scripts = load_scripted_echo_scripts().await?;
-            let trace = env::var("KIMI_SCRIPTED_ECHO_TRACE")
+            let scripts = load_scripted_echo_scripts(provider.env.as_ref()).await?;
+            let trace = read_env_var(provider.env.as_ref(), "KIMI_SCRIPTED_ECHO_TRACE")
                 .unwrap_or_default()
                 .trim()
                 .to_lowercase();
@@ -377,12 +371,52 @@ fn parse_env_f64(value: &str) -> Result<f64, LLMError> {
         .map_err(|_| LLMError::EnvVar(format!("could not convert string to float: '{}'", value)))
 }
 
-async fn load_scripted_echo_scripts() -> Result<Vec<String>, LLMError> {
-    let script_path = env::var("KIMI_SCRIPTED_ECHO_SCRIPTS").map_err(|_| {
-        LLMError::ScriptedEcho(
-            "KIMI_SCRIPTED_ECHO_SCRIPTS is required for _scripted_echo.".to_string(),
-        )
-    })?;
+fn read_env_var(provider_env: Option<&HashMap<String, String>>, key: &str) -> Option<String> {
+    provider_env
+        .and_then(|envs| envs.get(key))
+        .cloned()
+        .or_else(|| env::var(key).ok())
+}
+
+fn non_empty_provider_value(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn resolve_provider_value(
+    value: &str,
+    provider_env: Option<&HashMap<String, String>>,
+    env_key: &str,
+) -> String {
+    if !value.is_empty() {
+        return value.to_string();
+    }
+    read_env_var(provider_env, env_key).unwrap_or_default()
+}
+
+fn resolve_provider_value_with_explicit_env(
+    value: &str,
+    provider_env: Option<&HashMap<String, String>>,
+    env_key: &str,
+) -> Option<String> {
+    if !value.is_empty() {
+        return Some(value.to_string());
+    }
+    provider_env.and_then(|envs| envs.get(env_key)).cloned()
+}
+
+async fn load_scripted_echo_scripts(
+    provider_env: Option<&HashMap<String, String>>,
+) -> Result<Vec<String>, LLMError> {
+    let script_path =
+        read_env_var(provider_env, "KIMI_SCRIPTED_ECHO_SCRIPTS").ok_or_else(|| {
+            LLMError::ScriptedEcho(
+                "KIMI_SCRIPTED_ECHO_SCRIPTS is required for _scripted_echo.".to_string(),
+            )
+        })?;
     let path = PathBuf::from(script_path).expanduser();
     if tokio::fs::metadata(&path).await.is_err() {
         return Err(LLMError::ScriptedEcho(format!(
