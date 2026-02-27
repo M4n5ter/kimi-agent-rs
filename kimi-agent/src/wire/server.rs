@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::path::{Component, Path};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use axum::extract::Query;
@@ -45,12 +46,19 @@ enum PendingRequest {
     ToolCall(ToolCallRequest),
 }
 
+struct ActiveTurn {
+    id: u64,
+    cancel_token: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
 #[derive(Clone)]
 struct WireRpcState {
     soul: Arc<KimiSoul>,
     write_queue: Queue<Value>,
     pending: Arc<tokio::sync::Mutex<HashMap<String, PendingRequest>>>,
-    cancel_token: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
+    active_turn: Arc<tokio::sync::Mutex<Option<ActiveTurn>>>,
+    next_turn_id: Arc<AtomicU64>,
 }
 
 impl WireRpcState {
@@ -59,7 +67,8 @@ impl WireRpcState {
             soul,
             write_queue: Queue::new(),
             pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            cancel_token: Arc::new(tokio::sync::Mutex::new(None)),
+            active_turn: Arc::new(tokio::sync::Mutex::new(None)),
+            next_turn_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -165,7 +174,7 @@ impl WireRpcState {
         let Some(id) = msg.id.clone() else {
             return;
         };
-        if self.cancel_token.lock().await.is_some() {
+        if self.active_turn.lock().await.is_some() {
             self.send_error(
                 id,
                 error_codes::INVALID_STATE,
@@ -248,15 +257,6 @@ impl WireRpcState {
         let Some(id) = msg.id.clone() else {
             return;
         };
-        if self.cancel_token.lock().await.is_some() {
-            self.send_error(
-                id,
-                error_codes::INVALID_STATE,
-                "An agent turn is already in progress",
-            )
-            .await;
-            return;
-        }
         let params: PromptParams = match msg
             .params
             .clone()
@@ -274,16 +274,27 @@ impl WireRpcState {
             }
         };
 
+        let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
         let cancel_token = CancellationToken::new();
-        let cancel_slot = Arc::clone(&self.cancel_token);
-        *cancel_slot.lock().await = Some(cancel_token.clone());
-
+        let turn_cancel_token = cancel_token.clone();
+        let active_turn_slot = Arc::clone(&self.active_turn);
         let soul = Arc::clone(&self.soul);
         let write_queue = self.write_queue.clone();
         let pending = Arc::clone(&self.pending);
         let wire_file = Some(self.soul.runtime().session.wire_file());
+        let mut active_turn = self.active_turn.lock().await;
+        if active_turn.is_some() {
+            drop(active_turn);
+            self.send_error(
+                id,
+                error_codes::INVALID_STATE,
+                "An agent turn is already in progress",
+            )
+            .await;
+            return;
+        }
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let write_queue_for_stream = write_queue.clone();
             let pending_for_stream = Arc::clone(&pending);
             let run_handle = tokio::task::spawn_blocking(move || {
@@ -298,7 +309,7 @@ impl WireRpcState {
                             wire,
                         )
                     },
-                    cancel_token,
+                    turn_cancel_token,
                     wire_file,
                 ))
             });
@@ -306,8 +317,6 @@ impl WireRpcState {
                 Ok(result) => result,
                 Err(err) => Err(anyhow::anyhow!("Wire run task failed: {err}")),
             };
-
-            *cancel_slot.lock().await = None;
 
             match run_result {
                 Ok(()) => {
@@ -392,6 +401,15 @@ impl WireRpcState {
                     }
                 }
             }
+            let mut slot = active_turn_slot.lock().await;
+            if slot.as_ref().is_some_and(|turn| turn.id == turn_id) {
+                *slot = None;
+            }
+        });
+        *active_turn = Some(ActiveTurn {
+            id: turn_id,
+            cancel_token,
+            task,
         });
     }
 
@@ -399,8 +417,13 @@ impl WireRpcState {
         let Some(id) = msg.id.clone() else {
             return;
         };
-        let guard = self.cancel_token.lock().await;
-        let Some(token) = guard.as_ref() else {
+        let cancel_token = self
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .map(|turn| turn.cancel_token.clone());
+        let Some(token) = cancel_token else {
             self.send_error(
                 id,
                 error_codes::INVALID_STATE,
@@ -534,7 +557,7 @@ impl WireRpcState {
         }
     }
 
-    async fn shutdown(&self) {
+    async fn reject_pending_requests(&self) {
         let pending = {
             let mut pending = self.pending.lock().await;
             std::mem::take(&mut *pending)
@@ -554,12 +577,31 @@ impl WireRpcState {
                 }
             }
         }
+    }
 
-        if let Some(token) = self.cancel_token.lock().await.take() {
-            token.cancel();
-        }
+    async fn shutdown(&self) {
+        self.reject_pending_requests().await;
+
+        cancel_and_wait_active_turn(&self.active_turn).await;
+
+        self.reject_pending_requests().await;
 
         self.write_queue.shutdown(false);
+    }
+}
+
+async fn cancel_and_wait_active_turn(
+    active_turn_slot: &Arc<tokio::sync::Mutex<Option<ActiveTurn>>>,
+) {
+    let active_turn = {
+        let mut active_turn = active_turn_slot.lock().await;
+        active_turn.take()
+    };
+    if let Some(active_turn) = active_turn {
+        active_turn.cancel_token.cancel();
+        if let Err(err) = active_turn.task.await {
+            warn!("Wire turn task join failed during shutdown: {:?}", err);
+        }
     }
 }
 
@@ -988,7 +1030,12 @@ async fn request_tool_call(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_session_id, normalize_ws_path};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::{ActiveTurn, cancel_and_wait_active_turn, normalize_session_id, normalize_ws_path};
 
     #[test]
     fn normalize_ws_path_accepts_valid_path() {
@@ -1021,5 +1068,31 @@ mod tests {
         assert!(normalize_session_id("a:b").is_err());
         assert!(normalize_session_id("a b").is_err());
         assert!(normalize_session_id(&"a".repeat(129)).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_and_wait_active_turn_waits_for_turn_exit() {
+        let active_turn_slot = Arc::new(tokio::sync::Mutex::new(None));
+        let cancel_token = CancellationToken::new();
+        let task_cancel_token = cancel_token.clone();
+        let task = tokio::spawn(async move {
+            task_cancel_token.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        *active_turn_slot.lock().await = Some(ActiveTurn {
+            id: 1,
+            cancel_token,
+            task,
+        });
+
+        let started_at = Instant::now();
+        cancel_and_wait_active_turn(&active_turn_slot).await;
+
+        assert!(
+            started_at.elapsed() >= Duration::from_millis(50),
+            "cancel_and_wait_active_turn returned before turn task finished"
+        );
+        assert!(active_turn_slot.lock().await.is_none());
     }
 }

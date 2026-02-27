@@ -8,7 +8,7 @@ use kaos::KaosPath;
 use kosong::message::{Message, Role};
 use tracing::{debug, error, info, warn};
 
-use crate::metadata::{WorkDirMeta, load_metadata, save_metadata};
+use crate::metadata::{WorkDirMeta, load_metadata, update_metadata};
 use crate::wire::{TurnBegin, UserInput, WireFile, WireMessage};
 
 #[derive(Clone, Debug)]
@@ -84,10 +84,12 @@ impl Session {
             "Creating new session for work directory: {}",
             work_dir.to_string_lossy()
         );
-        let mut metadata = load_metadata().await;
-        let work_dir_meta = metadata
-            .get_work_dir_meta(&work_dir)
-            .unwrap_or_else(|| metadata.new_work_dir_meta(&work_dir));
+        let work_dir_meta = update_metadata(|metadata| {
+            metadata
+                .get_work_dir_meta(&work_dir)
+                .unwrap_or_else(|| metadata.new_work_dir_meta(&work_dir))
+        })
+        .await;
 
         let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let sessions_dir = work_dir_meta.ensure_sessions_dir().await;
@@ -137,8 +139,6 @@ impl Session {
                     context_file.display()
                 )
             });
-
-        save_metadata(&metadata).await;
 
         let mut session = Session {
             id: session_id,
@@ -322,38 +322,45 @@ impl Session {
 }
 
 pub async fn post_run(session: &Session) -> anyhow::Result<()> {
-    let mut metadata = load_metadata().await;
-    let mut index = metadata.work_dirs.iter().position(|meta| {
-        meta.path == session.work_dir.to_string() && meta.kaos == session.work_dir_meta.kaos
-    });
-
-    if index.is_none() {
-        warn!(
-            "Work dir metadata missing when marking last session, recreating: {}",
-            session.work_dir.to_string_lossy()
-        );
-        let meta = session.work_dir_meta.clone();
-        metadata.work_dirs.push(meta);
-        index = Some(metadata.work_dirs.len() - 1);
-    }
-
-    let Some(idx) = index else {
-        save_metadata(&metadata).await;
-        return Ok(());
-    };
-
-    let meta = &mut metadata.work_dirs[idx];
-    if session.is_empty().await {
+    let is_empty = session.is_empty().await;
+    if is_empty {
         info!("Session {} has empty context, removing it", session.id);
         session.delete().await;
-        if meta.last_session_id.as_deref() == Some(&session.id) {
-            meta.last_session_id = None;
-        }
-    } else {
-        meta.last_session_id = Some(session.id.clone());
     }
 
-    save_metadata(&metadata).await;
+    let work_dir = session.work_dir.to_string();
+    let work_dir_kaos = session.work_dir_meta.kaos.clone();
+    let work_dir_meta = session.work_dir_meta.clone();
+    let session_id = session.id.clone();
+    update_metadata(move |metadata| {
+        let mut index = metadata
+            .work_dirs
+            .iter()
+            .position(|meta| meta.path == work_dir && meta.kaos == work_dir_kaos);
+
+        if index.is_none() {
+            warn!(
+                "Work dir metadata missing when marking last session, recreating: {}",
+                work_dir_meta.path
+            );
+            metadata.work_dirs.push(work_dir_meta);
+            index = Some(metadata.work_dirs.len() - 1);
+        }
+
+        let Some(idx) = index else {
+            return;
+        };
+        let meta = &mut metadata.work_dirs[idx];
+        if is_empty {
+            if meta.last_session_id.as_deref() == Some(session_id.as_str()) {
+                meta.last_session_id = None;
+            }
+        } else {
+            meta.last_session_id = Some(session_id);
+        }
+    })
+    .await;
+
     Ok(())
 }
 
