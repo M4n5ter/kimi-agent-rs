@@ -425,7 +425,7 @@ impl KimiSoul {
 
         wire_send(WireMessage::ContentPart(ContentPart::Text(TextPart::new(
             format!(
-                "Failed to load MCP server(s) required by skill `/{}{}:`\n{}",
+                "Failed to load MCP server(s) required by skill `/{}{}`:\n{}",
                 SKILL_COMMAND_PREFIX,
                 skill.name,
                 failures.join("\n")
