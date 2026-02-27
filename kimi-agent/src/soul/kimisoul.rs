@@ -238,7 +238,10 @@ impl KimiSoul {
             },
             Some(SlashHandler::Skill(skill)) => self.run_skill(skill, args).await,
             Some(SlashHandler::Flow(skill, runner)) => {
-                if !self.ensure_skill_mcp_ready(skill).await? {
+                if !self
+                    .ensure_skill_mcp_ready(skill, FLOW_COMMAND_PREFIX)
+                    .await?
+                {
                     return Ok(());
                 }
                 runner.run(self, args).await
@@ -340,7 +343,10 @@ impl KimiSoul {
     }
 
     async fn run_skill(&self, skill: &Skill, args: &str) -> anyhow::Result<()> {
-        if !self.ensure_skill_mcp_ready(skill).await? {
+        if !self
+            .ensure_skill_mcp_ready(skill, SKILL_COMMAND_PREFIX)
+            .await?
+        {
             return Ok(());
         }
         let Some(mut skill_text) = read_skill_text(skill).await else {
@@ -365,7 +371,11 @@ impl KimiSoul {
         Ok(())
     }
 
-    async fn ensure_skill_mcp_ready(&self, skill: &Skill) -> anyhow::Result<bool> {
+    async fn ensure_skill_mcp_ready(
+        &self,
+        skill: &Skill,
+        command_prefix: &str,
+    ) -> anyhow::Result<bool> {
         if skill.mcp_servers.is_empty() {
             return Ok(true);
         }
@@ -426,7 +436,7 @@ impl KimiSoul {
         wire_send(WireMessage::ContentPart(ContentPart::Text(TextPart::new(
             format!(
                 "Failed to load MCP server(s) required by skill `/{}{}`:\n{}",
-                SKILL_COMMAND_PREFIX,
+                command_prefix,
                 skill.name,
                 failures.join("\n")
             ),
