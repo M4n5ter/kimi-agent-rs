@@ -631,10 +631,9 @@ impl WireServer {
 }
 
 pub struct WireWsServer {
-    runtime_mode: WsRuntimeMode,
+    options: Arc<WsSessionRuntimeOptions>,
     listen_addr: SocketAddr,
     path: String,
-    default_session_id: String,
 }
 
 #[derive(Clone)]
@@ -653,30 +652,8 @@ pub struct WsSessionRuntimeOptions {
     pub max_ralph_iterations: Option<i64>,
 }
 
-#[derive(Clone)]
-enum WsRuntimeMode {
-    SingleSoul(Arc<KimiSoul>),
-    SessionFactory(Arc<WsSessionRuntimeOptions>),
-}
-
 impl WireWsServer {
     pub fn new(
-        soul: Arc<KimiSoul>,
-        listen_addr: SocketAddr,
-        path: impl Into<String>,
-    ) -> anyhow::Result<Self> {
-        let path = path.into();
-        let path = normalize_ws_path(&path)?;
-        let default_session_id = normalize_session_id(&soul.runtime().session.id)?;
-        Ok(Self {
-            runtime_mode: WsRuntimeMode::SingleSoul(soul),
-            listen_addr,
-            path,
-            default_session_id,
-        })
-    }
-
-    pub fn new_multi(
         options: WsSessionRuntimeOptions,
         listen_addr: SocketAddr,
         path: impl Into<String>,
@@ -686,10 +663,9 @@ impl WireWsServer {
         let mut options = options;
         options.default_session_id = normalize_session_id(&options.default_session_id)?;
         Ok(Self {
-            runtime_mode: WsRuntimeMode::SessionFactory(Arc::new(options.clone())),
+            options: Arc::new(options),
             listen_addr,
             path,
-            default_session_id: options.default_session_id,
         })
     }
 
@@ -709,10 +685,7 @@ impl WireWsServer {
             "Starting Wire server on websocket"
         );
 
-        let state = Arc::new(WsServerState::new(
-            self.runtime_mode.clone(),
-            self.default_session_id.clone(),
-        ));
+        let state = Arc::new(WsServerState::new(Arc::clone(&self.options)));
         let app = Router::new()
             .route(&self.path, get(ws_upgrade_handler))
             .with_state(Arc::clone(&state));
@@ -723,34 +696,22 @@ impl WireWsServer {
 }
 
 struct WsServerState {
-    runtime_mode: WsRuntimeMode,
-    default_session_id: String,
+    options: Arc<WsSessionRuntimeOptions>,
     active_sessions: Mutex<HashSet<String>>,
 }
 
 impl WsServerState {
-    fn new(runtime_mode: WsRuntimeMode, default_session_id: String) -> Self {
+    fn new(options: Arc<WsSessionRuntimeOptions>) -> Self {
         Self {
-            runtime_mode,
-            default_session_id,
+            options,
             active_sessions: Mutex::new(HashSet::new()),
         }
     }
 
     fn resolve_session_id(&self, requested_session_id: Option<&str>) -> anyhow::Result<String> {
-        match (&self.runtime_mode, requested_session_id) {
-            (WsRuntimeMode::SingleSoul(_), Some(requested)) => {
-                let normalized = normalize_session_id(requested)?;
-                if normalized != self.default_session_id {
-                    anyhow::bail!(
-                        "single-session websocket server only accepts session_id `{}`",
-                        self.default_session_id
-                    );
-                }
-                Ok(normalized)
-            }
-            (_, Some(requested)) => normalize_session_id(requested),
-            (_, None) => Ok(self.default_session_id.clone()),
+        match requested_session_id {
+            Some(requested) => normalize_session_id(requested),
+            None => Ok(self.options.default_session_id.clone()),
         }
     }
 
@@ -775,41 +736,32 @@ impl WsServerState {
     }
 
     async fn create_rpc(&self, session_id: &str) -> anyhow::Result<WireRpcState> {
-        match &self.runtime_mode {
-            WsRuntimeMode::SingleSoul(soul) => Ok(WireRpcState::new(Arc::clone(soul))),
-            WsRuntimeMode::SessionFactory(options) => {
-                let session = match Session::find(options.work_dir.clone(), session_id).await {
-                    Some(session) => session,
-                    None => {
-                        Session::create(
-                            options.work_dir.clone(),
-                            Some(session_id.to_string()),
-                            None,
-                        )
-                        .await
-                    }
-                };
-
-                let cli = KimiCLI::create(
-                    session,
-                    CreateOptions {
-                        config: Some(ConfigInput::Inline(Box::new(options.config.clone()))),
-                        model_name: options.model_name.clone(),
-                        thinking: options.thinking,
-                        yolo: options.yolo,
-                        agent_file: options.agent_file.clone(),
-                        mcp_configs: options.mcp_configs.clone(),
-                        skills_dir: options.skills_dir.clone(),
-                        max_steps_per_turn: options.max_steps_per_turn,
-                        max_retries_per_step: options.max_retries_per_step,
-                        max_ralph_iterations: options.max_ralph_iterations,
-                    },
-                )
-                .await?;
-
-                Ok(WireRpcState::new(cli.soul()))
+        let options = &self.options;
+        let session = match Session::find(options.work_dir.clone(), session_id).await {
+            Some(session) => session,
+            None => {
+                Session::create(options.work_dir.clone(), Some(session_id.to_string()), None).await
             }
-        }
+        };
+
+        let cli = KimiCLI::create(
+            session,
+            CreateOptions {
+                config: Some(ConfigInput::Inline(Box::new(options.config.clone()))),
+                model_name: options.model_name.clone(),
+                thinking: options.thinking,
+                yolo: options.yolo,
+                agent_file: options.agent_file.clone(),
+                mcp_configs: options.mcp_configs.clone(),
+                skills_dir: options.skills_dir.clone(),
+                max_steps_per_turn: options.max_steps_per_turn,
+                max_retries_per_step: options.max_retries_per_step,
+                max_ralph_iterations: options.max_ralph_iterations,
+            },
+        )
+        .await?;
+
+        Ok(WireRpcState::new(cli.soul()))
     }
 }
 

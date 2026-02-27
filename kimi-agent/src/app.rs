@@ -19,7 +19,7 @@ use crate::soul::context::Context;
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::run_soul;
 use crate::wire::WireMessage;
-use crate::wire::server::{WireServer, WireWsServer};
+use crate::wire::server::{WireServer, WireWsServer, WsSessionRuntimeOptions};
 
 pub struct KimiCLI {
     soul: Arc<KimiSoul>,
@@ -219,8 +219,13 @@ impl KimiCLI {
         server.serve().await
     }
 
-    pub async fn run_wire_ws(&self, listen_addr: SocketAddr, path: &str) -> anyhow::Result<()> {
-        let server = WireWsServer::new(Arc::clone(&self.soul), listen_addr, path)?;
+    pub async fn run_wire_ws(
+        &self,
+        options: WsSessionRuntimeOptions,
+        listen_addr: SocketAddr,
+        path: &str,
+    ) -> anyhow::Result<()> {
+        let server = WireWsServer::new(options, listen_addr, path)?;
         server.serve().await
     }
 }

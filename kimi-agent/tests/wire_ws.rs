@@ -10,10 +10,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::error::Error as WsError;
 
 use kaos::KaosPath;
-use kimi_agent::app::{ConfigInput, CreateOptions, KimiCLI};
 use kimi_agent::config::{Config, LLMModel, LLMProvider, ProviderType, get_default_config};
 use kimi_agent::constant::{NAME, VERSION};
-use kimi_agent::session::Session;
 use kimi_agent::wire::protocol::WIRE_PROTOCOL_VERSION;
 use kimi_agent::wire::server::{WireWsServer, WsSessionRuntimeOptions};
 
@@ -159,37 +157,6 @@ async fn recv_response_by_id(
     panic!("timed out waiting for response id={id}");
 }
 
-async fn create_scripted_cli(
-    scripts: &[&str],
-    home_dir: &TempDir,
-    work_dir: &TempDir,
-) -> (KimiCLI, Vec<EnvGuard>) {
-    let env = configure_scripted_env(home_dir, scripts);
-    let config = scripted_config();
-
-    let work_path = KaosPath::from(work_dir.path().to_path_buf());
-    let session = Session::create(work_path, None, None).await;
-    let cli = KimiCLI::create(
-        session,
-        CreateOptions {
-            config: Some(ConfigInput::Inline(Box::new(config))),
-            model_name: None,
-            thinking: Some(false),
-            yolo: true,
-            agent_file: None,
-            mcp_configs: vec![],
-            skills_dir: None,
-            max_steps_per_turn: None,
-            max_retries_per_step: None,
-            max_ralph_iterations: None,
-        },
-    )
-    .await
-    .expect("create kimi cli");
-
-    (cli, env)
-}
-
 fn scripted_runtime_options(
     work_dir: &TempDir,
     default_session_id: &str,
@@ -215,13 +182,14 @@ async fn test_wire_ws_initialize_and_prompt() {
     let _lock = ENV_LOCK.lock().await;
     let home_dir = TempDir::new().expect("home dir");
     let work_dir = TempDir::new().expect("work dir");
-    let (cli, _env) = create_scripted_cli(&["text: hello from ws"], &home_dir, &work_dir).await;
+    let _env = configure_scripted_env(&home_dir, &["text: hello from ws"]);
+    let options = scripted_runtime_options(&work_dir, "default-session");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
     let listen_addr = listener.local_addr().expect("listener local addr");
-    let server = WireWsServer::new(cli.soul(), listen_addr, "/wire").expect("wire ws server");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws server");
     let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
 
     let mut ws = connect_ws_with_retry(&format!("ws://{listen_addr}/wire")).await;
@@ -316,21 +284,20 @@ async fn test_wire_ws_external_tool_request_roundtrip() {
     let _lock = ENV_LOCK.lock().await;
     let home_dir = TempDir::new().expect("home dir");
     let work_dir = TempDir::new().expect("work dir");
-    let (cli, _env) = create_scripted_cli(
+    let _env = configure_scripted_env(
+        &home_dir,
         &[
             r#"tool_call: {"id":"tc-1","name":"open_in_ide","arguments":"{\"path\":\"/tmp/a\"}"}"#,
             "text: tool handled",
         ],
-        &home_dir,
-        &work_dir,
-    )
-    .await;
+    );
+    let options = scripted_runtime_options(&work_dir, "default-session");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
     let listen_addr = listener.local_addr().expect("listener local addr");
-    let server = WireWsServer::new(cli.soul(), listen_addr, "/wire").expect("wire ws server");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws server");
     let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
 
     let mut ws = connect_ws_with_retry(&format!("ws://{listen_addr}/wire")).await;
@@ -468,8 +435,7 @@ async fn test_wire_ws_same_session_rejects_second_client() {
         .await
         .expect("bind listener");
     let listen_addr = listener.local_addr().expect("listener local addr");
-    let server =
-        WireWsServer::new_multi(options, listen_addr, "/wire").expect("wire ws multi server");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws multi server");
     let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
 
     let mut first = connect_ws_with_retry(&format!("ws://{listen_addr}/wire?session_id=s1")).await;
@@ -512,8 +478,7 @@ async fn test_wire_ws_allows_parallel_sessions() {
         .await
         .expect("bind listener");
     let listen_addr = listener.local_addr().expect("listener local addr");
-    let server =
-        WireWsServer::new_multi(options, listen_addr, "/wire").expect("wire ws multi server");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws multi server");
     let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
 
     let mut ws_a = connect_ws_with_retry(&format!("ws://{listen_addr}/wire?session_id=s-a")).await;

@@ -293,7 +293,7 @@ pub async fn run() -> Result<()> {
         }
         WireTransport::Ws => {
             let listen_addr = parse_wire_listen_addr(&cli.wire_listen)?;
-            let server = crate::wire::server::WireWsServer::new_multi(
+            let server = crate::wire::server::WireWsServer::new(
                 crate::wire::server::WsSessionRuntimeOptions {
                     work_dir,
                     default_session_id: default_session.id.clone(),
