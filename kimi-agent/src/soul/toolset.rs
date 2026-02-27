@@ -555,7 +555,13 @@ pub struct HttpServerConfig {
 pub fn parse_mcp_config(value: &Value) -> Result<HashMap<String, McpServerConfig>, String> {
     let config: McpConfig = serde_json::from_value(value.clone())
         .map_err(|err| format!("Invalid MCP config: {err}"))?;
-    Ok(config.mcp_servers)
+    config
+        .mcp_servers
+        .into_iter()
+        .map(|(name, server)| {
+            canonicalize_mcp_server_config(server).map(|normalized| (name, normalized))
+        })
+        .collect()
 }
 
 fn build_client_info() -> ClientInfo {
@@ -572,9 +578,32 @@ fn build_client_info() -> ClientInfo {
 }
 
 fn normalize_http_transport(transport: &Option<String>) -> Result<(), String> {
-    match transport.as_deref() {
-        None | Some("http") | Some("streamable-http") => Ok(()),
+    canonical_http_transport(transport.as_deref()).map(|_| ())
+}
+
+fn canonical_http_transport(transport: Option<&str>) -> Result<&'static str, String> {
+    match transport {
+        None | Some("http") | Some("streamable-http") => Ok("streamable-http"),
         Some(other) => Err(format!("Unsupported transport: {other}")),
+    }
+}
+
+fn canonicalize_mcp_server_config(server: McpServerConfig) -> Result<McpServerConfig, String> {
+    match server {
+        McpServerConfig::Stdio(mut stdio) => {
+            if stdio.env.as_ref().is_some_and(HashMap::is_empty) {
+                stdio.env = None;
+            }
+            Ok(McpServerConfig::Stdio(stdio))
+        }
+        McpServerConfig::Http(mut http) => {
+            let transport = canonical_http_transport(http.transport.as_deref())?;
+            http.transport = Some(transport.to_string());
+            if http.headers.as_ref().is_some_and(HashMap::is_empty) {
+                http.headers = None;
+            }
+            Ok(McpServerConfig::Http(http))
+        }
     }
 }
 
@@ -935,5 +964,85 @@ impl CallableTool for McpTool {
             ),
             Err(err) => tool_error("", err.to_string(), "MCP error"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{McpServerConfig, parse_mcp_config};
+
+    #[test]
+    fn parse_mcp_config_canonicalizes_http_transport_aliases() {
+        let config = json!({
+            "mcpServers": {
+                "a": { "url": "https://a.example/mcp" },
+                "b": { "url": "https://b.example/mcp", "transport": "http" },
+                "c": { "url": "https://c.example/mcp", "transport": "streamable-http" }
+            }
+        });
+
+        let parsed = parse_mcp_config(&config).expect("parse should succeed");
+
+        for name in ["a", "b", "c"] {
+            let server = parsed.get(name).expect("server must exist");
+            match server {
+                McpServerConfig::Http(http) => {
+                    assert_eq!(http.transport.as_deref(), Some("streamable-http"));
+                }
+                McpServerConfig::Stdio(_) => panic!("expected HTTP config"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_mcp_config_canonicalizes_empty_maps() {
+        let config = json!({
+            "mcpServers": {
+                "stdio": {
+                    "command": "npx",
+                    "args": [],
+                    "env": {}
+                },
+                "http": {
+                    "url": "https://example.com/mcp",
+                    "headers": {}
+                }
+            }
+        });
+
+        let parsed = parse_mcp_config(&config).expect("parse should succeed");
+
+        match parsed.get("stdio").expect("stdio must exist") {
+            McpServerConfig::Stdio(stdio) => {
+                assert_eq!(stdio.args, Vec::<String>::new());
+                assert!(stdio.env.is_none());
+            }
+            McpServerConfig::Http(_) => panic!("expected stdio config"),
+        }
+
+        match parsed.get("http").expect("http must exist") {
+            McpServerConfig::Http(http) => {
+                assert!(http.headers.is_none());
+                assert_eq!(http.transport.as_deref(), Some("streamable-http"));
+            }
+            McpServerConfig::Stdio(_) => panic!("expected HTTP config"),
+        }
+    }
+
+    #[test]
+    fn parse_mcp_config_rejects_unsupported_http_transport() {
+        let config = json!({
+            "mcpServers": {
+                "bad": {
+                    "url": "https://example.com/mcp",
+                    "transport": "sse"
+                }
+            }
+        });
+
+        let err = parse_mcp_config(&config).expect_err("parse should fail");
+        assert!(err.contains("Unsupported transport: sse"));
     }
 }
