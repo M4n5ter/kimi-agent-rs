@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde_json::json;
+use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 use kimi_agent::config::{LLMModel, LLMProvider, ModelCapability, ProviderType};
@@ -345,7 +346,7 @@ async fn test_create_llm_google_genai_provider_uses_openai_compat() {
 }
 
 #[tokio::test]
-async fn test_create_llm_vertexai_provider_sets_env_and_uses_openai_compat() {
+async fn test_create_llm_vertexai_provider_does_not_mutate_process_env_and_uses_openai_compat() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = EnvGuard::set("VERTEX_TEST_PROJECT", "old");
 
@@ -375,6 +376,47 @@ async fn test_create_llm_vertexai_provider_sets_env_and_uses_openai_compat() {
     assert_eq!(llm.chat_provider.name(), "vertexai");
     assert_eq!(
         std::env::var("VERTEX_TEST_PROJECT").expect("vertex env"),
-        "new-project"
+        "old"
+    );
+}
+
+#[tokio::test]
+async fn test_create_llm_scripted_echo_prefers_provider_env_without_mutating_process_env() {
+    let _lock = ENV_LOCK.lock().await;
+    let _guard = EnvGuard::set("KIMI_SCRIPTED_ECHO_SCRIPTS", "/tmp/does-not-exist.json");
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let scripts_path = temp_dir.path().join("scripts.json");
+    std::fs::write(&scripts_path, r#"["text: from provider env"]"#).expect("write scripts");
+
+    let provider = LLMProvider {
+        provider_type: ProviderType::ScriptedEcho,
+        base_url: String::new(),
+        api_key: String::new(),
+        env: Some(HashMap::from([
+            (
+                "KIMI_SCRIPTED_ECHO_SCRIPTS".to_string(),
+                scripts_path.to_string_lossy().to_string(),
+            ),
+            ("KIMI_SCRIPTED_ECHO_TRACE".to_string(), "false".to_string()),
+        ])),
+        custom_headers: None,
+    };
+    let model = LLMModel {
+        provider: "_scripted_echo".to_string(),
+        model: "scripted_echo".to_string(),
+        max_context_size: 10_000,
+        capabilities: None,
+    };
+
+    let llm = create_llm(&provider, &model, None, None)
+        .await
+        .expect("create llm")
+        .expect("llm");
+
+    assert_eq!(llm.chat_provider.name(), "scripted_echo");
+    assert_eq!(
+        std::env::var("KIMI_SCRIPTED_ECHO_SCRIPTS").expect("scripted echo env"),
+        "/tmp/does-not-exist.json"
     );
 }
