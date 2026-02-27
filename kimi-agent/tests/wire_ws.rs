@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::error::Error as WsError;
 use kaos::KaosPath;
 use kimi_agent::config::{Config, LLMModel, LLMProvider, ProviderType, get_default_config};
 use kimi_agent::constant::{NAME, VERSION};
+use kimi_agent::session::Session;
 use kimi_agent::wire::protocol::WIRE_PROTOCOL_VERSION;
 use kimi_agent::wire::server::{WireWsServer, WsSessionRuntimeOptions};
 
@@ -570,6 +571,51 @@ async fn test_wire_ws_allows_parallel_sessions() {
 
     ws_a.close(None).await.expect("close ws a");
     ws_b.close(None).await.expect("close ws b");
+    server_task.abort();
+    let join_err = server_task
+        .await
+        .expect_err("server task should be aborted for test shutdown");
+    assert!(join_err.is_cancelled(), "unexpected join error: {join_err}");
+}
+
+#[tokio::test]
+async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_rolls_back_session() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let work_dir = TempDir::new().expect("work dir");
+    let _env = configure_scripted_env(&home_dir, &["text: hello"]);
+
+    let mut options = scripted_runtime_options(&work_dir, "default-session");
+    options.agent_file = Some(home_dir.path().join("missing-agent.yaml"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
+
+    let failed_session_id = "failed-session";
+    let connect_result = connect_async(format!(
+        "ws://{listen_addr}/wire?session_id={failed_session_id}"
+    ))
+    .await;
+    match connect_result {
+        Err(WsError::Http(resp)) => {
+            assert_eq!(
+                resp.status(),
+                tokio_tungstenite::tungstenite::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+        other => panic!("expected HTTP 500 when runtime init fails, got: {other:?}"),
+    }
+
+    let work_path = KaosPath::from(work_dir.path().to_path_buf());
+    let session = Session::find(work_path, failed_session_id).await;
+    assert!(
+        session.is_none(),
+        "expected failed websocket runtime init to roll back new session"
+    );
+
     server_task.abort();
     let join_err = server_task
         .await

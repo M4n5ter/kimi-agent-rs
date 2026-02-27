@@ -779,11 +779,18 @@ impl WsServerState {
 
     async fn create_rpc(&self, session_id: &str) -> anyhow::Result<WireRpcState> {
         let options = &self.options;
-        let session = match Session::find(options.work_dir.clone(), session_id).await {
+        let found_session = Session::find(options.work_dir.clone(), session_id).await;
+        let created_new_session = found_session.is_none();
+        let session = match found_session {
             Some(session) => session,
             None => {
                 Session::create(options.work_dir.clone(), Some(session_id.to_string()), None).await
             }
+        };
+        let rollback_session = if created_new_session {
+            Some(session.clone())
+        } else {
+            None
         };
 
         let cli = KimiCLI::create(
@@ -801,7 +808,22 @@ impl WsServerState {
                 max_ralph_iterations: options.max_ralph_iterations,
             },
         )
-        .await?;
+        .await;
+        let cli = match cli {
+            Ok(cli) => cli,
+            Err(err) => {
+                if let Some(rollback_session) = rollback_session
+                    && let Err(post_run_err) = post_run_session(&rollback_session).await
+                {
+                    warn!(
+                        session_id = %session_id,
+                        "Failed to rollback newly created session after runtime init failure: {}",
+                        post_run_err
+                    );
+                }
+                return Err(err);
+            }
+        };
 
         Ok(WireRpcState::new(cli.soul()))
     }
@@ -825,38 +847,68 @@ async fn ws_upgrade_handler(
             .into_response();
     }
 
+    let prepared_rpc = match state.create_rpc(&session_id).await {
+        Ok(rpc) => rpc,
+        Err(err) => {
+            error!(
+                session_id = %session_id,
+                "Failed to initialize wire websocket runtime: {}",
+                err
+            );
+            state.release_session(&session_id);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to initialize websocket runtime: {err}"),
+            )
+                .into_response();
+        }
+    };
+
+    let rpc_slot = Arc::new(tokio::sync::Mutex::new(Some(prepared_rpc)));
     let state_for_upgrade = Arc::clone(&state);
     let session_id_for_upgrade = session_id.clone();
+    let rpc_slot_for_upgrade = Arc::clone(&rpc_slot);
     let state_for_failed_upgrade = Arc::clone(&state);
     let session_id_for_failed_upgrade = session_id.clone();
+    let rpc_slot_for_failed_upgrade = Arc::clone(&rpc_slot);
     ws.on_failed_upgrade(move |err| {
         warn!(
             session_id = %session_id_for_failed_upgrade,
             "Wire websocket upgrade failed: {}",
             err
         );
-        state_for_failed_upgrade.release_session(&session_id_for_failed_upgrade);
+        tokio::spawn(async move {
+            if let Some(rpc) = rpc_slot_for_failed_upgrade.lock().await.take() {
+                let session = rpc.session();
+                rpc.shutdown().await;
+                if let Err(post_run_err) = post_run_session(&session).await {
+                    warn!(
+                        session_id = %session_id_for_failed_upgrade,
+                        "Failed to finalize session metadata after failed websocket upgrade: {}",
+                        post_run_err
+                    );
+                }
+            }
+            state_for_failed_upgrade.release_session(&session_id_for_failed_upgrade);
+        });
     })
     .on_upgrade(move |socket| async move {
-        handle_ws_socket(socket, state_for_upgrade, session_id_for_upgrade).await;
+        let rpc = rpc_slot_for_upgrade
+            .lock()
+            .await
+            .take()
+            .expect("prepared websocket runtime missing");
+        handle_ws_socket(socket, state_for_upgrade, session_id_for_upgrade, rpc).await;
     })
     .into_response()
 }
 
-async fn handle_ws_socket(socket: WebSocket, state: Arc<WsServerState>, session_id: String) {
-    let rpc = match state.create_rpc(&session_id).await {
-        Ok(rpc) => rpc,
-        Err(err) => {
-            error!(
-                session_id = %session_id,
-                "Failed to create wire session runtime: {}",
-                err
-            );
-            state.release_session(&session_id);
-            return;
-        }
-    };
-
+async fn handle_ws_socket(
+    socket: WebSocket,
+    state: Arc<WsServerState>,
+    session_id: String,
+    rpc: WireRpcState,
+) {
     let (mut sender, mut receiver) = socket.split();
 
     let write_queue = rpc.write_queue();
