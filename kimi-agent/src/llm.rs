@@ -252,11 +252,18 @@ pub async fn create_llm(
         }
         ProviderType::Vertexai => {
             // Intentional: use Vertex AI OpenAI-compatible endpoint via OpenAILegacy for now.
+            let api_key =
+                resolve_provider_value(&provider.api_key, provider.env.as_ref(), "OPENAI_API_KEY");
+            let base_url = resolve_provider_value(
+                &provider.base_url,
+                provider.env.as_ref(),
+                "OPENAI_BASE_URL",
+            );
             Box::new(
                 kosong::chat_provider::openai_legacy::OpenAILegacy::new(
                     model.model.clone(),
-                    Some(provider.api_key.clone()),
-                    Some(provider.base_url.clone()),
+                    Some(api_key),
+                    Some(base_url),
                     Some(default_headers.clone()),
                 )
                 .map_err(map_chat_provider_error)?
@@ -366,6 +373,17 @@ fn read_env_var(provider_env: Option<&HashMap<String, String>>, key: &str) -> Op
         .and_then(|envs| envs.get(key))
         .cloned()
         .or_else(|| env::var(key).ok())
+}
+
+fn resolve_provider_value(
+    value: &str,
+    provider_env: Option<&HashMap<String, String>>,
+    env_key: &str,
+) -> String {
+    if !value.is_empty() {
+        return value.to_string();
+    }
+    read_env_var(provider_env, env_key).unwrap_or_default()
 }
 
 async fn load_scripted_echo_scripts(
