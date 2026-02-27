@@ -8,7 +8,8 @@ use kaos::KaosPath;
 use kosong::message::{Message, Role};
 use tracing::{debug, error, info, warn};
 
-use crate::metadata::{WorkDirMeta, load_metadata, save_metadata};
+use crate::metadata::{WorkDirMeta, load_metadata, update_metadata};
+use crate::session_id::normalize_session_id;
 use crate::wire::{TurnBegin, UserInput, WireFile, WireMessage};
 
 #[derive(Clone, Debug)]
@@ -84,12 +85,20 @@ impl Session {
             "Creating new session for work directory: {}",
             work_dir.to_string_lossy()
         );
-        let mut metadata = load_metadata().await;
-        let work_dir_meta = metadata
-            .get_work_dir_meta(&work_dir)
-            .unwrap_or_else(|| metadata.new_work_dir_meta(&work_dir));
+        let work_dir_meta = update_metadata(|metadata| {
+            metadata
+                .get_work_dir_meta(&work_dir)
+                .unwrap_or_else(|| metadata.new_work_dir_meta(&work_dir))
+        })
+        .await;
 
-        let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let session_id = session_id
+            .map(|session_id| {
+                normalize_session_id(&session_id).unwrap_or_else(|err| {
+                    panic!("Invalid session ID `{session_id}`: {err}");
+                })
+            })
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let sessions_dir = work_dir_meta.ensure_sessions_dir().await;
         let session_dir = sessions_dir.join(&session_id);
         tokio::fs::create_dir_all(&session_dir)
@@ -138,8 +147,6 @@ impl Session {
                 )
             });
 
-        save_metadata(&metadata).await;
-
         let mut session = Session {
             id: session_id,
             work_dir,
@@ -154,6 +161,13 @@ impl Session {
     }
 
     pub async fn find(work_dir: KaosPath, session_id: &str) -> Option<Session> {
+        let session_id = match normalize_session_id(session_id) {
+            Ok(session_id) => session_id,
+            Err(err) => {
+                warn!("Ignoring invalid session ID `{session_id}`: {err}");
+                return None;
+            }
+        };
         let work_dir = work_dir.canonical();
         debug!(
             "Finding session for work directory: {}, session ID: {}",
@@ -170,9 +184,9 @@ impl Session {
         };
 
         let sessions_dir = work_dir_meta.ensure_sessions_dir().await;
-        migrate_session_context_file(&sessions_dir, session_id).await;
+        migrate_session_context_file(&sessions_dir, &session_id).await;
 
-        let session_dir = sessions_dir.join(session_id);
+        let session_dir = sessions_dir.join(&session_id);
         if tokio::fs::metadata(&session_dir)
             .await
             .map(|meta| !meta.is_dir())
@@ -188,7 +202,7 @@ impl Session {
         }
 
         let mut session = Session {
-            id: session_id.to_string(),
+            id: session_id,
             work_dir,
             work_dir_meta,
             context_file,
@@ -256,6 +270,13 @@ impl Session {
 
         let mut sessions = Vec::new();
         for session_id in session_ids {
+            let session_id = match normalize_session_id(&session_id) {
+                Ok(session_id) => session_id,
+                Err(err) => {
+                    warn!("Skipping invalid session ID entry `{session_id}`: {err}");
+                    continue;
+                }
+            };
             migrate_session_context_file(&sessions_dir, &session_id).await;
             let session_dir = sessions_dir.join(&session_id);
             if tokio::fs::metadata(&session_dir)
@@ -319,6 +340,49 @@ impl Session {
         debug!("Found last session for work directory: {}", session_id);
         Session::find(work_dir, &session_id).await
     }
+}
+
+pub async fn post_run(session: &Session) -> anyhow::Result<()> {
+    let is_empty = session.is_empty().await;
+    if is_empty {
+        info!("Session {} has empty context, removing it", session.id);
+        session.delete().await;
+    }
+
+    let work_dir = session.work_dir.to_string();
+    let work_dir_kaos = session.work_dir_meta.kaos.clone();
+    let work_dir_meta = session.work_dir_meta.clone();
+    let session_id = session.id.clone();
+    update_metadata(move |metadata| {
+        let mut index = metadata
+            .work_dirs
+            .iter()
+            .position(|meta| meta.path == work_dir && meta.kaos == work_dir_kaos);
+
+        if index.is_none() {
+            warn!(
+                "Work dir metadata missing when marking last session, recreating: {}",
+                work_dir_meta.path
+            );
+            metadata.work_dirs.push(work_dir_meta);
+            index = Some(metadata.work_dirs.len() - 1);
+        }
+
+        let Some(idx) = index else {
+            return;
+        };
+        let meta = &mut metadata.work_dirs[idx];
+        if is_empty {
+            if meta.last_session_id.as_deref() == Some(session_id.as_str()) {
+                meta.last_session_id = None;
+            }
+        } else {
+            meta.last_session_id = Some(session_id);
+        }
+    })
+    .await;
+
+    Ok(())
 }
 
 async fn migrate_session_context_file(sessions_dir: &Path, session_id: &str) {

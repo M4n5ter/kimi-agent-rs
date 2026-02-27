@@ -7,14 +7,14 @@ use tempfile::TempDir;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::error::Error as WsError;
 
 use kaos::KaosPath;
-use kimi_agent::app::{ConfigInput, CreateOptions, KimiCLI};
-use kimi_agent::config::{LLMModel, LLMProvider, ProviderType, get_default_config};
+use kimi_agent::config::{Config, LLMModel, LLMProvider, ProviderType, get_default_config};
 use kimi_agent::constant::{NAME, VERSION};
 use kimi_agent::session::Session;
 use kimi_agent::wire::protocol::WIRE_PROTOCOL_VERSION;
-use kimi_agent::wire::server::WireWsServer;
+use kimi_agent::wire::server::{WireWsServer, WsSessionRuntimeOptions};
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -62,6 +62,47 @@ fn set_home_env(path: &Path) -> Vec<EnvGuard> {
     ]
 }
 
+fn scripted_config() -> Config {
+    let mut config = get_default_config();
+    config.default_model = "scripted".to_string();
+    config.models.insert(
+        "scripted".to_string(),
+        LLMModel {
+            provider: "scripted_provider".to_string(),
+            model: "scripted_echo".to_string(),
+            max_context_size: 100_000,
+            capabilities: None,
+        },
+    );
+    config.providers.insert(
+        "scripted_provider".to_string(),
+        LLMProvider {
+            provider_type: ProviderType::ScriptedEcho,
+            base_url: String::new(),
+            api_key: String::new(),
+            env: None,
+            custom_headers: None,
+        },
+    );
+    config
+}
+
+fn configure_scripted_env(home_dir: &TempDir, scripts: &[&str]) -> Vec<EnvGuard> {
+    let mut env = set_home_env(home_dir.path());
+    let scripts_path = home_dir.path().join("scripts.json");
+    let scripts_json: Vec<String> = scripts.iter().map(|script| script.to_string()).collect();
+    std::fs::write(
+        &scripts_path,
+        serde_json::to_string(&scripts_json).expect("serialize scripts"),
+    )
+    .expect("write scripted echo file");
+    env.push(EnvGuard::set(
+        "KIMI_SCRIPTED_ECHO_SCRIPTS",
+        scripts_path.to_str().expect("scripts path"),
+    ));
+    env
+}
+
 async fn connect_ws_with_retry(
     url: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
@@ -102,67 +143,39 @@ async fn recv_json(
     }
 }
 
-async fn create_scripted_cli(
-    scripts: &[&str],
-    home_dir: &TempDir,
+async fn recv_response_by_id(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: &str,
+) -> Value {
+    for _ in 0..200 {
+        let msg = recv_json(ws).await;
+        if msg.get("id").and_then(Value::as_str) == Some(id) {
+            return msg;
+        }
+    }
+    panic!("timed out waiting for response id={id}");
+}
+
+fn scripted_runtime_options(
     work_dir: &TempDir,
-) -> (KimiCLI, Vec<EnvGuard>) {
-    let mut env = set_home_env(home_dir.path());
-    let scripts_path = home_dir.path().join("scripts.json");
-    let scripts_json: Vec<String> = scripts.iter().map(|script| script.to_string()).collect();
-    std::fs::write(
-        &scripts_path,
-        serde_json::to_string(&scripts_json).expect("serialize scripts"),
-    )
-    .expect("write scripted echo file");
-    env.push(EnvGuard::set(
-        "KIMI_SCRIPTED_ECHO_SCRIPTS",
-        scripts_path.to_str().expect("scripts path"),
-    ));
-
-    let mut config = get_default_config();
-    config.default_model = "scripted".to_string();
-    config.models.insert(
-        "scripted".to_string(),
-        LLMModel {
-            provider: "scripted_provider".to_string(),
-            model: "scripted_echo".to_string(),
-            max_context_size: 100_000,
-            capabilities: None,
-        },
-    );
-    config.providers.insert(
-        "scripted_provider".to_string(),
-        LLMProvider {
-            provider_type: ProviderType::ScriptedEcho,
-            base_url: String::new(),
-            api_key: String::new(),
-            env: None,
-            custom_headers: None,
-        },
-    );
-
-    let work_path = KaosPath::from(work_dir.path().to_path_buf());
-    let session = Session::create(work_path, None, None).await;
-    let cli = KimiCLI::create(
-        session,
-        CreateOptions {
-            config: Some(ConfigInput::Inline(Box::new(config))),
-            model_name: None,
-            thinking: Some(false),
-            yolo: true,
-            agent_file: None,
-            mcp_configs: vec![],
-            skills_dir: None,
-            max_steps_per_turn: None,
-            max_retries_per_step: None,
-            max_ralph_iterations: None,
-        },
-    )
-    .await
-    .expect("create kimi cli");
-
-    (cli, env)
+    default_session_id: &str,
+) -> WsSessionRuntimeOptions {
+    WsSessionRuntimeOptions {
+        work_dir: KaosPath::from(work_dir.path().to_path_buf()),
+        default_session_id: default_session_id.to_string(),
+        config: scripted_config(),
+        model_name: None,
+        thinking: Some(false),
+        yolo: true,
+        agent_file: None,
+        mcp_configs: vec![],
+        skills_dir: None,
+        max_steps_per_turn: None,
+        max_retries_per_step: None,
+        max_ralph_iterations: None,
+    }
 }
 
 #[tokio::test]
@@ -170,13 +183,14 @@ async fn test_wire_ws_initialize_and_prompt() {
     let _lock = ENV_LOCK.lock().await;
     let home_dir = TempDir::new().expect("home dir");
     let work_dir = TempDir::new().expect("work dir");
-    let (cli, _env) = create_scripted_cli(&["text: hello from ws"], &home_dir, &work_dir).await;
+    let _env = configure_scripted_env(&home_dir, &["text: hello from ws"]);
+    let options = scripted_runtime_options(&work_dir, "default-session");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
     let listen_addr = listener.local_addr().expect("listener local addr");
-    let server = WireWsServer::new(cli.soul(), listen_addr, "/wire").expect("wire ws server");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws server");
     let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
 
     let mut ws = connect_ws_with_retry(&format!("ws://{listen_addr}/wire")).await;
@@ -259,14 +273,11 @@ async fn test_wire_ws_initialize_and_prompt() {
     );
 
     ws.close(None).await.expect("close ws");
-    let server_result = tokio::time::timeout(Duration::from_secs(10), server_task)
+    server_task.abort();
+    let join_err = server_task
         .await
-        .expect("server task timeout")
-        .expect("server task join");
-    assert!(
-        server_result.is_ok(),
-        "server returned error: {server_result:?}"
-    );
+        .expect_err("server task should be aborted for test shutdown");
+    assert!(join_err.is_cancelled(), "unexpected join error: {join_err}");
 }
 
 #[tokio::test]
@@ -274,21 +285,20 @@ async fn test_wire_ws_external_tool_request_roundtrip() {
     let _lock = ENV_LOCK.lock().await;
     let home_dir = TempDir::new().expect("home dir");
     let work_dir = TempDir::new().expect("work dir");
-    let (cli, _env) = create_scripted_cli(
+    let _env = configure_scripted_env(
+        &home_dir,
         &[
             r#"tool_call: {"id":"tc-1","name":"open_in_ide","arguments":"{\"path\":\"/tmp/a\"}"}"#,
             "text: tool handled",
         ],
-        &home_dir,
-        &work_dir,
-    )
-    .await;
+    );
+    let options = scripted_runtime_options(&work_dir, "default-session");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
     let listen_addr = listener.local_addr().expect("listener local addr");
-    let server = WireWsServer::new(cli.soul(), listen_addr, "/wire").expect("wire ws server");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws server");
     let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
 
     let mut ws = connect_ws_with_retry(&format!("ws://{listen_addr}/wire")).await;
@@ -407,12 +417,208 @@ async fn test_wire_ws_external_tool_request_roundtrip() {
     );
 
     ws.close(None).await.expect("close ws");
-    let server_result = tokio::time::timeout(Duration::from_secs(10), server_task)
+    server_task.abort();
+    let join_err = server_task
         .await
-        .expect("server task timeout")
-        .expect("server task join");
-    assert!(
-        server_result.is_ok(),
-        "server returned error: {server_result:?}"
+        .expect_err("server task should be aborted for test shutdown");
+    assert!(join_err.is_cancelled(), "unexpected join error: {join_err}");
+}
+
+#[tokio::test]
+async fn test_wire_ws_same_session_rejects_second_client() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let work_dir = TempDir::new().expect("work dir");
+    let _env = configure_scripted_env(&home_dir, &["text: hello"]);
+
+    let options = scripted_runtime_options(&work_dir, "default-session");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws multi server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
+
+    let mut first = connect_ws_with_retry(&format!("ws://{listen_addr}/wire?session_id=s1")).await;
+    let second = connect_async(format!("ws://{listen_addr}/wire?session_id=s1")).await;
+    match second {
+        Err(WsError::Http(resp)) => {
+            assert_eq!(
+                resp.status(),
+                tokio_tungstenite::tungstenite::http::StatusCode::CONFLICT
+            );
+        }
+        other => panic!("expected HTTP 409 for second same-session client, got: {other:?}"),
+    }
+
+    first.close(None).await.expect("close first ws");
+    server_task.abort();
+    let join_err = server_task
+        .await
+        .expect_err("server task should be aborted for test shutdown");
+    assert!(join_err.is_cancelled(), "unexpected join error: {join_err}");
+}
+
+#[tokio::test]
+async fn test_wire_ws_allows_parallel_sessions() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let work_dir = TempDir::new().expect("work dir");
+    let _env = configure_scripted_env(
+        &home_dir,
+        &[
+            "text: session a response",
+            "text: session b response",
+            "text: fallback a",
+            "text: fallback b",
+        ],
     );
+
+    let options = scripted_runtime_options(&work_dir, "default-session");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws multi server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
+
+    let mut ws_a = connect_ws_with_retry(&format!("ws://{listen_addr}/wire?session_id=s-a")).await;
+    let mut ws_b = connect_ws_with_retry(&format!("ws://{listen_addr}/wire?session_id=s-b")).await;
+
+    ws_a.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init-a",
+            "method": "initialize",
+            "params": { "protocol_version": WIRE_PROTOCOL_VERSION }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send initialize a");
+    ws_b.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init-b",
+            "method": "initialize",
+            "params": { "protocol_version": WIRE_PROTOCOL_VERSION }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send initialize b");
+
+    let init_a = recv_response_by_id(&mut ws_a, "init-a").await;
+    let init_b = recv_response_by_id(&mut ws_b, "init-b").await;
+    assert_eq!(
+        init_a
+            .get("result")
+            .and_then(|v| v.get("protocol_version"))
+            .and_then(Value::as_str),
+        Some(WIRE_PROTOCOL_VERSION)
+    );
+    assert_eq!(
+        init_b
+            .get("result")
+            .and_then(|v| v.get("protocol_version"))
+            .and_then(Value::as_str),
+        Some(WIRE_PROTOCOL_VERSION)
+    );
+
+    ws_a.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-a",
+            "method": "prompt",
+            "params": { "user_input": "hello a" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send prompt a");
+    ws_b.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-b",
+            "method": "prompt",
+            "params": { "user_input": "hello b" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send prompt b");
+
+    let resp_a = recv_response_by_id(&mut ws_a, "prompt-a").await;
+    let resp_b = recv_response_by_id(&mut ws_b, "prompt-b").await;
+    assert_eq!(
+        resp_a
+            .get("result")
+            .and_then(|v| v.get("status"))
+            .and_then(Value::as_str),
+        Some("finished")
+    );
+    assert_eq!(
+        resp_b
+            .get("result")
+            .and_then(|v| v.get("status"))
+            .and_then(Value::as_str),
+        Some("finished")
+    );
+
+    ws_a.close(None).await.expect("close ws a");
+    ws_b.close(None).await.expect("close ws b");
+    server_task.abort();
+    let join_err = server_task
+        .await
+        .expect_err("server task should be aborted for test shutdown");
+    assert!(join_err.is_cancelled(), "unexpected join error: {join_err}");
+}
+
+#[tokio::test]
+async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_rolls_back_session() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let work_dir = TempDir::new().expect("work dir");
+    let _env = configure_scripted_env(&home_dir, &["text: hello"]);
+
+    let mut options = scripted_runtime_options(&work_dir, "default-session");
+    options.agent_file = Some(home_dir.path().join("missing-agent.yaml"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
+
+    let failed_session_id = "failed-session";
+    let connect_result = connect_async(format!(
+        "ws://{listen_addr}/wire?session_id={failed_session_id}"
+    ))
+    .await;
+    match connect_result {
+        Err(WsError::Http(resp)) => {
+            assert_eq!(
+                resp.status(),
+                tokio_tungstenite::tungstenite::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+        other => panic!("expected HTTP 500 when runtime init fails, got: {other:?}"),
+    }
+
+    let work_path = KaosPath::from(work_dir.path().to_path_buf());
+    let session = Session::find(work_path, failed_session_id).await;
+    assert!(
+        session.is_none(),
+        "expected failed websocket runtime init to roll back new session"
+    );
+
+    server_task.abort();
+    let join_err = server_task
+        .await
+        .expect_err("server task should be aborted for test shutdown");
+    assert!(join_err.is_cancelled(), "unexpected join error: {join_err}");
 }

@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
+use axum::extract::Query;
 use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
@@ -11,14 +14,18 @@ use axum::{Router, http::StatusCode};
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use kaos::KaosPath;
 use kosong::chat_provider::ChatProviderError;
 use kosong::tooling::tool_error;
 
+use crate::app::{ConfigInput, CreateOptions, KimiCLI};
+use crate::config::Config;
 use crate::constant::{NAME, VERSION};
+use crate::session::{Session, post_run as post_run_session};
+use crate::session_id::normalize_session_id;
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::{LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul};
 use crate::utils::{Queue, QueueShutDown};
@@ -39,12 +46,19 @@ enum PendingRequest {
     ToolCall(ToolCallRequest),
 }
 
+struct ActiveTurn {
+    id: u64,
+    cancel_token: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
 #[derive(Clone)]
 struct WireRpcState {
     soul: Arc<KimiSoul>,
     write_queue: Queue<Value>,
     pending: Arc<tokio::sync::Mutex<HashMap<String, PendingRequest>>>,
-    cancel_token: Arc<tokio::sync::Mutex<Option<CancellationToken>>>,
+    active_turn: Arc<tokio::sync::Mutex<Option<ActiveTurn>>>,
+    next_turn_id: Arc<AtomicU64>,
 }
 
 impl WireRpcState {
@@ -53,12 +67,17 @@ impl WireRpcState {
             soul,
             write_queue: Queue::new(),
             pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            cancel_token: Arc::new(tokio::sync::Mutex::new(None)),
+            active_turn: Arc::new(tokio::sync::Mutex::new(None)),
+            next_turn_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
     fn write_queue(&self) -> Queue<Value> {
         self.write_queue.clone()
+    }
+
+    fn session(&self) -> Session {
+        self.soul.runtime().session.clone()
     }
 
     async fn handle_json_line(&self, line: &str) {
@@ -155,7 +174,7 @@ impl WireRpcState {
         let Some(id) = msg.id.clone() else {
             return;
         };
-        if self.cancel_token.lock().await.is_some() {
+        if self.active_turn.lock().await.is_some() {
             self.send_error(
                 id,
                 error_codes::INVALID_STATE,
@@ -238,15 +257,6 @@ impl WireRpcState {
         let Some(id) = msg.id.clone() else {
             return;
         };
-        if self.cancel_token.lock().await.is_some() {
-            self.send_error(
-                id,
-                error_codes::INVALID_STATE,
-                "An agent turn is already in progress",
-            )
-            .await;
-            return;
-        }
         let params: PromptParams = match msg
             .params
             .clone()
@@ -264,16 +274,27 @@ impl WireRpcState {
             }
         };
 
+        let turn_id = self.next_turn_id.fetch_add(1, Ordering::Relaxed);
         let cancel_token = CancellationToken::new();
-        let cancel_slot = Arc::clone(&self.cancel_token);
-        *cancel_slot.lock().await = Some(cancel_token.clone());
-
+        let turn_cancel_token = cancel_token.clone();
+        let active_turn_slot = Arc::clone(&self.active_turn);
         let soul = Arc::clone(&self.soul);
         let write_queue = self.write_queue.clone();
         let pending = Arc::clone(&self.pending);
         let wire_file = Some(self.soul.runtime().session.wire_file());
+        let mut active_turn = self.active_turn.lock().await;
+        if active_turn.is_some() {
+            drop(active_turn);
+            self.send_error(
+                id,
+                error_codes::INVALID_STATE,
+                "An agent turn is already in progress",
+            )
+            .await;
+            return;
+        }
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let write_queue_for_stream = write_queue.clone();
             let pending_for_stream = Arc::clone(&pending);
             let run_handle = tokio::task::spawn_blocking(move || {
@@ -288,7 +309,7 @@ impl WireRpcState {
                             wire,
                         )
                     },
-                    cancel_token,
+                    turn_cancel_token,
                     wire_file,
                 ))
             });
@@ -296,8 +317,6 @@ impl WireRpcState {
                 Ok(result) => result,
                 Err(err) => Err(anyhow::anyhow!("Wire run task failed: {err}")),
             };
-
-            *cancel_slot.lock().await = None;
 
             match run_result {
                 Ok(()) => {
@@ -382,6 +401,15 @@ impl WireRpcState {
                     }
                 }
             }
+            let mut slot = active_turn_slot.lock().await;
+            if slot.as_ref().is_some_and(|turn| turn.id == turn_id) {
+                *slot = None;
+            }
+        });
+        *active_turn = Some(ActiveTurn {
+            id: turn_id,
+            cancel_token,
+            task,
         });
     }
 
@@ -389,8 +417,13 @@ impl WireRpcState {
         let Some(id) = msg.id.clone() else {
             return;
         };
-        let guard = self.cancel_token.lock().await;
-        let Some(token) = guard.as_ref() else {
+        let cancel_token = self
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .map(|turn| turn.cancel_token.clone());
+        let Some(token) = cancel_token else {
             self.send_error(
                 id,
                 error_codes::INVALID_STATE,
@@ -524,7 +557,7 @@ impl WireRpcState {
         }
     }
 
-    async fn shutdown(&self) {
+    async fn reject_pending_requests(&self) {
         let pending = {
             let mut pending = self.pending.lock().await;
             std::mem::take(&mut *pending)
@@ -544,12 +577,31 @@ impl WireRpcState {
                 }
             }
         }
+    }
 
-        if let Some(token) = self.cancel_token.lock().await.take() {
-            token.cancel();
-        }
+    async fn shutdown(&self) {
+        self.reject_pending_requests().await;
+
+        cancel_and_wait_active_turn(&self.active_turn).await;
+
+        self.reject_pending_requests().await;
 
         self.write_queue.shutdown(false);
+    }
+}
+
+async fn cancel_and_wait_active_turn(
+    active_turn_slot: &Arc<tokio::sync::Mutex<Option<ActiveTurn>>>,
+) {
+    let active_turn = {
+        let mut active_turn = active_turn_slot.lock().await;
+        active_turn.take()
+    };
+    if let Some(active_turn) = active_turn {
+        active_turn.cancel_token.cancel();
+        if let Err(err) = active_turn.task.await {
+            warn!("Wire turn task join failed during shutdown: {:?}", err);
+        }
     }
 }
 
@@ -621,21 +673,39 @@ impl WireServer {
 }
 
 pub struct WireWsServer {
-    rpc: WireRpcState,
+    options: Arc<WsSessionRuntimeOptions>,
     listen_addr: SocketAddr,
     path: String,
 }
 
+#[derive(Clone)]
+pub struct WsSessionRuntimeOptions {
+    pub work_dir: KaosPath,
+    pub default_session_id: String,
+    pub config: Config,
+    pub model_name: Option<String>,
+    pub thinking: Option<bool>,
+    pub yolo: bool,
+    pub agent_file: Option<PathBuf>,
+    pub mcp_configs: Vec<Value>,
+    pub skills_dir: Option<KaosPath>,
+    pub max_steps_per_turn: Option<i64>,
+    pub max_retries_per_step: Option<i64>,
+    pub max_ralph_iterations: Option<i64>,
+}
+
 impl WireWsServer {
     pub fn new(
-        soul: Arc<KimiSoul>,
+        options: WsSessionRuntimeOptions,
         listen_addr: SocketAddr,
         path: impl Into<String>,
     ) -> anyhow::Result<Self> {
         let path = path.into();
         let path = normalize_ws_path(&path)?;
+        let mut options = options;
+        options.default_session_id = normalize_session_id(&options.default_session_id)?;
         Ok(Self {
-            rpc: WireRpcState::new(soul),
+            options: Arc::new(options),
             listen_addr,
             path,
         })
@@ -657,74 +727,191 @@ impl WireWsServer {
             "Starting Wire server on websocket"
         );
 
-        let state = Arc::new(WsServerState::new(self.rpc.clone()));
+        let state = Arc::new(WsServerState::new(Arc::clone(&self.options)));
         let app = Router::new()
             .route(&self.path, get(ws_upgrade_handler))
             .with_state(Arc::clone(&state));
 
-        axum::serve(listener, app)
-            .with_graceful_shutdown(wait_for_ws_shutdown(Arc::clone(&state)))
-            .await?;
-
-        self.rpc.shutdown().await;
+        axum::serve(listener, app).await?;
         Ok(())
     }
 }
 
 struct WsServerState {
-    rpc: WireRpcState,
-    active_client: AtomicBool,
-    shutdown: Notify,
+    options: Arc<WsSessionRuntimeOptions>,
+    active_sessions: Mutex<HashSet<String>>,
 }
 
 impl WsServerState {
-    fn new(rpc: WireRpcState) -> Self {
+    fn new(options: Arc<WsSessionRuntimeOptions>) -> Self {
         Self {
-            rpc,
-            active_client: AtomicBool::new(false),
-            shutdown: Notify::new(),
+            options,
+            active_sessions: Mutex::new(HashSet::new()),
         }
     }
-}
 
-async fn wait_for_ws_shutdown(state: Arc<WsServerState>) {
-    state.shutdown.notified().await;
+    fn resolve_session_id(&self, requested_session_id: Option<&str>) -> anyhow::Result<String> {
+        match requested_session_id {
+            Some(requested) => normalize_session_id(requested),
+            None => Ok(self.options.default_session_id.clone()),
+        }
+    }
+
+    fn lock_active_sessions(&self) -> MutexGuard<'_, HashSet<String>> {
+        match self.active_sessions.lock() {
+            Ok(guard) => guard,
+            Err(err) => err.into_inner(),
+        }
+    }
+
+    fn try_acquire_session(&self, session_id: &str) -> bool {
+        let mut sessions = self.lock_active_sessions();
+        if sessions.contains(session_id) {
+            return false;
+        }
+        sessions.insert(session_id.to_string());
+        true
+    }
+
+    fn release_session(&self, session_id: &str) {
+        self.lock_active_sessions().remove(session_id);
+    }
+
+    async fn create_rpc(&self, session_id: &str) -> anyhow::Result<WireRpcState> {
+        let options = &self.options;
+        let found_session = Session::find(options.work_dir.clone(), session_id).await;
+        let created_new_session = found_session.is_none();
+        let session = match found_session {
+            Some(session) => session,
+            None => {
+                Session::create(options.work_dir.clone(), Some(session_id.to_string()), None).await
+            }
+        };
+        let rollback_session = if created_new_session {
+            Some(session.clone())
+        } else {
+            None
+        };
+
+        let cli = KimiCLI::create(
+            session,
+            CreateOptions {
+                config: Some(ConfigInput::Inline(Box::new(options.config.clone()))),
+                model_name: options.model_name.clone(),
+                thinking: options.thinking,
+                yolo: options.yolo,
+                agent_file: options.agent_file.clone(),
+                mcp_configs: options.mcp_configs.clone(),
+                skills_dir: options.skills_dir.clone(),
+                max_steps_per_turn: options.max_steps_per_turn,
+                max_retries_per_step: options.max_retries_per_step,
+                max_ralph_iterations: options.max_ralph_iterations,
+            },
+        )
+        .await;
+        let cli = match cli {
+            Ok(cli) => cli,
+            Err(err) => {
+                if let Some(rollback_session) = rollback_session
+                    && let Err(post_run_err) = post_run_session(&rollback_session).await
+                {
+                    warn!(
+                        session_id = %session_id,
+                        "Failed to rollback newly created session after runtime init failure: {}",
+                        post_run_err
+                    );
+                }
+                return Err(err);
+            }
+        };
+
+        Ok(WireRpcState::new(cli.soul()))
+    }
 }
 
 async fn ws_upgrade_handler(
     State(state): State<Arc<WsServerState>>,
+    Query(query): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if state
-        .active_client
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
+    let session_id = match state.resolve_session_id(query.get("session_id").map(String::as_str)) {
+        Ok(session_id) => session_id,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    if !state.try_acquire_session(&session_id) {
         return (
             StatusCode::CONFLICT,
-            "Only one websocket client is allowed for this wire server.",
+            format!("Session `{session_id}` already has an active websocket client."),
         )
             .into_response();
     }
 
+    let prepared_rpc = match state.create_rpc(&session_id).await {
+        Ok(rpc) => rpc,
+        Err(err) => {
+            error!(
+                session_id = %session_id,
+                "Failed to initialize wire websocket runtime: {}",
+                err
+            );
+            state.release_session(&session_id);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to initialize websocket runtime: {err}"),
+            )
+                .into_response();
+        }
+    };
+
+    let rpc_slot = Arc::new(tokio::sync::Mutex::new(Some(prepared_rpc)));
     let state_for_upgrade = Arc::clone(&state);
+    let session_id_for_upgrade = session_id.clone();
+    let rpc_slot_for_upgrade = Arc::clone(&rpc_slot);
     let state_for_failed_upgrade = Arc::clone(&state);
+    let session_id_for_failed_upgrade = session_id.clone();
+    let rpc_slot_for_failed_upgrade = Arc::clone(&rpc_slot);
     ws.on_failed_upgrade(move |err| {
-        warn!("Wire websocket upgrade failed: {}", err);
-        state_for_failed_upgrade
-            .active_client
-            .store(false, Ordering::SeqCst);
+        warn!(
+            session_id = %session_id_for_failed_upgrade,
+            "Wire websocket upgrade failed: {}",
+            err
+        );
+        tokio::spawn(async move {
+            if let Some(rpc) = rpc_slot_for_failed_upgrade.lock().await.take() {
+                let session = rpc.session();
+                rpc.shutdown().await;
+                if let Err(post_run_err) = post_run_session(&session).await {
+                    warn!(
+                        session_id = %session_id_for_failed_upgrade,
+                        "Failed to finalize session metadata after failed websocket upgrade: {}",
+                        post_run_err
+                    );
+                }
+            }
+            state_for_failed_upgrade.release_session(&session_id_for_failed_upgrade);
+        });
     })
     .on_upgrade(move |socket| async move {
-        handle_ws_socket(socket, state_for_upgrade).await;
+        let rpc = rpc_slot_for_upgrade
+            .lock()
+            .await
+            .take()
+            .expect("prepared websocket runtime missing");
+        handle_ws_socket(socket, state_for_upgrade, session_id_for_upgrade, rpc).await;
     })
     .into_response()
 }
 
-async fn handle_ws_socket(socket: WebSocket, state: Arc<WsServerState>) {
+async fn handle_ws_socket(
+    socket: WebSocket,
+    state: Arc<WsServerState>,
+    session_id: String,
+    rpc: WireRpcState,
+) {
     let (mut sender, mut receiver) = socket.split();
 
-    let write_queue = state.rpc.write_queue();
+    let write_queue = rpc.write_queue();
     let write_task = tokio::spawn(async move {
         loop {
             let msg = match write_queue.get().await {
@@ -753,32 +940,41 @@ async fn handle_ws_socket(socket: WebSocket, state: Arc<WsServerState>) {
     while let Some(frame) = receiver.next().await {
         match frame {
             Ok(WsMessage::Text(text)) => {
-                state.rpc.handle_json_line(text.as_str()).await;
+                rpc.handle_json_line(text.as_str()).await;
             }
             Ok(WsMessage::Binary(binary)) => match std::str::from_utf8(binary.as_ref()) {
-                Ok(text) => state.rpc.handle_json_line(text).await,
+                Ok(text) => rpc.handle_json_line(text).await,
                 Err(_) => {
-                    state
-                        .rpc
-                        .send_error_nullable(error_codes::INVALID_REQUEST, "Invalid request", None)
+                    rpc.send_error_nullable(error_codes::INVALID_REQUEST, "Invalid request", None)
                         .await;
                 }
             },
             Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
             Ok(WsMessage::Close(_)) => {
-                info!("websocket closed by client, Wire server exiting");
+                info!(session_id = %session_id, "websocket closed by client");
                 break;
             }
             Err(err) => {
-                error!("Wire websocket read loop error: {:?}", err);
+                error!(
+                    session_id = %session_id,
+                    "Wire websocket read loop error: {:?}",
+                    err
+                );
                 break;
             }
         }
     }
 
-    // Stop accepting new connections before tearing down RPC state.
-    state.shutdown.notify_waiters();
-    state.rpc.shutdown().await;
+    let session = rpc.session();
+    rpc.shutdown().await;
+    if let Err(err) = post_run_session(&session).await {
+        warn!(
+            session_id = %session_id,
+            "Failed to finalize session metadata after websocket close: {}",
+            err
+        );
+    }
+    state.release_session(&session_id);
     let _ = write_task.await;
 }
 
@@ -856,7 +1052,12 @@ async fn request_tool_call(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_ws_path;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::{ActiveTurn, cancel_and_wait_active_turn, normalize_ws_path};
 
     #[test]
     fn normalize_ws_path_accepts_valid_path() {
@@ -870,5 +1071,31 @@ mod tests {
         assert!(normalize_ws_path("wire").is_err());
         assert!(normalize_ws_path("/wire?x=1").is_err());
         assert!(normalize_ws_path("/wire#frag").is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_and_wait_active_turn_waits_for_turn_exit() {
+        let active_turn_slot = Arc::new(tokio::sync::Mutex::new(None));
+        let cancel_token = CancellationToken::new();
+        let task_cancel_token = cancel_token.clone();
+        let task = tokio::spawn(async move {
+            task_cancel_token.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+
+        *active_turn_slot.lock().await = Some(ActiveTurn {
+            id: 1,
+            cancel_token,
+            task,
+        });
+
+        let started_at = Instant::now();
+        cancel_and_wait_active_turn(&active_turn_slot).await;
+
+        assert!(
+            started_at.elapsed() >= Duration::from_millis(50),
+            "cancel_and_wait_active_turn returned before turn task finished"
+        );
+        assert!(active_turn_slot.lock().await.is_none());
     }
 }

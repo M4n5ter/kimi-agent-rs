@@ -8,6 +8,7 @@ pub mod llm;
 pub mod metadata;
 pub mod prompts;
 pub mod session;
+pub mod session_id;
 pub mod share;
 pub mod skill;
 pub mod soul;
