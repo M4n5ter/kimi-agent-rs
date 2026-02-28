@@ -216,6 +216,16 @@ impl Kaos for LocalKaos {
         KaosPath::from(dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
     }
 
+    fn app_state_dir(&self, app_name: &str) -> KaosPath {
+        let env_key = format!("{}_SHARE_DIR", app_name.to_ascii_uppercase());
+        if let Some(path) = std::env::var_os(&env_key)
+            && !path.is_empty()
+        {
+            return KaosPath::from(PathBuf::from(path));
+        }
+        self.home().joinpath(&format!(".{app_name}"))
+    }
+
     fn cwd(&self) -> KaosPath {
         KaosPath::from(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
@@ -548,7 +558,7 @@ fn system_time_to_f64(time: SystemTime) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::LocalKaos;
-    use crate::Kaos;
+    use crate::{Kaos, KaosPath};
     use tokio::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -616,5 +626,22 @@ mod tests {
                 .expect("read env"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn app_state_dir_prefers_share_dir_env_override() {
+        let _lock = ENV_LOCK.lock().await;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let share_dir = std::env::temp_dir().join(format!("kaos-kimi-share-{unique}"));
+        let _guard = EnvGuard::set(
+            "KIMI_SHARE_DIR",
+            share_dir.to_str().expect("share dir path"),
+        );
+        let kaos = LocalKaos::new();
+
+        assert_eq!(kaos.app_state_dir("kimi"), KaosPath::from(share_dir));
     }
 }

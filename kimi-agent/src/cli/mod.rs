@@ -161,7 +161,7 @@ pub struct Cli {
     #[arg(
         long = "skills-dir",
         value_name = "PATH",
-        help = "Path to the skills directory. Overrides discovery."
+        help = "Path to the skills directory. Disables builtin/user/project discovery and loads only this directory."
     )]
     skills_dir: Option<String>,
 
