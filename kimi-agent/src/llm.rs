@@ -56,6 +56,10 @@ pub async fn augment_provider_with_env_vars(
     provider: &mut LLMProvider,
     model: &mut LLMModel,
 ) -> Result<HashMap<String, String>, LLMError> {
+    // Env resolution for LLM configuration is intentionally backend-scoped:
+    // provider.env is checked first, then the active kaos backend environment.
+    // Explicit config still wins over ambient env, so env only fills fields
+    // that are missing from config.toml.
     let mut applied = HashMap::new();
     let missing_provider_base_url = provider.base_url.is_empty();
     let missing_provider_api_key = provider.api_key.is_empty();
@@ -80,6 +84,8 @@ pub async fn augment_provider_with_env_vars(
     }
 
     if provider.provider_type == ProviderType::Kimi {
+        // Kimi model metadata follows the same config-first contract as
+        // provider credentials: backend env supplies defaults, not overrides.
         if model.model.is_empty()
             && let Some(model_name) = read_backend_env_var("KIMI_MODEL_NAME")
                 .await?
@@ -471,6 +477,8 @@ fn apply_resolved_provider_credentials_if_missing(
     provider: &mut LLMProvider,
     credentials: &ResolvedProviderCredentials,
 ) {
+    // Ambient env is allowed to complete provider config, but not replace
+    // explicit values that were already chosen in config.toml.
     if provider.base_url.is_empty()
         && let Some((_, base_url)) = credentials.base_url.as_ref()
     {
