@@ -6,6 +6,7 @@ use kaos::{
     StrOrKaosPath, reset_current_kaos, set_current_kaos, with_current_kaos_scope,
 };
 use kimi_agent::utils::Environment;
+use tempfile::TempDir;
 
 struct EnvOnlyKaos {
     inner: LocalKaos,
@@ -144,11 +145,13 @@ async fn test_environment_detection() {
         assert_eq!(env.shell_name, "Windows PowerShell");
         assert_eq!(env.shell_path.to_string_lossy(), "powershell.exe");
     } else {
-        assert!(env.shell_name == "bash" || env.shell_name == "sh");
+        assert!(env.shell_name == "bash" || env.shell_name == "zsh" || env.shell_name == "sh");
         let shell_path = env.shell_path.to_string_lossy();
         assert!(!shell_path.is_empty());
         if env.shell_name == "bash" {
             assert!(shell_path.ends_with("bash"));
+        } else if env.shell_name == "zsh" {
+            assert!(shell_path.ends_with("zsh"));
         } else {
             assert!(shell_path.ends_with("sh"));
         }
@@ -179,6 +182,64 @@ async fn test_environment_detection_prefers_backend_shell_env_for_non_local_back
 }
 
 #[tokio::test]
+async fn test_environment_detection_accepts_backend_zsh_env() {
+    let temp = TempDir::new().expect("temp dir");
+    let zsh_path = temp.path().join("zsh");
+    std::fs::write(&zsh_path, "#!/bin/zsh\n").expect("write fake zsh");
+
+    with_current_kaos_scope(async {
+        let _guard = EnvOnlyKaosGuard::new(EnvOnlyKaos::new(
+            "ssh",
+            HashMap::from([("SHELL".to_string(), zsh_path.to_string_lossy().to_string())]),
+            KaosPlatform {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                abi: None,
+                libc: Some("gnu".to_string()),
+            },
+        ));
+
+        let env = Environment::detect().await;
+        assert_eq!(env.shell_name, "zsh");
+        assert_eq!(env.shell_path.to_string_lossy(), zsh_path.to_string_lossy());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_environment_detection_ignores_backend_sh_env_and_keeps_preferred_fallbacks() {
+    with_current_kaos_scope(async {
+        let _guard = EnvOnlyKaosGuard::new(EnvOnlyKaos::new(
+            "ssh",
+            HashMap::from([("SHELL".to_string(), "/bin/sh".to_string())]),
+            KaosPlatform {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                abi: None,
+                libc: Some("gnu".to_string()),
+            },
+        ));
+
+        let env = Environment::detect().await;
+        let expected = if std::path::Path::new("/bin/bash").is_file()
+            || std::path::Path::new("/usr/bin/bash").is_file()
+            || std::path::Path::new("/usr/local/bin/bash").is_file()
+        {
+            "bash"
+        } else if std::path::Path::new("/bin/zsh").is_file()
+            || std::path::Path::new("/usr/bin/zsh").is_file()
+            || std::path::Path::new("/usr/local/bin/zsh").is_file()
+        {
+            "zsh"
+        } else {
+            "sh"
+        };
+        assert_eq!(env.shell_name, expected);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_environment_detection_ignores_unsupported_backend_shell_env() {
     with_current_kaos_scope(async {
         let _guard = EnvOnlyKaosGuard::new(EnvOnlyKaos::new(
@@ -193,7 +254,7 @@ async fn test_environment_detection_ignores_unsupported_backend_shell_env() {
         ));
 
         let env = Environment::detect().await;
-        assert!(env.shell_name == "bash" || env.shell_name == "sh");
+        assert!(env.shell_name == "bash" || env.shell_name == "zsh" || env.shell_name == "sh");
     })
     .await;
 }
