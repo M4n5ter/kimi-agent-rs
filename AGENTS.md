@@ -12,40 +12,39 @@
 
 ## Purpose and naming
 
-Kimi Agent is the Rust rewrite of the Python `kimi-cli` runtime. It is a wire-only agent server
+Kimi Agent is the Rust implementation of the Kimi wire runtime. It is a wire-only agent server
 (no Shell/Print/ACP UI) and lives in this repository. The binary name is `kimi-agent`, but the wire
-protocol identity stays aligned with Python:
+protocol identity stays aligned with the existing Kimi wire ecosystem:
 
 - Wire metadata and user-agent still identify as "Kimi Code CLI" / `KimiCLI/<VERSION>`.
-- Tool identifiers remain `kimi_cli.tools.*` for compatibility.
+- Tool identifiers remain `kimi_cli.tools.*` for wire compatibility.
 - The CLI `about` string is "Kimi Agent, the Rust agent server."
 
-## Sync contract with Python (must-follow)
+## Wire compatibility contract (must-follow)
 
-The Rust and Python implementations must stay in lockstep for any external behavior:
+Rust is allowed to evolve independently. The hard compatibility requirement is the wire protocol and
+other wire-visible contracts:
 
 - Wire protocol, message envelopes, error codes (`docs/zh/customization/wire-mode.md`).
 - `kosong.message` and `kimi_cli.wire.types` schemas and serde behavior.
-- Config, metadata, sessions, and context JSONL formats under `~/.kimi`.
-- Agent specs, prompts, skills/flows, tool schemas/descriptions, approvals, compaction.
-- Providers and Kaos behavior (Kimi/Echo/ScriptedEcho, LocalKaos).
 - Internal IDs and names that appear on the wire must remain stable.
+- Tool identifiers, tool schemas, and other wire-visible metadata must remain stable.
 
-When in doubt, Python (`src/kimi_cli`, `packages/kosong`, `packages/kaos`) and `docs/zh/`
-are the source of truth, and both sides should change together.
+Rust runtime behavior, local persistence, provider semantics, Kaos behavior, prompts, and other
+non-wire internals may diverge when that leads to a cleaner design. Treat Python as a useful
+reference, not as the default source of truth.
 
 ## Versioning (must-follow)
 
-The Rust workspace version must always match the Python `kimi-cli` version exactly
-(`MAJOR.MINOR.PATCH`). Rust may lag behind in feature completeness, but the
-version number must not diverge from the corresponding Python release.
+The Rust workspace version is managed by the Rust project itself. It does not need to match Python
+`kimi-cli` exactly unless a separate release policy explicitly requires that.
 
 ## Rewrite constraints (from _/PROMPT.md and _/PLAN.md)
 
 - Three crates: `kimi-agent`, `kosong`, `kaos`.
 - Rust edition 2024, async runtime `tokio`, serde, anyhow/thiserror, clap, reqwest.
 - Only Wire transports (stdio/WebSocket); no Shell/Print/ACP UI.
-- Full parity with Python for data formats and wire behavior.
+- Wire compatibility is required; full Python parity is not.
 - Tests are ported for core runtime/tools/wire; UI-only tests are omitted.
 
 ## Workspace layout
@@ -60,16 +59,13 @@ version number must not diverge from the corresponding Python release.
 - `--wire` exists but is hidden and ignored (legacy compatibility).
 - No `--prompt`/`--command` because wire server does not accept an initial prompt.
 - Subcommands: `info`, `mcp` only.
-- Help text mirrors Python; some MCP examples still show `kimi` for parity.
+- Help text may diverge from Python when Rust behavior intentionally differs.
 
-## Known incompatibilities with Python
+## Python divergence notes
 
-- MCP OAuth credentials location differs from Python fastmcp defaults; Rust uses `rmcp`
-  credential storage paths and is not compatible with fastmcp token locations.
-- Options kept for parity: `--work-dir`, `--session`, `--continue`, `--config`,
-  `--config-file`, `--model`, `--thinking/--no-thinking`, `--yolo`, `--agent`,
-  `--agent-file`, `--mcp-config-file`, `--mcp-config`, `--skills-dir`,
-  `--max-steps-per-turn`, `--max-retries-per-step`, `--max-ralph-iterations`.
+- Divergence from Python is acceptable unless it breaks wire-visible behavior.
+- Existing CLI flags may still mirror earlier Python behavior for migration or UX reasons, but that
+  is a product choice, not a blanket compatibility rule.
 - `help_expected` is enabled in clap, so every CLI arg must define help text.
 
 ## Major Rust modules (kimi-agent)
@@ -86,9 +82,10 @@ version number must not diverge from the corresponding Python release.
 ## Wire protocol and data compatibility
 
 - Wire protocol version `1.2` with JSON-RPC payload compatibility across stdio/WebSocket transports.
-- Data layout under `~/.kimi` must match Python:
-  - `config.toml`, `kimi.json`, session directories, context JSONL, wire JSONL.
 - `Message.content` string/parts serde rules must match Python exactly.
+- Any identifier, schema, or field shape that crosses the wire must remain compatible.
+- Local on-disk formats may evolve independently unless a separate compatibility requirement says
+  otherwise.
 
 ## Providers and tools
 
@@ -96,11 +93,12 @@ version number must not diverge from the corresponding Python release.
 - Kaos: LocalKaos only (SSH Kaos omitted for now).
 - Built-in tools: Shell, Read/Write/Replace/Glob/Grep/ReadMedia, SearchWeb/FetchURL,
   SetTodoList, CreateSubagent, Task, SendDMail, Think; test tools Plus/Compare/Panic.
-- Tool descriptions live under `kimi-agent/src/tools/desc/` and must match Python.
+- Tool descriptions live under `kimi-agent/src/tools/desc/`; wire-visible tool names and schemas
+  must stay stable, but description text may evolve with Rust.
 
 ## MCP integration
 
-- MCP config: `~/.kimi/mcp.json`, same schema as Python.
+- MCP config: `~/.kimi/mcp.json`.
 - Client: `rmcp` with stdio + HTTP transports, OAuth storage compatibility.
 - CLI: `kimi-agent mcp add/list/remove/auth/reset-auth/test`.
 
@@ -115,12 +113,14 @@ version number must not diverge from the corresponding Python release.
 ## Conventions and runtime rules
 
 - Prefer async I/O in runtime code; avoid blocking locks in async contexts.
-- Keep prompts, schemas, error strings, and wire payloads aligned with Python.
-- If any behavior or documented interface changes, update this file and the
-  corresponding Python implementation and tests.
+- Keep wire payloads and wire-visible schemas aligned with the protocol contract.
+- If Rust intentionally diverges from Python in a non-wire area, update this file and the relevant
+  Rust-side tests/docs instead of assuming Python must change too.
 
 ## Pointers for future updates
 
 - `_/PROMPT.md` defines the rewrite scope and compatibility constraints.
-- `_/PLAN.md` records the parity plan and progress; treat it as historical context.
-- Always validate against the actual Rust code and Python behavior when in conflict.
+- `_/PLAN.md` records earlier parity planning; treat it as historical context, not as a hard
+  constraint.
+- When Rust and Python differ, prefer the explicit wire contract and current Rust design over
+  implicit parity assumptions.

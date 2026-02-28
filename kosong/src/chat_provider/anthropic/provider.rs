@@ -1,5 +1,4 @@
 use std::any::Any;
-use std::env;
 
 use async_trait::async_trait;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -41,11 +40,9 @@ impl Anthropic {
     ) -> Result<Self, ChatProviderError> {
         let api_key = api_key
             .filter(|value| !value.is_empty())
-            .or_else(|| env::var("ANTHROPIC_API_KEY").ok())
             .unwrap_or_default();
         let mut base_url = base_url
             .filter(|value| !value.is_empty())
-            .or_else(|| env::var("ANTHROPIC_BASE_URL").ok())
             .unwrap_or_else(|| "https://api.anthropic.com".to_string());
         if !base_url.ends_with('/') {
             base_url.push('/');

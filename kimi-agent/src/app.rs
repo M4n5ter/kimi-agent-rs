@@ -21,6 +21,8 @@ use crate::soul::run_soul;
 use crate::wire::WireMessage;
 use crate::wire::server::{WireServer, WireWsServer, WsSessionRuntimeOptions};
 
+const DEFAULT_FALLBACK_MAX_CONTEXT_SIZE: i64 = 100_000;
+
 pub struct KimiCLI {
     soul: Arc<KimiSoul>,
     runtime: Runtime,
@@ -111,7 +113,7 @@ impl KimiCLI {
             model = Some(LLMModel {
                 provider: "".to_string(),
                 model: "".to_string(),
-                max_context_size: 100_000,
+                max_context_size: 0,
                 capabilities: None,
             });
             provider = Some(LLMProvider {
@@ -137,7 +139,11 @@ impl KimiCLI {
             "Using LLM model"
         );
         let env_overrides = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
             .map_err(anyhow::Error::new)?;
+        if model.max_context_size <= 0 {
+            model.max_context_size = DEFAULT_FALLBACK_MAX_CONTEXT_SIZE;
+        }
 
         let thinking = thinking.unwrap_or(config.default_thinking);
         info!(thinking, "Thinking mode");

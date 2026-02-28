@@ -183,7 +183,7 @@ fn test_shell_params_schema() {
         serde_json::json!({
             "properties": {
                 "command": {
-                    "description": "The bash command to execute.",
+                    "description": "The shell command to execute.",
                     "type": "string",
                 },
                 "timeout": {

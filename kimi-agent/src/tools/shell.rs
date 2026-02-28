@@ -17,7 +17,7 @@ const POWERSHELL_DESC: &str = include_str!("desc/shell/powershell.md");
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ShellParams {
-    #[schemars(description = "The bash command to execute.")]
+    #[schemars(description = "The shell command to execute.")]
     pub command: String,
     #[serde(default = "default_timeout")]
     #[schemars(

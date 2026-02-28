@@ -228,7 +228,7 @@ impl KimiToolset {
                     }
                 }
 
-                if std::env::var("KIMI_TEST_TRACE").as_deref() == Ok("1") {
+                if backend_test_trace_enabled().await {
                     eprintln!("MCP config loaded server: {name}");
                 }
                 self.mcp_servers
@@ -251,7 +251,7 @@ impl KimiToolset {
         let task = tokio::spawn(async move {
             let mut failures: HashMap<String, String> = HashMap::new();
             for name in servers_to_connect {
-                if std::env::var("KIMI_TEST_TRACE").as_deref() == Ok("1") {
+                if backend_test_trace_enabled().await {
                     eprintln!("MCP connecting to server: {name}");
                 }
                 if let Err(err) = connect_mcp_server(&toolset_ref, &runtime, &name).await {
@@ -326,6 +326,10 @@ impl Default for KimiToolset {
     fn default() -> Self {
         Self::new()
     }
+}
+
+async fn backend_test_trace_enabled() -> bool {
+    matches!(kaos::env_var("KIMI_TEST_TRACE").await, Ok(Some(value)) if value == "1")
 }
 
 impl Toolset for KimiToolset {
@@ -745,7 +749,7 @@ async fn connect_mcp_server(
                 "Failed to connect MCP server: {}, error: {}",
                 server_name, err
             );
-            if std::env::var("KIMI_TEST_TRACE").as_deref() == Ok("1") {
+            if backend_test_trace_enabled().await {
                 eprintln!("MCP connect error for {server_name}: {err}");
             }
             return Err(MCPRuntimeError::new(err));
@@ -762,13 +766,13 @@ async fn connect_mcp_server(
                 info.status = McpServerStatus::Failed;
                 info.last_error = Some(err.to_string());
             }
-            if std::env::var("KIMI_TEST_TRACE").as_deref() == Ok("1") {
+            if backend_test_trace_enabled().await {
                 eprintln!("MCP list tools error for {server_name}: {err}");
             }
             return Err(MCPRuntimeError::new(err.to_string()));
         }
     };
-    if std::env::var("KIMI_TEST_TRACE").as_deref() == Ok("1") {
+    if backend_test_trace_enabled().await {
         eprintln!("MCP server {server_name} listed {} tools", tools.len());
     }
 

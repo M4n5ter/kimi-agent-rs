@@ -132,6 +132,7 @@ pub trait Kaos: Send + Sync {
     async fn write_text(&self, path: &KaosPath, data: &str, append: bool) -> Result<usize>;
     async fn chmod(&self, path: &KaosPath, mode: u32) -> Result<()>;
     async fn mkdir(&self, path: &KaosPath, parents: bool, exist_ok: bool) -> Result<()>;
+    async fn env_var(&self, key: &str) -> Result<Option<String>>;
     async fn exec(&self, args: &[String]) -> Result<Box<dyn KaosProcess>>;
 }
 
@@ -222,6 +223,10 @@ pub async fn chmod(path: &KaosPath, mode: u32) -> Result<()> {
 
 pub async fn mkdir(path: &KaosPath, parents: bool, exist_ok: bool) -> Result<()> {
     get_current_kaos().mkdir(path, parents, exist_ok).await
+}
+
+pub async fn env_var(key: &str) -> Result<Option<String>> {
+    get_current_kaos().env_var(key).await
 }
 
 pub async fn exec(args: &[String]) -> Result<Box<dyn KaosProcess>> {

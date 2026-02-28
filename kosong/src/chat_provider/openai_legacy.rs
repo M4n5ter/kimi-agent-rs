@@ -1,6 +1,5 @@
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
-use std::env;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -43,13 +42,9 @@ impl OpenAILegacy {
         base_url: Option<String>,
         default_headers: Option<HeaderMap>,
     ) -> Result<Self, ChatProviderError> {
-        let api_key = match api_key {
-            Some(value) => value,
-            None => env::var("OPENAI_API_KEY").unwrap_or_default(),
-        };
+        let api_key = api_key.unwrap_or_default();
         let mut base_url = base_url
             .filter(|value| !value.is_empty())
-            .or_else(|| env::var("OPENAI_BASE_URL").ok())
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
         if !base_url.ends_with('/') {
             base_url.push('/');

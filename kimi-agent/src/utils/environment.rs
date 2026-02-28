@@ -37,16 +37,7 @@ impl Environment {
             };
         }
 
-        let mut shell_name = "sh".to_string();
-        let mut shell_path = KaosPath::new("/bin/sh");
-        for candidate in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
-            let path = KaosPath::new(candidate);
-            if path.is_file(true).await {
-                shell_name = "bash".to_string();
-                shell_path = path;
-                break;
-            }
-        }
+        let (shell_name, shell_path) = detect_unix_shell().await;
 
         Environment {
             os_kind,
@@ -56,4 +47,64 @@ impl Environment {
             shell_path,
         }
     }
+}
+
+async fn detect_unix_shell() -> (String, KaosPath) {
+    if let Some(shell) = shell_from_backend_env().await {
+        return shell;
+    }
+
+    for (name, candidate) in unix_shell_candidates() {
+        let path = KaosPath::new(candidate);
+        if is_executable_unix_shell(&path).await {
+            return (name.to_string(), path);
+        }
+    }
+
+    ("sh".to_string(), KaosPath::new("/bin/sh"))
+}
+
+async fn shell_from_backend_env() -> Option<(String, KaosPath)> {
+    let shell = kaos::env_var("SHELL").await.ok().flatten()?;
+    if shell.is_empty() {
+        return None;
+    }
+
+    let path = KaosPath::new(shell);
+    let basename = path.name().to_ascii_lowercase();
+    // Respect explicit bash/zsh shells from the backend environment, but do not let
+    // `SHELL=/bin/sh` override our stronger bash/zsh fallback preference.
+    let name = match basename.as_str() {
+        "bash" => "bash",
+        "zsh" => "zsh",
+        _ => return None,
+    };
+    if !is_executable_unix_shell(&path).await {
+        return None;
+    }
+
+    Some((name.to_string(), path))
+}
+
+fn unix_shell_candidates() -> [(&'static str, &'static str); 6] {
+    [
+        ("bash", "/bin/bash"),
+        ("bash", "/usr/bin/bash"),
+        ("bash", "/usr/local/bin/bash"),
+        ("zsh", "/bin/zsh"),
+        ("zsh", "/usr/bin/zsh"),
+        ("zsh", "/usr/local/bin/zsh"),
+    ]
+}
+
+async fn is_executable_unix_shell(path: &KaosPath) -> bool {
+    let Ok(stat) = path.stat(true).await else {
+        return false;
+    };
+
+    is_regular_file(stat.st_mode) && stat.st_mode & 0o111 != 0
+}
+
+fn is_regular_file(mode: u32) -> bool {
+    mode & 0o170000 == 0o100000
 }
