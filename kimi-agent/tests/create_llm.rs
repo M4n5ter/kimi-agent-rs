@@ -371,6 +371,39 @@ async fn test_augment_provider_with_env_vars_kimi_prefers_provider_env_for_model
 }
 
 #[tokio::test]
+async fn test_augment_provider_with_env_vars_kimi_applies_context_size_to_fallback_model() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([(
+            "KIMI_MODEL_MAX_CONTEXT_SIZE".to_string(),
+            "262144".to_string(),
+        )]));
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::Kimi,
+            base_url: "https://configured.test/v1".to_string(),
+            api_key: "configured-key".to_string(),
+            env: None,
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "kimi".to_string(),
+            model: String::new(),
+            max_context_size: 0,
+            capabilities: None,
+        };
+
+        augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("backend env should fill fallback context size");
+
+        assert_eq!(model.max_context_size, 262_144);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_augment_provider_with_env_vars_anthropic_uses_backend_env() {
     let _lock = ENV_LOCK.lock().await;
 
