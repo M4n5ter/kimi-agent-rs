@@ -574,6 +574,7 @@ fn build_client_info() -> ClientInfo {
             name: NAME.to_string(),
             title: None,
             version: VERSION.to_string(),
+            description: None,
             icons: None,
             website_url: None,
         },

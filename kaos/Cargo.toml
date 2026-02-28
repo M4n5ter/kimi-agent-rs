@@ -6,16 +6,16 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-serde.workspace = true
-tokio.workspace = true
-futures.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
+futures.workspace = true
 glob.workspace = true
-typed-path = "0.12"
 russh = "0.57"
 russh-sftp = "2.1"
+serde.workspace = true
 sha2 = "0.10"
+tokio.workspace = true
+typed-path = "0.12"
 
 [dev-dependencies]
 tokio.workspace = true
