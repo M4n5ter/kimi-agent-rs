@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use anyhow::anyhow;
 use kaos::{
     CurrentKaosToken, Kaos, KaosPath, KaosProcess, LineStream, LocalKaos, StrOrKaosPath,
     reset_current_kaos, set_current_kaos, with_current_kaos_scope,
@@ -56,13 +57,15 @@ impl Drop for EnvGuard {
 struct BackendEnvKaos {
     inner: LocalKaos,
     env: HashMap<String, String>,
+    failing_keys: HashSet<String>,
 }
 
 impl BackendEnvKaos {
-    fn new(env: HashMap<String, String>) -> Self {
+    fn with_failing_keys(env: HashMap<String, String>, failing_keys: HashSet<String>) -> Self {
         Self {
             inner: LocalKaos::new(),
             env,
+            failing_keys,
         }
     }
 }
@@ -147,6 +150,9 @@ impl Kaos for BackendEnvKaos {
     }
 
     async fn env_var(&self, key: &str) -> anyhow::Result<Option<String>> {
+        if self.failing_keys.contains(key) {
+            return Err(anyhow!("backend env lookup failed for `{key}`"));
+        }
         Ok(self.env.get(key).cloned())
     }
 
@@ -161,7 +167,11 @@ struct BackendEnvKaosGuard {
 
 impl BackendEnvKaosGuard {
     fn new(env: HashMap<String, String>) -> Self {
-        let kaos = Arc::new(BackendEnvKaos::new(env));
+        Self::with_failing_keys(env, HashSet::new())
+    }
+
+    fn with_failing_keys(env: HashMap<String, String>, failing_keys: HashSet<String>) -> Self {
+        let kaos = Arc::new(BackendEnvKaos::with_failing_keys(env, failing_keys));
         let token = set_current_kaos(kaos);
         Self { token: Some(token) }
     }
@@ -370,6 +380,44 @@ async fn test_augment_provider_with_env_vars_preserves_explicit_anthropic_config
         let applied = augment_provider_with_env_vars(&mut provider, &mut model)
             .await
             .expect("env overrides");
+
+        assert!(applied.is_empty());
+        assert_eq!(provider.base_url, "https://configured.anthropic.test");
+        assert_eq!(provider.api_key, "configured-anthropic-key");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_augment_provider_with_env_vars_skips_backend_probe_for_explicit_credentials() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::with_failing_keys(
+            HashMap::new(),
+            HashSet::from([
+                "ANTHROPIC_BASE_URL".to_string(),
+                "ANTHROPIC_API_KEY".to_string(),
+            ]),
+        );
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::Anthropic,
+            base_url: "https://configured.anthropic.test".to_string(),
+            api_key: "configured-anthropic-key".to_string(),
+            env: None,
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4".to_string(),
+            max_context_size: 200_000,
+            capabilities: None,
+        };
+
+        let applied = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("explicit config should not probe failing backend env");
 
         assert!(applied.is_empty());
         assert_eq!(provider.base_url, "https://configured.anthropic.test");
@@ -715,6 +763,79 @@ async fn test_create_llm_invalid_temperature_env() {
         err.to_string()
             .contains("could not convert string to float")
     );
+}
+
+#[tokio::test]
+async fn test_create_llm_kimi_ignores_optional_backend_env_lookup_failures() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::with_failing_keys(
+            HashMap::new(),
+            HashSet::from([
+                "KIMI_MODEL_TEMPERATURE".to_string(),
+                "KIMI_MODEL_TOP_P".to_string(),
+                "KIMI_MODEL_MAX_TOKENS".to_string(),
+            ]),
+        );
+
+        let provider = LLMProvider {
+            provider_type: ProviderType::Kimi,
+            base_url: "https://kimi.test/v1".to_string(),
+            api_key: "kimi-key".to_string(),
+            env: None,
+            custom_headers: None,
+        };
+        let model = LLMModel {
+            provider: "kimi".to_string(),
+            model: "kimi-k2-0905-preview".to_string(),
+            max_context_size: 128_000,
+            capabilities: None,
+        };
+
+        let llm = create_llm(&provider, &model, None, None)
+            .await
+            .expect("optional backend env lookup failure should be ignored")
+            .expect("llm");
+
+        assert!(llm.chat_provider.as_any().is::<Kimi>());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_create_llm_vertexai_ignores_optional_backend_env_lookup_failures() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::with_failing_keys(
+            HashMap::new(),
+            HashSet::from(["VERTEXAI_MODEL_TEMPERATURE".to_string()]),
+        );
+
+        let provider = LLMProvider {
+            provider_type: ProviderType::Vertexai,
+            base_url: "https://vertex.test/v1".to_string(),
+            api_key: "vertex-key".to_string(),
+            env: None,
+            custom_headers: None,
+        };
+        let model = LLMModel {
+            provider: "vertex".to_string(),
+            model: "gemini-3-pro-preview".to_string(),
+            max_context_size: 1_000_000,
+            capabilities: None,
+        };
+
+        let llm = create_llm(&provider, &model, None, None)
+            .await
+            .expect("optional backend env lookup failure should be ignored")
+            .expect("llm");
+
+        assert!(llm.chat_provider.as_any().is::<OpenAILegacy>());
+        assert_eq!(llm.chat_provider.name(), "vertexai");
+    })
+    .await;
 }
 
 #[tokio::test]

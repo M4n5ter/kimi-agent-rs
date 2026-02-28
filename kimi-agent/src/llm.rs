@@ -65,8 +65,17 @@ pub async fn augment_provider_with_env_vars(
     let missing_provider_api_key = provider.api_key.is_empty();
     let resolved_credentials = if let Some(env_keys) =
         provider_credential_env_keys(&provider.provider_type)
+        && (missing_provider_base_url || missing_provider_api_key)
     {
-        Some(resolve_provider_credentials_from_env_sources(provider.env.as_ref(), env_keys).await?)
+        Some(
+            resolve_provider_credentials_from_env_sources(
+                provider.env.as_ref(),
+                env_keys,
+                missing_provider_base_url,
+                missing_provider_api_key,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -87,25 +96,26 @@ pub async fn augment_provider_with_env_vars(
         // Kimi model metadata follows the same config-first contract as
         // provider credentials: backend env supplies defaults, not overrides.
         if model.model.is_empty()
-            && let Some(model_name) = read_backend_env_var("KIMI_MODEL_NAME")
-                .await?
+            && let Some(model_name) = read_backend_env_var_best_effort("KIMI_MODEL_NAME")
+                .await
                 .filter(|value| !value.is_empty())
         {
             model.model = model_name.clone();
             applied.insert("KIMI_MODEL_NAME".to_string(), model_name);
         }
         if model.max_context_size <= 0
-            && let Some(max_context_size) = read_backend_env_var("KIMI_MODEL_MAX_CONTEXT_SIZE")
-                .await?
-                .filter(|value| !value.is_empty())
+            && let Some(max_context_size) =
+                read_backend_env_var_best_effort("KIMI_MODEL_MAX_CONTEXT_SIZE")
+                    .await
+                    .filter(|value| !value.is_empty())
         {
             let value = parse_env_i64(&max_context_size)?;
             model.max_context_size = value;
             applied.insert("KIMI_MODEL_MAX_CONTEXT_SIZE".to_string(), max_context_size);
         }
         if model.capabilities.is_none()
-            && let Some(caps) = read_backend_env_var("KIMI_MODEL_CAPABILITIES")
-                .await?
+            && let Some(caps) = read_backend_env_var_best_effort("KIMI_MODEL_CAPABILITIES")
+                .await
                 .filter(|value| !value.is_empty())
         {
             let mut parsed = HashSet::new();
@@ -166,22 +176,22 @@ pub async fn create_llm(
                     Value::String(session_id.to_string()),
                 );
             }
-            if let Some(value) = read_backend_env_var("KIMI_MODEL_TEMPERATURE")
-                .await?
+            if let Some(value) = read_backend_env_var_best_effort("KIMI_MODEL_TEMPERATURE")
+                .await
                 .filter(|value| !value.is_empty())
             {
                 let parsed = parse_env_f64(&value)?;
                 kwargs.insert("temperature".to_string(), Value::from(parsed));
             }
-            if let Some(value) = read_backend_env_var("KIMI_MODEL_TOP_P")
-                .await?
+            if let Some(value) = read_backend_env_var_best_effort("KIMI_MODEL_TOP_P")
+                .await
                 .filter(|value| !value.is_empty())
             {
                 let parsed = parse_env_f64(&value)?;
                 kwargs.insert("top_p".to_string(), Value::from(parsed));
             }
-            if let Some(value) = read_backend_env_var("KIMI_MODEL_MAX_TOKENS")
-                .await?
+            if let Some(value) = read_backend_env_var_best_effort("KIMI_MODEL_MAX_TOKENS")
+                .await
                 .filter(|value| !value.is_empty())
             {
                 let parsed = parse_env_i64(&value)?;
@@ -209,11 +219,11 @@ pub async fn create_llm(
                 Some(default_headers.clone()),
             )
             .map_err(map_chat_provider_error)?;
-            if let Some(value) = read_non_empty_env_override_var(
+            if let Some(value) = read_non_empty_env_override_var_best_effort(
                 provider.env.as_ref(),
                 &["OPENAI_MODEL_TEMPERATURE"],
             )
-            .await?
+            .await
             {
                 let parsed = parse_env_f64(&value)?;
                 let mut kwargs = Map::new();
@@ -233,8 +243,8 @@ pub async fn create_llm(
 
             let mut kwargs = Map::new();
             kwargs.insert("max_tokens".to_string(), Value::from(50_000));
-            if let Some(value) = read_backend_env_var("ANTHROPIC_MODEL_TEMPERATURE")
-                .await?
+            if let Some(value) = read_backend_env_var_best_effort("ANTHROPIC_MODEL_TEMPERATURE")
+                .await
                 .filter(|value| !value.is_empty())
             {
                 kwargs.insert(
@@ -242,14 +252,14 @@ pub async fn create_llm(
                     Value::from(parse_env_f64(&value)?),
                 );
             }
-            if let Some(value) = read_backend_env_var("ANTHROPIC_MODEL_TOP_P")
-                .await?
+            if let Some(value) = read_backend_env_var_best_effort("ANTHROPIC_MODEL_TOP_P")
+                .await
                 .filter(|value| !value.is_empty())
             {
                 kwargs.insert("top_p".to_string(), Value::from(parse_env_f64(&value)?));
             }
-            if let Some(value) = read_backend_env_var("ANTHROPIC_MODEL_MAX_TOKENS")
-                .await?
+            if let Some(value) = read_backend_env_var_best_effort("ANTHROPIC_MODEL_MAX_TOKENS")
+                .await
                 .filter(|value| !value.is_empty())
             {
                 kwargs.insert(
@@ -390,31 +400,35 @@ async fn read_backend_env_var(key: &str) -> Result<Option<String>, LLMError> {
     })
 }
 
-async fn read_env_override_var(
-    provider_env: Option<&HashMap<String, String>>,
-    keys: &'static [&'static str],
-) -> Result<Option<(&'static str, String)>, LLMError> {
-    for key in keys {
-        if let Some(value) = provider_env.and_then(|envs| envs.get(*key)).cloned() {
-            return Ok(Some((*key, value)));
-        }
-        if let Some(value) = read_backend_env_var(key).await?
-            && !value.is_empty()
-        {
-            return Ok(Some((*key, value)));
-        }
-    }
-    Ok(None)
+async fn read_backend_env_var_best_effort(key: &str) -> Option<String> {
+    read_backend_env_var(key).await.unwrap_or_default()
 }
 
-async fn read_non_empty_env_override_var(
+async fn read_env_override_var_best_effort(
     provider_env: Option<&HashMap<String, String>>,
     keys: &'static [&'static str],
-) -> Result<Option<String>, LLMError> {
-    Ok(read_env_override_var(provider_env, keys)
-        .await?
+) -> Option<(&'static str, String)> {
+    for key in keys {
+        if let Some(value) = provider_env.and_then(|envs| envs.get(*key)).cloned() {
+            return Some((*key, value));
+        }
+        if let Some(value) = read_backend_env_var_best_effort(key).await
+            && !value.is_empty()
+        {
+            return Some((*key, value));
+        }
+    }
+    None
+}
+
+async fn read_non_empty_env_override_var_best_effort(
+    provider_env: Option<&HashMap<String, String>>,
+    keys: &'static [&'static str],
+) -> Option<String> {
+    read_env_override_var_best_effort(provider_env, keys)
+        .await
         .map(|(_, value)| value)
-        .filter(|value| !value.is_empty()))
+        .filter(|value| !value.is_empty())
 }
 
 fn provider_credential_env_keys(provider_type: &ProviderType) -> Option<ProviderCredentialEnvKeys> {
@@ -466,10 +480,20 @@ fn openai_compat_env_profile(provider_type: &ProviderType) -> Option<OpenAiCompa
 async fn resolve_provider_credentials_from_env_sources(
     provider_env: Option<&HashMap<String, String>>,
     env_keys: ProviderCredentialEnvKeys,
+    resolve_base_url: bool,
+    resolve_api_key: bool,
 ) -> Result<ResolvedProviderCredentials, LLMError> {
     Ok(ResolvedProviderCredentials {
-        base_url: read_env_override_var(provider_env, env_keys.base_url).await?,
-        api_key: read_env_override_var(provider_env, env_keys.api_key).await?,
+        base_url: if resolve_base_url {
+            read_env_override_var_best_effort(provider_env, env_keys.base_url).await
+        } else {
+            None
+        },
+        api_key: if resolve_api_key {
+            read_env_override_var_best_effort(provider_env, env_keys.api_key).await
+        } else {
+            None
+        },
     })
 }
 
@@ -513,7 +537,8 @@ async fn build_openai_compat_legacy_provider(
     .with_provider_name(env_profile.provider_name);
 
     if let Some(value) =
-        read_non_empty_env_override_var(provider.env.as_ref(), env_profile.temperature).await?
+        read_non_empty_env_override_var_best_effort(provider.env.as_ref(), env_profile.temperature)
+            .await
     {
         let parsed = parse_env_f64(&value)?;
         let mut kwargs = Map::new();
