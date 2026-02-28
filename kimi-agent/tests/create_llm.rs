@@ -188,15 +188,15 @@ async fn test_augment_provider_with_env_vars_kimi() {
 
     let mut provider = LLMProvider {
         provider_type: ProviderType::Kimi,
-        base_url: "https://original.test/v1".to_string(),
-        api_key: "orig-key".to_string(),
+        base_url: String::new(),
+        api_key: String::new(),
         env: None,
         custom_headers: None,
     };
     let mut model = LLMModel {
         provider: "kimi".to_string(),
-        model: "kimi-base".to_string(),
-        max_context_size: 4096,
+        model: String::new(),
+        max_context_size: 0,
         capabilities: None,
     };
 
@@ -229,6 +229,46 @@ async fn test_augment_provider_with_env_vars_kimi() {
 }
 
 #[tokio::test]
+async fn test_augment_provider_with_env_vars_preserves_explicit_kimi_config() {
+    let _lock = ENV_LOCK.lock().await;
+    let _guards = [
+        EnvGuard::set("KIMI_BASE_URL", "https://env.test/v1"),
+        EnvGuard::set("KIMI_API_KEY", "env-key"),
+        EnvGuard::set("KIMI_MODEL_NAME", "kimi-env-model"),
+        EnvGuard::set("KIMI_MODEL_MAX_CONTEXT_SIZE", "8192"),
+        EnvGuard::set("KIMI_MODEL_CAPABILITIES", "Image_In,THINKING"),
+    ];
+
+    let mut provider = LLMProvider {
+        provider_type: ProviderType::Kimi,
+        base_url: "https://configured.test/v1".to_string(),
+        api_key: "configured-key".to_string(),
+        env: None,
+        custom_headers: None,
+    };
+    let mut model = LLMModel {
+        provider: "kimi".to_string(),
+        model: "kimi-configured".to_string(),
+        max_context_size: 4096,
+        capabilities: Some(HashSet::from([ModelCapability::VideoIn])),
+    };
+
+    let applied = augment_provider_with_env_vars(&mut provider, &mut model)
+        .await
+        .expect("env overrides");
+
+    assert!(applied.is_empty());
+    assert_eq!(provider.base_url, "https://configured.test/v1");
+    assert_eq!(provider.api_key, "configured-key");
+    assert_eq!(model.model, "kimi-configured");
+    assert_eq!(model.max_context_size, 4096);
+    assert_eq!(
+        model.capabilities,
+        Some(HashSet::from([ModelCapability::VideoIn]))
+    );
+}
+
+#[tokio::test]
 async fn test_augment_provider_with_env_vars_invalid_max_context_size() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = EnvGuard::set("KIMI_MODEL_MAX_CONTEXT_SIZE", "not-a-number");
@@ -243,7 +283,7 @@ async fn test_augment_provider_with_env_vars_invalid_max_context_size() {
     let mut model = LLMModel {
         provider: "kimi".to_string(),
         model: "kimi-base".to_string(),
-        max_context_size: 4096,
+        max_context_size: 0,
         capabilities: None,
     };
 
@@ -298,6 +338,47 @@ async fn test_augment_provider_with_env_vars_anthropic_uses_backend_env() {
 }
 
 #[tokio::test]
+async fn test_augment_provider_with_env_vars_preserves_explicit_anthropic_config() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://backend.anthropic.test".to_string(),
+            ),
+            (
+                "ANTHROPIC_API_KEY".to_string(),
+                "backend-anthropic-key".to_string(),
+            ),
+        ]));
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::Anthropic,
+            base_url: "https://configured.anthropic.test".to_string(),
+            api_key: "configured-anthropic-key".to_string(),
+            env: None,
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4".to_string(),
+            max_context_size: 200_000,
+            capabilities: None,
+        };
+
+        let applied = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("env overrides");
+
+        assert!(applied.is_empty());
+        assert_eq!(provider.base_url, "https://configured.anthropic.test");
+        assert_eq!(provider.api_key, "configured-anthropic-key");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_augment_provider_with_env_vars_google_genai_uses_gemini_env_family() {
     let _lock = ENV_LOCK.lock().await;
 
@@ -342,6 +423,50 @@ async fn test_augment_provider_with_env_vars_google_genai_uses_gemini_env_family
 }
 
 #[tokio::test]
+async fn test_augment_provider_with_env_vars_preserves_explicit_google_genai_config() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([
+            (
+                "GEMINI_BASE_URL".to_string(),
+                "https://backend.gemini.test/v1beta/openai".to_string(),
+            ),
+            (
+                "GEMINI_API_KEY".to_string(),
+                "backend-gemini-key".to_string(),
+            ),
+        ]));
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::GoogleGenai,
+            base_url: "https://configured.gemini.test/v1beta/openai".to_string(),
+            api_key: "configured-gemini-key".to_string(),
+            env: None,
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "google".to_string(),
+            model: "gemini-2.5-flash".to_string(),
+            max_context_size: 1_000_000,
+            capabilities: None,
+        };
+
+        let applied = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("env overrides");
+
+        assert!(applied.is_empty());
+        assert_eq!(
+            provider.base_url,
+            "https://configured.gemini.test/v1beta/openai"
+        );
+        assert_eq!(provider.api_key, "configured-gemini-key");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_augment_provider_with_env_vars_openai_responses_uses_openai_env_family() {
     let _lock = ENV_LOCK.lock().await;
 
@@ -378,6 +503,47 @@ async fn test_augment_provider_with_env_vars_openai_responses_uses_openai_env_fa
         assert!(applied.is_empty());
         assert_eq!(provider.base_url, "https://backend.openai.test/v1");
         assert_eq!(provider.api_key, "backend-openai-key");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_augment_provider_with_env_vars_preserves_explicit_vertexai_config() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([
+            (
+                "VERTEXAI_BASE_URL".to_string(),
+                "https://backend.vertex.test/v1".to_string(),
+            ),
+            (
+                "VERTEXAI_API_KEY".to_string(),
+                "backend-vertex-key".to_string(),
+            ),
+        ]));
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::Vertexai,
+            base_url: "https://configured.vertex.test/v1".to_string(),
+            api_key: "configured-vertex-key".to_string(),
+            env: None,
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "vertex".to_string(),
+            model: "gemini-3-pro-preview".to_string(),
+            max_context_size: 1_000_000,
+            capabilities: None,
+        };
+
+        let applied = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("env overrides");
+
+        assert!(applied.is_empty());
+        assert_eq!(provider.base_url, "https://configured.vertex.test/v1");
+        assert_eq!(provider.api_key, "configured-vertex-key");
     })
     .await;
 }

@@ -565,15 +565,11 @@ impl Kaos for SshKaos {
         }
 
         let command = format!(
-            "if [ \"${{{key}+x}}\" = x ]; then printf '%s' \"${{{key}}}\"; else exit 1; fi"
+            "if [ \"${{{key}+x}}\" = x ]; then printf '%s' \"${{{key}}}\"; else exit {SSH_ENV_VAR_UNSET_EXIT_CODE}; fi"
         );
         let mut handle = self.state.handle.lock().await;
         let (exit_code, stdout, stderr) = exec_capture_raw(&mut handle, &command).await?;
-        let value = match exit_code {
-            0 => Some(stdout),
-            1 if stderr.is_empty() => None,
-            _ => bail!("Failed to read remote environment variable `{key}`: {stderr}"),
-        };
+        let value = map_env_var_lookup_result(key, exit_code, stdout, stderr)?;
 
         self.state
             .env_cache
@@ -1151,6 +1147,21 @@ async fn exec_capture_raw(
     ))
 }
 
+const SSH_ENV_VAR_UNSET_EXIT_CODE: i32 = 3;
+
+fn map_env_var_lookup_result(
+    key: &str,
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+) -> Result<Option<String>> {
+    match exit_code {
+        0 => Ok(Some(stdout)),
+        SSH_ENV_VAR_UNSET_EXIT_CODE => Ok(None),
+        _ => bail!("Failed to read remote environment variable `{key}`: {stderr}"),
+    }
+}
+
 async fn mkdir_once(sftp: &SftpSession, path: &str, exist_ok: bool) -> Result<()> {
     match sftp.create_dir(path).await {
         Ok(()) => Ok(()),
@@ -1322,7 +1333,8 @@ fn build_storage_name(host: &str, port: u16, username: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GlobTraversalPlan, build_storage_name, normalize_glob_pattern, resolve_absolute_posix,
+        GlobTraversalPlan, SSH_ENV_VAR_UNSET_EXIT_CODE, build_storage_name,
+        map_env_var_lookup_result, normalize_glob_pattern, resolve_absolute_posix,
         validate_env_var_key,
     };
     use crate::{KaosPath, KaosPathStyle};
@@ -1402,5 +1414,32 @@ mod tests {
         assert!(validate_env_var_key("").is_err());
         assert!(validate_env_var_key("1PATH").is_err());
         assert!(validate_env_var_key("BAD-NAME").is_err());
+    }
+
+    #[test]
+    fn map_env_var_lookup_result_returns_value_for_success() {
+        let value = map_env_var_lookup_result("PATH", 0, "value ".to_string(), "noise".to_string())
+            .expect("success");
+        assert_eq!(value, Some("value ".to_string()));
+    }
+
+    #[test]
+    fn map_env_var_lookup_result_returns_none_for_unset_exit_code() {
+        let value = map_env_var_lookup_result(
+            "PATH",
+            SSH_ENV_VAR_UNSET_EXIT_CODE,
+            String::new(),
+            "startup noise".to_string(),
+        )
+        .expect("unset");
+        assert_eq!(value, None);
+    }
+
+    #[test]
+    fn map_env_var_lookup_result_errors_for_other_failures() {
+        let err =
+            map_env_var_lookup_result("PATH", 1, String::new(), "permission denied".to_string())
+                .expect_err("failure");
+        assert!(err.to_string().contains("permission denied"));
     }
 }

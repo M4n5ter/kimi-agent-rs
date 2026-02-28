@@ -57,6 +57,8 @@ pub async fn augment_provider_with_env_vars(
     model: &mut LLMModel,
 ) -> Result<HashMap<String, String>, LLMError> {
     let mut applied = HashMap::new();
+    let missing_provider_base_url = provider.base_url.is_empty();
+    let missing_provider_api_key = provider.api_key.is_empty();
     let resolved_credentials = if let Some(env_keys) =
         provider_credential_env_keys(&provider.provider_type)
     {
@@ -66,36 +68,39 @@ pub async fn augment_provider_with_env_vars(
     };
 
     if let Some(credentials) = resolved_credentials.as_ref() {
-        apply_resolved_provider_credentials(provider, credentials);
+        apply_resolved_provider_credentials_if_missing(provider, credentials);
         if provider.provider_type == ProviderType::Kimi {
-            if let Some((key, value)) = credentials.base_url.as_ref() {
+            if missing_provider_base_url && let Some((key, value)) = credentials.base_url.as_ref() {
                 applied.insert((*key).to_string(), value.clone());
             }
-            if let Some((key, _)) = credentials.api_key.as_ref() {
+            if missing_provider_api_key && let Some((key, _)) = credentials.api_key.as_ref() {
                 applied.insert((*key).to_string(), "******".to_string());
             }
         }
     }
 
     if provider.provider_type == ProviderType::Kimi {
-        if let Some(model_name) = read_backend_env_var("KIMI_MODEL_NAME")
-            .await?
-            .filter(|value| !value.is_empty())
+        if model.model.is_empty()
+            && let Some(model_name) = read_backend_env_var("KIMI_MODEL_NAME")
+                .await?
+                .filter(|value| !value.is_empty())
         {
             model.model = model_name.clone();
             applied.insert("KIMI_MODEL_NAME".to_string(), model_name);
         }
-        if let Some(max_context_size) = read_backend_env_var("KIMI_MODEL_MAX_CONTEXT_SIZE")
-            .await?
-            .filter(|value| !value.is_empty())
+        if model.max_context_size <= 0
+            && let Some(max_context_size) = read_backend_env_var("KIMI_MODEL_MAX_CONTEXT_SIZE")
+                .await?
+                .filter(|value| !value.is_empty())
         {
             let value = parse_env_i64(&max_context_size)?;
             model.max_context_size = value;
             applied.insert("KIMI_MODEL_MAX_CONTEXT_SIZE".to_string(), max_context_size);
         }
-        if let Some(caps) = read_backend_env_var("KIMI_MODEL_CAPABILITIES")
-            .await?
-            .filter(|value| !value.is_empty())
+        if model.capabilities.is_none()
+            && let Some(caps) = read_backend_env_var("KIMI_MODEL_CAPABILITIES")
+                .await?
+                .filter(|value| !value.is_empty())
         {
             let mut parsed = HashSet::new();
             for cap in caps.split(',').map(|s| s.trim().to_lowercase()) {
@@ -435,10 +440,10 @@ fn openai_compat_env_profile(provider_type: &ProviderType) -> Option<OpenAiCompa
         ProviderType::GoogleGenai | ProviderType::Gemini => Some(OpenAiCompatEnvProfile {
             provider_name: "google_genai",
             credentials: ProviderCredentialEnvKeys {
-                base_url: &["GEMINI_BASE_URL", "GOOGLE_GENAI_BASE_URL"],
-                api_key: &["GEMINI_API_KEY", "GOOGLE_GENAI_API_KEY"],
+                base_url: &["GEMINI_BASE_URL"],
+                api_key: &["GEMINI_API_KEY"],
             },
-            temperature: &["GEMINI_MODEL_TEMPERATURE", "GOOGLE_GENAI_MODEL_TEMPERATURE"],
+            temperature: &["GEMINI_MODEL_TEMPERATURE"],
         }),
         ProviderType::Vertexai => Some(OpenAiCompatEnvProfile {
             provider_name: "vertexai",
@@ -462,14 +467,18 @@ async fn resolve_provider_credentials_from_env_sources(
     })
 }
 
-fn apply_resolved_provider_credentials(
+fn apply_resolved_provider_credentials_if_missing(
     provider: &mut LLMProvider,
     credentials: &ResolvedProviderCredentials,
 ) {
-    if let Some((_, base_url)) = credentials.base_url.as_ref() {
+    if provider.base_url.is_empty()
+        && let Some((_, base_url)) = credentials.base_url.as_ref()
+    {
         provider.base_url = base_url.clone();
     }
-    if let Some((_, api_key)) = credentials.api_key.as_ref() {
+    if provider.api_key.is_empty()
+        && let Some((_, api_key)) = credentials.api_key.as_ref()
+    {
         provider.api_key = api_key.clone();
     }
 }
