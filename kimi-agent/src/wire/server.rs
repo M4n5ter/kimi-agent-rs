@@ -584,6 +584,8 @@ impl WireRpcState {
 
         cancel_and_wait_active_turn(&self.active_turn).await;
 
+        self.soul.shutdown().await;
+
         self.reject_pending_requests().await;
 
         self.write_queue.shutdown(false);
