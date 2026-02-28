@@ -548,30 +548,66 @@ fn system_time_to_f64(time: SystemTime) -> f64 {
 mod tests {
     use super::LocalKaos;
     use crate::Kaos;
+    use tokio::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: tests serialize env access via ENV_LOCK to avoid races.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: tests serialize env access via ENV_LOCK to avoid races.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(prev) = &self.prev {
+                // SAFETY: tests serialize env access via ENV_LOCK to avoid races.
+                unsafe {
+                    std::env::set_var(self.key, prev);
+                }
+            } else {
+                // SAFETY: tests serialize env access via ENV_LOCK to avoid races.
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn env_var_reads_local_process_environment() {
-        // SAFETY: test process controls this variable for the duration of the test.
-        unsafe {
-            std::env::set_var("KAOS_TEST_ENV_VAR", "local-value");
-        }
+        let _lock = ENV_LOCK.lock().await;
+        let _guard = EnvGuard::set("KAOS_TEST_ENV_VAR", "local-value");
         let kaos = LocalKaos::new();
         assert_eq!(
             kaos.env_var("KAOS_TEST_ENV_VAR").await.expect("read env"),
             Some("local-value".to_string())
         );
-        // SAFETY: test process controls this variable for the duration of the test.
-        unsafe {
-            std::env::remove_var("KAOS_TEST_ENV_VAR");
-        }
     }
 
     #[tokio::test]
     async fn env_var_returns_none_for_missing_values() {
-        // SAFETY: test process controls this variable for the duration of the test.
-        unsafe {
-            std::env::remove_var("KAOS_TEST_ENV_VAR_MISSING");
-        }
+        let _lock = ENV_LOCK.lock().await;
+        let _guard = EnvGuard::remove("KAOS_TEST_ENV_VAR_MISSING");
         let kaos = LocalKaos::new();
         assert_eq!(
             kaos.env_var("KAOS_TEST_ENV_VAR_MISSING")

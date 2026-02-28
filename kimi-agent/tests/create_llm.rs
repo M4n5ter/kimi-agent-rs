@@ -780,6 +780,47 @@ async fn test_create_llm_scripted_echo_prefers_provider_env_without_mutating_pro
 }
 
 #[tokio::test]
+async fn test_create_llm_scripted_echo_uses_host_env_instead_of_backend_env() {
+    let _lock = ENV_LOCK.lock().await;
+    let temp_dir = TempDir::new().expect("temp dir");
+    let scripts_path = temp_dir.path().join("scripts.json");
+    std::fs::write(&scripts_path, r#"["text: from host env"]"#).expect("write scripts");
+    let host_path = scripts_path.to_string_lossy().to_string();
+    let _guard = EnvGuard::set("KIMI_SCRIPTED_ECHO_SCRIPTS", &host_path);
+
+    with_current_kaos_scope(async {
+        let _backend = BackendEnvKaosGuard::new(HashMap::from([(
+            "KIMI_SCRIPTED_ECHO_SCRIPTS".to_string(),
+            "/remote/does-not-exist.json".to_string(),
+        )]));
+
+        let llm = create_llm(
+            &LLMProvider {
+                provider_type: ProviderType::ScriptedEcho,
+                base_url: String::new(),
+                api_key: String::new(),
+                env: None,
+                custom_headers: None,
+            },
+            &LLMModel {
+                provider: "_scripted_echo".to_string(),
+                model: "scripted_echo".to_string(),
+                max_context_size: 10_000,
+                capabilities: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create llm")
+        .expect("llm");
+
+        assert_eq!(llm.chat_provider.name(), "scripted_echo");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_create_llm_vertexai_uses_provider_scoped_api_key_env_without_mutating_process_env() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = EnvGuard::set("VERTEXAI_API_KEY", "process-old-key");

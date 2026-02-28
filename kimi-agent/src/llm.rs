@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::path::PathBuf;
 
 use serde_json::{Map, Value};
@@ -270,8 +271,8 @@ pub async fn create_llm(
         ProviderType::Echo => Box::new(kosong::chat_provider::echo::EchoChatProvider),
         ProviderType::ScriptedEcho => {
             let scripts = load_scripted_echo_scripts(provider.env.as_ref()).await?;
-            let trace = read_env_var(provider.env.as_ref(), "KIMI_SCRIPTED_ECHO_TRACE")
-                .await?
+            // Scripted echo scripts and tracing are host-local test fixtures.
+            let trace = read_host_env_var(provider.env.as_ref(), "KIMI_SCRIPTED_ECHO_TRACE")
                 .unwrap_or_default()
                 .trim()
                 .to_lowercase();
@@ -504,14 +505,11 @@ async fn build_openai_compat_legacy_provider(
     Ok(openai)
 }
 
-async fn read_env_var(
-    provider_env: Option<&HashMap<String, String>>,
-    key: &str,
-) -> Result<Option<String>, LLMError> {
-    if let Some(value) = provider_env.and_then(|envs| envs.get(key)).cloned() {
-        return Ok(Some(value));
-    }
-    read_backend_env_var(key).await
+fn read_host_env_var(provider_env: Option<&HashMap<String, String>>, key: &str) -> Option<String> {
+    provider_env
+        .and_then(|envs| envs.get(key))
+        .cloned()
+        .or_else(|| env::var(key).ok())
 }
 
 fn non_empty_provider_value(value: &str) -> Option<String> {
@@ -525,9 +523,8 @@ fn non_empty_provider_value(value: &str) -> Option<String> {
 async fn load_scripted_echo_scripts(
     provider_env: Option<&HashMap<String, String>>,
 ) -> Result<Vec<String>, LLMError> {
-    let script_path = read_env_var(provider_env, "KIMI_SCRIPTED_ECHO_SCRIPTS")
-        .await?
-        .ok_or_else(|| {
+    let script_path =
+        read_host_env_var(provider_env, "KIMI_SCRIPTED_ECHO_SCRIPTS").ok_or_else(|| {
             LLMError::ScriptedEcho(
                 "KIMI_SCRIPTED_ECHO_SCRIPTS is required for _scripted_echo.".to_string(),
             )
