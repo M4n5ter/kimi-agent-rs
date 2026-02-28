@@ -97,18 +97,12 @@ pub async fn augment_provider_with_env_vars(
             }
         }
         ProviderType::OpenaiLegacy | ProviderType::OpenaiResponses => {
-            if let Some(base_url) = read_backend_env_var("OPENAI_BASE_URL")
-                .await?
-                .filter(|value| !value.is_empty())
-            {
-                provider.base_url = base_url;
-            }
-            if let Some(api_key) = read_backend_env_var("OPENAI_API_KEY")
-                .await?
-                .filter(|value| !value.is_empty())
-            {
-                provider.api_key = api_key;
-            }
+            apply_backend_provider_credentials(provider, "OPENAI_BASE_URL", "OPENAI_API_KEY")
+                .await?;
+        }
+        ProviderType::Anthropic => {
+            apply_backend_provider_credentials(provider, "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY")
+                .await?;
         }
         _ => {}
     }
@@ -397,6 +391,26 @@ async fn read_backend_env_var(key: &str) -> Result<Option<String>, LLMError> {
             "failed to read environment variable `{key}`: {err}"
         ))
     })
+}
+
+async fn read_non_empty_backend_env_var(key: &str) -> Result<Option<String>, LLMError> {
+    Ok(read_backend_env_var(key)
+        .await?
+        .filter(|value| !value.is_empty()))
+}
+
+async fn apply_backend_provider_credentials(
+    provider: &mut LLMProvider,
+    base_url_key: &str,
+    api_key_key: &str,
+) -> Result<(), LLMError> {
+    if let Some(base_url) = read_non_empty_backend_env_var(base_url_key).await? {
+        provider.base_url = base_url;
+    }
+    if let Some(api_key) = read_non_empty_backend_env_var(api_key_key).await? {
+        provider.api_key = api_key;
+    }
+    Ok(())
 }
 
 async fn read_env_var(

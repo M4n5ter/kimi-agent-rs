@@ -257,6 +257,47 @@ async fn test_augment_provider_with_env_vars_invalid_max_context_size() {
 }
 
 #[tokio::test]
+async fn test_augment_provider_with_env_vars_anthropic_uses_backend_env() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "https://backend.anthropic.test".to_string(),
+            ),
+            (
+                "ANTHROPIC_API_KEY".to_string(),
+                "backend-anthropic-key".to_string(),
+            ),
+        ]));
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::Anthropic,
+            base_url: String::new(),
+            api_key: String::new(),
+            env: None,
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4".to_string(),
+            max_context_size: 200_000,
+            capabilities: None,
+        };
+
+        let applied = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("env overrides");
+
+        assert!(applied.is_empty());
+        assert_eq!(provider.base_url, "https://backend.anthropic.test");
+        assert_eq!(provider.api_key, "backend-anthropic-key");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_augment_provider_with_env_vars_uses_backend_env_without_process_fallback() {
     let _lock = ENV_LOCK.lock().await;
     let _guards = [
