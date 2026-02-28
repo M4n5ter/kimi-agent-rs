@@ -244,6 +244,10 @@ impl Kaos for TestKaos {
         self.inner.mkdir(path, parents, exist_ok).await
     }
 
+    async fn env_var(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.inner.env_var(key).await
+    }
+
     async fn exec(&self, args: &[String]) -> anyhow::Result<Box<dyn kaos::KaosProcess>> {
         self.inner.exec(args).await
     }

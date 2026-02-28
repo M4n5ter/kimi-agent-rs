@@ -137,6 +137,7 @@ impl KimiCLI {
             "Using LLM model"
         );
         let env_overrides = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
             .map_err(anyhow::Error::new)?;
 
         let thinking = thinking.unwrap_or(config.default_thinking);

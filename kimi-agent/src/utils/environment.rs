@@ -37,6 +37,16 @@ impl Environment {
             };
         }
 
+        if let Some(shell) = shell_from_backend_env().await {
+            return Environment {
+                os_kind,
+                os_arch,
+                os_version,
+                shell_name: shell.0,
+                shell_path: shell.1,
+            };
+        }
+
         let mut shell_name = "sh".to_string();
         let mut shell_path = KaosPath::new("/bin/sh");
         for candidate in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
@@ -56,4 +66,24 @@ impl Environment {
             shell_path,
         }
     }
+}
+
+async fn shell_from_backend_env() -> Option<(String, KaosPath)> {
+    let shell = kaos::env_var("SHELL").await.ok().flatten()?;
+    if shell.is_empty() {
+        return None;
+    }
+
+    let path = KaosPath::new(shell);
+    let basename = path.name().to_ascii_lowercase();
+    let name = match basename.as_str() {
+        "bash" => "bash",
+        "sh" => "sh",
+        _ => return None,
+    };
+    if !path.is_file(true).await {
+        return None;
+    }
+
+    Some((name.to_string(), path))
 }

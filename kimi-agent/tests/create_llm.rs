@@ -1,5 +1,10 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use kaos::{
+    CurrentKaosToken, Kaos, KaosPath, KaosProcess, LineStream, LocalKaos, StrOrKaosPath,
+    reset_current_kaos, set_current_kaos, with_current_kaos_scope,
+};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -48,9 +53,131 @@ impl Drop for EnvGuard {
     }
 }
 
-#[test]
-fn test_augment_provider_with_env_vars_kimi() {
-    let _lock = ENV_LOCK.blocking_lock();
+struct BackendEnvKaos {
+    inner: LocalKaos,
+    env: HashMap<String, String>,
+}
+
+impl BackendEnvKaos {
+    fn new(env: HashMap<String, String>) -> Self {
+        Self {
+            inner: LocalKaos::new(),
+            env,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Kaos for BackendEnvKaos {
+    fn name(&self) -> &str {
+        "test-backend"
+    }
+
+    fn platform(&self) -> kaos::KaosPlatform {
+        self.inner.platform()
+    }
+
+    fn normpath(&self, path: &StrOrKaosPath<'_>) -> KaosPath {
+        self.inner.normpath(path)
+    }
+
+    fn home(&self) -> KaosPath {
+        self.inner.home()
+    }
+
+    fn cwd(&self) -> KaosPath {
+        self.inner.cwd()
+    }
+
+    async fn chdir(&self, path: &KaosPath) -> anyhow::Result<()> {
+        self.inner.chdir(path).await
+    }
+
+    async fn stat(
+        &self,
+        path: &KaosPath,
+        follow_symlinks: bool,
+    ) -> anyhow::Result<kaos::StatResult> {
+        self.inner.stat(path, follow_symlinks).await
+    }
+
+    async fn iterdir(&self, path: &KaosPath) -> anyhow::Result<Vec<KaosPath>> {
+        self.inner.iterdir(path).await
+    }
+
+    async fn glob(
+        &self,
+        path: &KaosPath,
+        pattern: &str,
+        case_sensitive: bool,
+    ) -> anyhow::Result<Vec<KaosPath>> {
+        self.inner.glob(path, pattern, case_sensitive).await
+    }
+
+    async fn read_bytes(&self, path: &KaosPath, limit: Option<usize>) -> anyhow::Result<Vec<u8>> {
+        self.inner.read_bytes(path, limit).await
+    }
+
+    async fn read_text(&self, path: &KaosPath) -> anyhow::Result<String> {
+        self.inner.read_text(path).await
+    }
+
+    async fn read_lines(&self, path: &KaosPath) -> anyhow::Result<Vec<String>> {
+        self.inner.read_lines(path).await
+    }
+
+    async fn read_lines_stream(&self, path: &KaosPath) -> anyhow::Result<LineStream> {
+        self.inner.read_lines_stream(path).await
+    }
+
+    async fn write_bytes(&self, path: &KaosPath, data: &[u8]) -> anyhow::Result<usize> {
+        self.inner.write_bytes(path, data).await
+    }
+
+    async fn write_text(&self, path: &KaosPath, data: &str, append: bool) -> anyhow::Result<usize> {
+        self.inner.write_text(path, data, append).await
+    }
+
+    async fn chmod(&self, path: &KaosPath, mode: u32) -> anyhow::Result<()> {
+        self.inner.chmod(path, mode).await
+    }
+
+    async fn mkdir(&self, path: &KaosPath, parents: bool, exist_ok: bool) -> anyhow::Result<()> {
+        self.inner.mkdir(path, parents, exist_ok).await
+    }
+
+    async fn env_var(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self.env.get(key).cloned())
+    }
+
+    async fn exec(&self, args: &[String]) -> anyhow::Result<Box<dyn KaosProcess>> {
+        self.inner.exec(args).await
+    }
+}
+
+struct BackendEnvKaosGuard {
+    token: Option<CurrentKaosToken>,
+}
+
+impl BackendEnvKaosGuard {
+    fn new(env: HashMap<String, String>) -> Self {
+        let kaos = Arc::new(BackendEnvKaos::new(env));
+        let token = set_current_kaos(kaos);
+        Self { token: Some(token) }
+    }
+}
+
+impl Drop for BackendEnvKaosGuard {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            reset_current_kaos(token);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_augment_provider_with_env_vars_kimi() {
+    let _lock = ENV_LOCK.lock().await;
     let _guards = [
         EnvGuard::set("KIMI_BASE_URL", "https://env.test/v1"),
         EnvGuard::set("KIMI_API_KEY", "env-key"),
@@ -73,7 +200,9 @@ fn test_augment_provider_with_env_vars_kimi() {
         capabilities: None,
     };
 
-    augment_provider_with_env_vars(&mut provider, &mut model).expect("env overrides");
+    augment_provider_with_env_vars(&mut provider, &mut model)
+        .await
+        .expect("env overrides");
 
     assert_eq!(
         provider,
@@ -99,9 +228,9 @@ fn test_augment_provider_with_env_vars_kimi() {
     );
 }
 
-#[test]
-fn test_augment_provider_with_env_vars_invalid_max_context_size() {
-    let _lock = ENV_LOCK.blocking_lock();
+#[tokio::test]
+async fn test_augment_provider_with_env_vars_invalid_max_context_size() {
+    let _lock = ENV_LOCK.lock().await;
     let _guard = EnvGuard::set("KIMI_MODEL_MAX_CONTEXT_SIZE", "not-a-number");
 
     let mut provider = LLMProvider {
@@ -119,11 +248,108 @@ fn test_augment_provider_with_env_vars_invalid_max_context_size() {
     };
 
     let err = augment_provider_with_env_vars(&mut provider, &mut model)
+        .await
         .expect_err("invalid max context size");
     assert!(
         err.to_string()
             .contains("invalid literal for int() with base 10")
     );
+}
+
+#[tokio::test]
+async fn test_augment_provider_with_env_vars_uses_backend_env_without_process_fallback() {
+    let _lock = ENV_LOCK.lock().await;
+    let _guards = [
+        EnvGuard::set("KIMI_BASE_URL", "https://host.test/v1"),
+        EnvGuard::set("KIMI_API_KEY", "host-key"),
+    ];
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::new());
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::Kimi,
+            base_url: String::new(),
+            api_key: String::new(),
+            env: None,
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "kimi".to_string(),
+            model: "kimi-base".to_string(),
+            max_context_size: 4096,
+            capabilities: None,
+        };
+
+        let applied = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("env overrides");
+
+        assert!(applied.is_empty());
+        assert_eq!(provider.base_url, "");
+        assert_eq!(provider.api_key, "");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_augment_provider_with_env_vars_prefers_provider_env_over_backend_env() {
+    let _lock = ENV_LOCK.lock().await;
+    let mock_server = MockServer::start().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([
+            (
+                "OPENAI_BASE_URL".to_string(),
+                "https://backend.invalid/v1".to_string(),
+            ),
+            ("OPENAI_API_KEY".to_string(), "backend-key".to_string()),
+        ]));
+
+        let base_url = format!("{}/v1", mock_server.uri());
+        let api_key = "provider-key".to_string();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer provider-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("", "text/event-stream"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let llm = create_llm(
+            &LLMProvider {
+                provider_type: ProviderType::Vertexai,
+                base_url: base_url.clone(),
+                api_key: String::new(),
+                env: Some(HashMap::from([(
+                    "OPENAI_API_KEY".to_string(),
+                    api_key.clone(),
+                )])),
+                custom_headers: None,
+            },
+            &LLMModel {
+                provider: "vertex".to_string(),
+                model: "gemini-3-pro-preview".to_string(),
+                max_context_size: 1_000_000,
+                capabilities: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create llm")
+        .expect("llm");
+
+        let tools: Vec<kosong::tooling::Tool> = vec![];
+        let history: Vec<kosong::message::Message> = vec![];
+        let _stream = llm
+            .chat_provider
+            .generate("", &tools, &history)
+            .await
+            .expect("generate request should use provider env values");
+    })
+    .await;
 }
 
 #[tokio::test]

@@ -1,6 +1,5 @@
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
-use std::env;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -41,17 +40,13 @@ impl Kimi {
         base_url: Option<String>,
         default_headers: Option<HeaderMap>,
     ) -> Result<Self, ChatProviderError> {
-        let api_key = api_key
-            .or_else(|| env::var("KIMI_API_KEY").ok())
-            .ok_or_else(|| {
-                ChatProviderError::new(
-                    ChatProviderErrorKind::Other,
-                    "The api_key client option or the KIMI_API_KEY environment variable is not set",
-                )
-            })?;
-        let mut base_url = base_url
-            .or_else(|| env::var("KIMI_BASE_URL").ok())
-            .unwrap_or_else(|| "https://api.moonshot.ai/v1".to_string());
+        let api_key = api_key.ok_or_else(|| {
+            ChatProviderError::new(
+                ChatProviderErrorKind::Other,
+                "The api_key client option is not set",
+            )
+        })?;
+        let mut base_url = base_url.unwrap_or_else(|| "https://api.moonshot.ai/v1".to_string());
         if !base_url.ends_with('/') {
             base_url.push('/');
         }

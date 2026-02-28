@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -96,6 +96,7 @@ struct SshState {
     sftp: SftpSession,
     home: KaosPath,
     cwd: Mutex<KaosPath>,
+    env_cache: AsyncMutex<HashMap<String, Option<String>>>,
     platform: KaosPlatform,
     storage_name: String,
 }
@@ -241,6 +242,7 @@ impl SshKaos {
                 sftp,
                 home,
                 cwd: Mutex::new(cwd),
+                env_cache: AsyncMutex::new(HashMap::new()),
                 platform,
                 storage_name,
             }),
@@ -553,6 +555,32 @@ impl Kaos for SshKaos {
             mkdir_once(&self.state.sftp, current.as_str(), allow_existing).await?;
         }
         Ok(())
+    }
+
+    async fn env_var(&self, key: &str) -> Result<Option<String>> {
+        validate_env_var_key(key)?;
+
+        if let Some(cached) = self.state.env_cache.lock().await.get(key).cloned() {
+            return Ok(cached);
+        }
+
+        let command = format!(
+            "if [ \"${{{key}+x}}\" = x ]; then printf '%s' \"${{{key}}}\"; else exit 1; fi"
+        );
+        let mut handle = self.state.handle.lock().await;
+        let (exit_code, stdout, stderr) = exec_capture_raw(&mut handle, &command).await?;
+        let value = match exit_code {
+            0 => Some(stdout),
+            1 if stderr.is_empty() => None,
+            _ => bail!("Failed to read remote environment variable `{key}`: {stderr}"),
+        };
+
+        self.state
+            .env_cache
+            .lock()
+            .await
+            .insert(key.to_string(), value.clone());
+        Ok(value)
     }
 
     async fn exec(&self, args: &[String]) -> Result<Box<dyn KaosProcess>> {
@@ -1091,6 +1119,14 @@ async fn exec_capture(
     handle: &mut client::Handle<SshClientHandler>,
     command: &str,
 ) -> Result<(i32, String, String)> {
+    let (code, stdout, stderr) = exec_capture_raw(handle, command).await?;
+    Ok((code, stdout.trim().to_string(), stderr.trim().to_string()))
+}
+
+async fn exec_capture_raw(
+    handle: &mut client::Handle<SshClientHandler>,
+    command: &str,
+) -> Result<(i32, String, String)> {
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, command).await?;
 
@@ -1110,8 +1146,8 @@ async fn exec_capture(
 
     Ok((
         code.unwrap_or(1),
-        String::from_utf8_lossy(&stdout).trim().to_string(),
-        String::from_utf8_lossy(&stderr).trim().to_string(),
+        String::from_utf8_lossy(&stdout).to_string(),
+        String::from_utf8_lossy(&stderr).to_string(),
     ))
 }
 
@@ -1153,6 +1189,21 @@ fn normalize_arch(raw: &str) -> String {
         "x86" | "i386" | "i686" => "x86".to_string(),
         other if !other.is_empty() => other.to_string(),
         _ => "x86_64".to_string(),
+    }
+}
+
+fn validate_env_var_key(key: &str) -> Result<()> {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        bail!("Environment variable name cannot be empty");
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        bail!("Invalid environment variable name `{key}`");
+    }
+    if chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        Ok(())
+    } else {
+        bail!("Invalid environment variable name `{key}`");
     }
 }
 
@@ -1272,6 +1323,7 @@ fn build_storage_name(host: &str, port: u16, username: &str) -> String {
 mod tests {
     use super::{
         GlobTraversalPlan, build_storage_name, normalize_glob_pattern, resolve_absolute_posix,
+        validate_env_var_key,
     };
     use crate::{KaosPath, KaosPathStyle};
 
@@ -1337,5 +1389,18 @@ mod tests {
         assert_eq!(normalize_glob_pattern("./*.rs"), "*.rs");
         assert_eq!(normalize_glob_pattern("./src/**/*.rs"), "src/**/*.rs");
         assert_eq!(normalize_glob_pattern("*.rs"), "*.rs");
+    }
+
+    #[test]
+    fn validate_env_var_key_accepts_posix_identifiers() {
+        assert!(validate_env_var_key("PATH").is_ok());
+        assert!(validate_env_var_key("_TOKEN_2").is_ok());
+    }
+
+    #[test]
+    fn validate_env_var_key_rejects_invalid_identifiers() {
+        assert!(validate_env_var_key("").is_err());
+        assert!(validate_env_var_key("1PATH").is_err());
+        assert!(validate_env_var_key("BAD-NAME").is_err());
     }
 }

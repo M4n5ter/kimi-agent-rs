@@ -418,6 +418,16 @@ impl Kaos for LocalKaos {
         Ok(())
     }
 
+    async fn env_var(&self, key: &str) -> Result<Option<String>> {
+        match std::env::var(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(anyhow!("Environment variable `{key}` is not valid UTF-8"))
+            }
+        }
+    }
+
     async fn exec(&self, args: &[String]) -> Result<Box<dyn KaosProcess>> {
         if args.is_empty() {
             return Err(anyhow!("missing command"));
@@ -532,4 +542,42 @@ fn system_time_to_f64(time: SystemTime) -> f64 {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LocalKaos;
+    use crate::Kaos;
+
+    #[tokio::test]
+    async fn env_var_reads_local_process_environment() {
+        // SAFETY: test process controls this variable for the duration of the test.
+        unsafe {
+            std::env::set_var("KAOS_TEST_ENV_VAR", "local-value");
+        }
+        let kaos = LocalKaos::new();
+        assert_eq!(
+            kaos.env_var("KAOS_TEST_ENV_VAR").await.expect("read env"),
+            Some("local-value".to_string())
+        );
+        // SAFETY: test process controls this variable for the duration of the test.
+        unsafe {
+            std::env::remove_var("KAOS_TEST_ENV_VAR");
+        }
+    }
+
+    #[tokio::test]
+    async fn env_var_returns_none_for_missing_values() {
+        // SAFETY: test process controls this variable for the duration of the test.
+        unsafe {
+            std::env::remove_var("KAOS_TEST_ENV_VAR_MISSING");
+        }
+        let kaos = LocalKaos::new();
+        assert_eq!(
+            kaos.env_var("KAOS_TEST_ENV_VAR_MISSING")
+                .await
+                .expect("read env"),
+            None
+        );
+    }
 }

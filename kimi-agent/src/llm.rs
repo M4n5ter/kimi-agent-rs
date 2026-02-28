@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::env;
 use std::path::PathBuf;
 
 use serde_json::{Map, Value};
@@ -34,7 +33,7 @@ impl LLM {
     }
 }
 
-pub fn augment_provider_with_env_vars(
+pub async fn augment_provider_with_env_vars(
     provider: &mut LLMProvider,
     model: &mut LLMModel,
 ) -> Result<HashMap<String, String>, LLMError> {
@@ -42,33 +41,38 @@ pub fn augment_provider_with_env_vars(
 
     match provider.provider_type {
         ProviderType::Kimi => {
-            if let Ok(base_url) = env::var("KIMI_BASE_URL")
-                && !base_url.is_empty()
+            if let Some(base_url) = read_backend_env_var("KIMI_BASE_URL")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 provider.base_url = base_url.clone();
                 applied.insert("KIMI_BASE_URL".to_string(), base_url);
             }
-            if let Ok(api_key) = env::var("KIMI_API_KEY")
-                && !api_key.is_empty()
+            if let Some(api_key) = read_backend_env_var("KIMI_API_KEY")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 provider.api_key = api_key;
                 applied.insert("KIMI_API_KEY".to_string(), "******".to_string());
             }
-            if let Ok(model_name) = env::var("KIMI_MODEL_NAME")
-                && !model_name.is_empty()
+            if let Some(model_name) = read_backend_env_var("KIMI_MODEL_NAME")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 model.model = model_name.clone();
                 applied.insert("KIMI_MODEL_NAME".to_string(), model_name);
             }
-            if let Ok(max_context_size) = env::var("KIMI_MODEL_MAX_CONTEXT_SIZE")
-                && !max_context_size.is_empty()
+            if let Some(max_context_size) = read_backend_env_var("KIMI_MODEL_MAX_CONTEXT_SIZE")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 let value = parse_env_i64(&max_context_size)?;
                 model.max_context_size = value;
                 applied.insert("KIMI_MODEL_MAX_CONTEXT_SIZE".to_string(), max_context_size);
             }
-            if let Ok(caps) = env::var("KIMI_MODEL_CAPABILITIES")
-                && !caps.is_empty()
+            if let Some(caps) = read_backend_env_var("KIMI_MODEL_CAPABILITIES")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 let mut parsed = HashSet::new();
                 for cap in caps.split(',').map(|s| s.trim().to_lowercase()) {
@@ -93,13 +97,15 @@ pub fn augment_provider_with_env_vars(
             }
         }
         ProviderType::OpenaiLegacy | ProviderType::OpenaiResponses => {
-            if let Ok(base_url) = env::var("OPENAI_BASE_URL")
-                && !base_url.is_empty()
+            if let Some(base_url) = read_backend_env_var("OPENAI_BASE_URL")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 provider.base_url = base_url;
             }
-            if let Ok(api_key) = env::var("OPENAI_API_KEY")
-                && !api_key.is_empty()
+            if let Some(api_key) = read_backend_env_var("OPENAI_API_KEY")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 provider.api_key = api_key;
             }
@@ -142,20 +148,23 @@ pub async fn create_llm(
                     Value::String(session_id.to_string()),
                 );
             }
-            if let Ok(value) = env::var("KIMI_MODEL_TEMPERATURE")
-                && !value.is_empty()
+            if let Some(value) = read_backend_env_var("KIMI_MODEL_TEMPERATURE")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 let parsed = parse_env_f64(&value)?;
                 kwargs.insert("temperature".to_string(), Value::from(parsed));
             }
-            if let Ok(value) = env::var("KIMI_MODEL_TOP_P")
-                && !value.is_empty()
+            if let Some(value) = read_backend_env_var("KIMI_MODEL_TOP_P")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 let parsed = parse_env_f64(&value)?;
                 kwargs.insert("top_p".to_string(), Value::from(parsed));
             }
-            if let Ok(value) = env::var("KIMI_MODEL_MAX_TOKENS")
-                && !value.is_empty()
+            if let Some(value) = read_backend_env_var("KIMI_MODEL_MAX_TOKENS")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 let parsed = parse_env_i64(&value)?;
                 kwargs.insert("max_tokens".to_string(), Value::from(parsed));
@@ -173,8 +182,9 @@ pub async fn create_llm(
                 Some(default_headers.clone()),
             )
             .map_err(map_chat_provider_error)?;
-            if let Ok(value) = env::var("OPENAI_MODEL_TEMPERATURE")
-                && !value.is_empty()
+            if let Some(value) = read_backend_env_var("OPENAI_MODEL_TEMPERATURE")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 let parsed = parse_env_f64(&value)?;
                 let mut kwargs = Map::new();
@@ -191,8 +201,9 @@ pub async fn create_llm(
                 Some(default_headers.clone()),
             )
             .map_err(map_chat_provider_error)?;
-            if let Ok(value) = env::var("OPENAI_MODEL_TEMPERATURE")
-                && !value.is_empty()
+            if let Some(value) = read_backend_env_var("OPENAI_MODEL_TEMPERATURE")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 let parsed = parse_env_f64(&value)?;
                 let mut kwargs = Map::new();
@@ -212,21 +223,24 @@ pub async fn create_llm(
 
             let mut kwargs = Map::new();
             kwargs.insert("max_tokens".to_string(), Value::from(50_000));
-            if let Ok(value) = env::var("ANTHROPIC_MODEL_TEMPERATURE")
-                && !value.is_empty()
+            if let Some(value) = read_backend_env_var("ANTHROPIC_MODEL_TEMPERATURE")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 kwargs.insert(
                     "temperature".to_string(),
                     Value::from(parse_env_f64(&value)?),
                 );
             }
-            if let Ok(value) = env::var("ANTHROPIC_MODEL_TOP_P")
-                && !value.is_empty()
+            if let Some(value) = read_backend_env_var("ANTHROPIC_MODEL_TOP_P")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 kwargs.insert("top_p".to_string(), Value::from(parse_env_f64(&value)?));
             }
-            if let Ok(value) = env::var("ANTHROPIC_MODEL_MAX_TOKENS")
-                && !value.is_empty()
+            if let Some(value) = read_backend_env_var("ANTHROPIC_MODEL_MAX_TOKENS")
+                .await?
+                .filter(|value| !value.is_empty())
             {
                 kwargs.insert(
                     "max_tokens".to_string(),
@@ -261,7 +275,8 @@ pub async fn create_llm(
                 &provider.base_url,
                 provider.env.as_ref(),
                 "OPENAI_BASE_URL",
-            );
+            )
+            .await?;
             Box::new(
                 kosong::chat_provider::openai_legacy::OpenAILegacy::new(
                     model.model.clone(),
@@ -277,6 +292,7 @@ pub async fn create_llm(
         ProviderType::ScriptedEcho => {
             let scripts = load_scripted_echo_scripts(provider.env.as_ref()).await?;
             let trace = read_env_var(provider.env.as_ref(), "KIMI_SCRIPTED_ECHO_TRACE")
+                .await?
                 .unwrap_or_default()
                 .trim()
                 .to_lowercase();
@@ -371,11 +387,22 @@ fn parse_env_f64(value: &str) -> Result<f64, LLMError> {
         .map_err(|_| LLMError::EnvVar(format!("could not convert string to float: '{}'", value)))
 }
 
-fn read_env_var(provider_env: Option<&HashMap<String, String>>, key: &str) -> Option<String> {
-    provider_env
-        .and_then(|envs| envs.get(key))
-        .cloned()
-        .or_else(|| env::var(key).ok())
+async fn read_backend_env_var(key: &str) -> Result<Option<String>, LLMError> {
+    kaos::env_var(key).await.map_err(|err| {
+        LLMError::EnvVar(format!(
+            "failed to read environment variable `{key}`: {err}"
+        ))
+    })
+}
+
+async fn read_env_var(
+    provider_env: Option<&HashMap<String, String>>,
+    key: &str,
+) -> Result<Option<String>, LLMError> {
+    if let Some(value) = provider_env.and_then(|envs| envs.get(key)).cloned() {
+        return Ok(Some(value));
+    }
+    read_backend_env_var(key).await
 }
 
 fn non_empty_provider_value(value: &str) -> Option<String> {
@@ -386,15 +413,17 @@ fn non_empty_provider_value(value: &str) -> Option<String> {
     }
 }
 
-fn resolve_provider_value(
+async fn resolve_provider_value(
     value: &str,
     provider_env: Option<&HashMap<String, String>>,
     env_key: &str,
-) -> String {
+) -> Result<String, LLMError> {
     if !value.is_empty() {
-        return value.to_string();
+        return Ok(value.to_string());
     }
-    read_env_var(provider_env, env_key).unwrap_or_default()
+    Ok(read_env_var(provider_env, env_key)
+        .await?
+        .unwrap_or_default())
 }
 
 fn resolve_provider_value_with_explicit_env(
@@ -411,8 +440,9 @@ fn resolve_provider_value_with_explicit_env(
 async fn load_scripted_echo_scripts(
     provider_env: Option<&HashMap<String, String>>,
 ) -> Result<Vec<String>, LLMError> {
-    let script_path =
-        read_env_var(provider_env, "KIMI_SCRIPTED_ECHO_SCRIPTS").ok_or_else(|| {
+    let script_path = read_env_var(provider_env, "KIMI_SCRIPTED_ECHO_SCRIPTS")
+        .await?
+        .ok_or_else(|| {
             LLMError::ScriptedEcho(
                 "KIMI_SCRIPTED_ECHO_SCRIPTS is required for _scripted_echo.".to_string(),
             )
