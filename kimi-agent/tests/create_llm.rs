@@ -298,6 +298,50 @@ async fn test_augment_provider_with_env_vars_anthropic_uses_backend_env() {
 }
 
 #[tokio::test]
+async fn test_augment_provider_with_env_vars_google_genai_uses_gemini_env_family() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([
+            (
+                "GEMINI_BASE_URL".to_string(),
+                "https://backend.gemini.test/v1beta/openai".to_string(),
+            ),
+            (
+                "GEMINI_API_KEY".to_string(),
+                "backend-gemini-key".to_string(),
+            ),
+        ]));
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::GoogleGenai,
+            base_url: String::new(),
+            api_key: String::new(),
+            env: None,
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "google".to_string(),
+            model: "gemini-2.5-flash".to_string(),
+            max_context_size: 1_000_000,
+            capabilities: None,
+        };
+
+        let applied = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("env overrides");
+
+        assert!(applied.is_empty());
+        assert_eq!(
+            provider.base_url,
+            "https://backend.gemini.test/v1beta/openai"
+        );
+        assert_eq!(provider.api_key, "backend-gemini-key");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_augment_provider_with_env_vars_uses_backend_env_without_process_fallback() {
     let _lock = ENV_LOCK.lock().await;
     let _guards = [
@@ -339,13 +383,10 @@ async fn test_augment_provider_with_env_vars_prefers_provider_env_over_backend_e
     let mock_server = MockServer::start().await;
 
     with_current_kaos_scope(async {
-        let _guard = BackendEnvKaosGuard::new(HashMap::from([
-            (
-                "OPENAI_BASE_URL".to_string(),
-                "https://backend.invalid/v1".to_string(),
-            ),
-            ("OPENAI_API_KEY".to_string(), "backend-key".to_string()),
-        ]));
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([(
+            "VERTEXAI_API_KEY".to_string(),
+            "backend-key".to_string(),
+        )]));
 
         let base_url = format!("{}/v1", mock_server.uri());
         let api_key = "provider-key".to_string();
@@ -358,29 +399,31 @@ async fn test_augment_provider_with_env_vars_prefers_provider_env_over_backend_e
             .mount(&mock_server)
             .await;
 
-        let llm = create_llm(
-            &LLMProvider {
-                provider_type: ProviderType::Vertexai,
-                base_url: base_url.clone(),
-                api_key: String::new(),
-                env: Some(HashMap::from([(
-                    "OPENAI_API_KEY".to_string(),
-                    api_key.clone(),
-                )])),
-                custom_headers: None,
-            },
-            &LLMModel {
-                provider: "vertex".to_string(),
-                model: "gemini-3-pro-preview".to_string(),
-                max_context_size: 1_000_000,
-                capabilities: None,
-            },
-            None,
-            None,
-        )
-        .await
-        .expect("create llm")
-        .expect("llm");
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::Vertexai,
+            base_url: base_url.clone(),
+            api_key: String::new(),
+            env: Some(HashMap::from([(
+                "VERTEXAI_API_KEY".to_string(),
+                api_key.clone(),
+            )])),
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "vertex".to_string(),
+            model: "gemini-3-pro-preview".to_string(),
+            max_context_size: 1_000_000,
+            capabilities: None,
+        };
+
+        augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("env overrides");
+
+        let llm = create_llm(&provider, &model, None, None)
+            .await
+            .expect("create llm")
+            .expect("llm");
 
         let tools: Vec<kosong::tooling::Tool> = vec![];
         let history: Vec<kosong::message::Message> = vec![];
@@ -615,6 +658,52 @@ async fn test_create_llm_google_genai_provider_uses_openai_compat() {
 }
 
 #[tokio::test]
+async fn test_create_llm_google_genai_uses_gemini_temperature_env() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([(
+            "GEMINI_MODEL_TEMPERATURE".to_string(),
+            "0.3".to_string(),
+        )]));
+
+        let provider = LLMProvider {
+            provider_type: ProviderType::GoogleGenai,
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+            api_key: "test-key".to_string(),
+            env: None,
+            custom_headers: None,
+        };
+        let model = LLMModel {
+            provider: "google".to_string(),
+            model: "gemini-2.5-flash".to_string(),
+            max_context_size: 1_000_000,
+            capabilities: None,
+        };
+
+        let llm = create_llm(&provider, &model, None, None)
+            .await
+            .expect("create llm")
+            .expect("llm");
+
+        let openai = llm
+            .chat_provider
+            .as_any()
+            .downcast_ref::<OpenAILegacy>()
+            .expect("openai legacy provider");
+
+        assert_eq!(
+            serde_json::Value::Object(openai.model_parameters()),
+            json!({
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+                "temperature": 0.3
+            })
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_create_llm_vertexai_provider_does_not_mutate_process_env_and_uses_openai_compat() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = EnvGuard::set("VERTEX_TEST_PROJECT", "old");
@@ -691,9 +780,9 @@ async fn test_create_llm_scripted_echo_prefers_provider_env_without_mutating_pro
 }
 
 #[tokio::test]
-async fn test_create_llm_vertexai_uses_provider_env_openai_api_key_without_mutating_process_env() {
+async fn test_create_llm_vertexai_uses_provider_scoped_api_key_env_without_mutating_process_env() {
     let _lock = ENV_LOCK.lock().await;
-    let _guard = EnvGuard::set("OPENAI_API_KEY", "process-old-key");
+    let _guard = EnvGuard::set("VERTEXAI_API_KEY", "process-old-key");
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -704,22 +793,26 @@ async fn test_create_llm_vertexai_uses_provider_env_openai_api_key_without_mutat
         .mount(&mock_server)
         .await;
 
-    let provider = LLMProvider {
+    let mut provider = LLMProvider {
         provider_type: ProviderType::Vertexai,
         base_url: format!("{}/v1", mock_server.uri()),
         api_key: String::new(),
         env: Some(HashMap::from([(
-            "OPENAI_API_KEY".to_string(),
+            "VERTEXAI_API_KEY".to_string(),
             "overlay-key".to_string(),
         )])),
         custom_headers: None,
     };
-    let model = LLMModel {
+    let mut model = LLMModel {
         provider: "vertex".to_string(),
         model: "gemini-3-pro-preview".to_string(),
         max_context_size: 1_000_000,
         capabilities: None,
     };
+
+    augment_provider_with_env_vars(&mut provider, &mut model)
+        .await
+        .expect("env overrides");
 
     let llm = create_llm(&provider, &model, None, None)
         .await
@@ -737,7 +830,7 @@ async fn test_create_llm_vertexai_uses_provider_env_openai_api_key_without_mutat
         .expect("generate request should use provider env api key");
 
     assert_eq!(
-        std::env::var("OPENAI_API_KEY").expect("openai env"),
+        std::env::var("VERTEXAI_API_KEY").expect("vertex env"),
         "process-old-key"
     );
 }
@@ -746,7 +839,7 @@ async fn test_create_llm_vertexai_uses_provider_env_openai_api_key_without_mutat
 async fn test_create_llm_vertexai_explicit_empty_provider_env_api_key_disables_process_env_fallback()
  {
     let _lock = ENV_LOCK.lock().await;
-    let _guard = EnvGuard::set("OPENAI_API_KEY", "process-old-key");
+    let _guard = EnvGuard::set("VERTEXAI_API_KEY", "process-old-key");
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -763,22 +856,26 @@ async fn test_create_llm_vertexai_explicit_empty_provider_env_api_key_disables_p
         .mount(&mock_server)
         .await;
 
-    let provider = LLMProvider {
+    let mut provider = LLMProvider {
         provider_type: ProviderType::Vertexai,
         base_url: format!("{}/v1", mock_server.uri()),
         api_key: String::new(),
         env: Some(HashMap::from([(
-            "OPENAI_API_KEY".to_string(),
+            "VERTEXAI_API_KEY".to_string(),
             String::new(),
         )])),
         custom_headers: None,
     };
-    let model = LLMModel {
+    let mut model = LLMModel {
         provider: "vertex".to_string(),
         model: "gemini-3-pro-preview".to_string(),
         max_context_size: 1_000_000,
         capabilities: None,
     };
+
+    augment_provider_with_env_vars(&mut provider, &mut model)
+        .await
+        .expect("env overrides");
 
     let llm = create_llm(&provider, &model, None, None)
         .await
@@ -793,10 +890,10 @@ async fn test_create_llm_vertexai_explicit_empty_provider_env_api_key_disables_p
         .chat_provider
         .generate("", &tools, &history)
         .await
-        .expect("generate request should not fall back to process openai key");
+        .expect("generate request should not fall back to process vertex key");
 
     assert_eq!(
-        std::env::var("OPENAI_API_KEY").expect("openai env"),
+        std::env::var("VERTEXAI_API_KEY").expect("vertex env"),
         "process-old-key"
     );
 }

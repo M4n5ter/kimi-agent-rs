@@ -33,78 +33,90 @@ impl LLM {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ProviderCredentialEnvKeys {
+    base_url: &'static [&'static str],
+    api_key: &'static [&'static str],
+}
+
+struct ResolvedProviderCredentials {
+    base_url: Option<(&'static str, String)>,
+    api_key: Option<(&'static str, String)>,
+}
+
+#[derive(Clone, Copy)]
+struct OpenAiCompatEnvProfile {
+    provider_name: &'static str,
+    credentials: ProviderCredentialEnvKeys,
+    temperature: &'static [&'static str],
+}
+
 pub async fn augment_provider_with_env_vars(
     provider: &mut LLMProvider,
     model: &mut LLMModel,
 ) -> Result<HashMap<String, String>, LLMError> {
     let mut applied = HashMap::new();
+    let resolved_credentials = if let Some(env_keys) =
+        provider_credential_env_keys(&provider.provider_type)
+    {
+        Some(resolve_provider_credentials_from_env_sources(provider.env.as_ref(), env_keys).await?)
+    } else {
+        None
+    };
 
-    match provider.provider_type {
-        ProviderType::Kimi => {
-            if let Some(base_url) = read_backend_env_var("KIMI_BASE_URL")
-                .await?
-                .filter(|value| !value.is_empty())
-            {
-                provider.base_url = base_url.clone();
-                applied.insert("KIMI_BASE_URL".to_string(), base_url);
+    if let Some(credentials) = resolved_credentials.as_ref() {
+        apply_resolved_provider_credentials(provider, credentials);
+        if provider.provider_type == ProviderType::Kimi {
+            if let Some((key, value)) = credentials.base_url.as_ref() {
+                applied.insert((*key).to_string(), value.clone());
             }
-            if let Some(api_key) = read_backend_env_var("KIMI_API_KEY")
-                .await?
-                .filter(|value| !value.is_empty())
-            {
-                provider.api_key = api_key;
-                applied.insert("KIMI_API_KEY".to_string(), "******".to_string());
+            if let Some((key, _)) = credentials.api_key.as_ref() {
+                applied.insert((*key).to_string(), "******".to_string());
             }
-            if let Some(model_name) = read_backend_env_var("KIMI_MODEL_NAME")
-                .await?
-                .filter(|value| !value.is_empty())
-            {
-                model.model = model_name.clone();
-                applied.insert("KIMI_MODEL_NAME".to_string(), model_name);
-            }
-            if let Some(max_context_size) = read_backend_env_var("KIMI_MODEL_MAX_CONTEXT_SIZE")
-                .await?
-                .filter(|value| !value.is_empty())
-            {
-                let value = parse_env_i64(&max_context_size)?;
-                model.max_context_size = value;
-                applied.insert("KIMI_MODEL_MAX_CONTEXT_SIZE".to_string(), max_context_size);
-            }
-            if let Some(caps) = read_backend_env_var("KIMI_MODEL_CAPABILITIES")
-                .await?
-                .filter(|value| !value.is_empty())
-            {
-                let mut parsed = HashSet::new();
-                for cap in caps.split(',').map(|s| s.trim().to_lowercase()) {
-                    match cap.as_str() {
-                        "image_in" => {
-                            parsed.insert(ModelCapability::ImageIn);
-                        }
-                        "video_in" => {
-                            parsed.insert(ModelCapability::VideoIn);
-                        }
-                        "thinking" => {
-                            parsed.insert(ModelCapability::Thinking);
-                        }
-                        "always_thinking" => {
-                            parsed.insert(ModelCapability::AlwaysThinking);
-                        }
-                        _ => {}
+        }
+    }
+
+    if provider.provider_type == ProviderType::Kimi {
+        if let Some(model_name) = read_backend_env_var("KIMI_MODEL_NAME")
+            .await?
+            .filter(|value| !value.is_empty())
+        {
+            model.model = model_name.clone();
+            applied.insert("KIMI_MODEL_NAME".to_string(), model_name);
+        }
+        if let Some(max_context_size) = read_backend_env_var("KIMI_MODEL_MAX_CONTEXT_SIZE")
+            .await?
+            .filter(|value| !value.is_empty())
+        {
+            let value = parse_env_i64(&max_context_size)?;
+            model.max_context_size = value;
+            applied.insert("KIMI_MODEL_MAX_CONTEXT_SIZE".to_string(), max_context_size);
+        }
+        if let Some(caps) = read_backend_env_var("KIMI_MODEL_CAPABILITIES")
+            .await?
+            .filter(|value| !value.is_empty())
+        {
+            let mut parsed = HashSet::new();
+            for cap in caps.split(',').map(|s| s.trim().to_lowercase()) {
+                match cap.as_str() {
+                    "image_in" => {
+                        parsed.insert(ModelCapability::ImageIn);
                     }
+                    "video_in" => {
+                        parsed.insert(ModelCapability::VideoIn);
+                    }
+                    "thinking" => {
+                        parsed.insert(ModelCapability::Thinking);
+                    }
+                    "always_thinking" => {
+                        parsed.insert(ModelCapability::AlwaysThinking);
+                    }
+                    _ => {}
                 }
-                model.capabilities = Some(parsed);
-                applied.insert("KIMI_MODEL_CAPABILITIES".to_string(), caps);
             }
+            model.capabilities = Some(parsed);
+            applied.insert("KIMI_MODEL_CAPABILITIES".to_string(), caps);
         }
-        ProviderType::OpenaiLegacy | ProviderType::OpenaiResponses => {
-            apply_backend_provider_credentials(provider, "OPENAI_BASE_URL", "OPENAI_API_KEY")
-                .await?;
-        }
-        ProviderType::Anthropic => {
-            apply_backend_provider_credentials(provider, "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY")
-                .await?;
-        }
-        _ => {}
     }
 
     Ok(applied)
@@ -168,25 +180,15 @@ pub async fn create_llm(
             }
             Box::new(kimi)
         }
-        ProviderType::OpenaiLegacy => {
-            let mut openai = kosong::chat_provider::openai_legacy::OpenAILegacy::new(
-                model.model.clone(),
-                non_empty_provider_value(&provider.api_key),
-                Some(provider.base_url.clone()),
-                Some(default_headers.clone()),
+        ProviderType::OpenaiLegacy => Box::new(
+            build_openai_compat_legacy_provider(
+                &provider.provider_type,
+                provider,
+                model,
+                default_headers.clone(),
             )
-            .map_err(map_chat_provider_error)?;
-            if let Some(value) = read_backend_env_var("OPENAI_MODEL_TEMPERATURE")
-                .await?
-                .filter(|value| !value.is_empty())
-            {
-                let parsed = parse_env_f64(&value)?;
-                let mut kwargs = Map::new();
-                kwargs.insert("temperature".to_string(), Value::from(parsed));
-                openai = openai.with_generation_kwargs(kwargs);
-            }
-            Box::new(openai)
-        }
+            .await?,
+        ),
         ProviderType::OpenaiResponses => {
             let mut openai = kosong::chat_provider::openai_responses::OpenAIResponses::new(
                 model.model.clone(),
@@ -195,9 +197,11 @@ pub async fn create_llm(
                 Some(default_headers.clone()),
             )
             .map_err(map_chat_provider_error)?;
-            if let Some(value) = read_backend_env_var("OPENAI_MODEL_TEMPERATURE")
-                .await?
-                .filter(|value| !value.is_empty())
+            if let Some(value) = read_non_empty_env_override_var(
+                provider.env.as_ref(),
+                &["OPENAI_MODEL_TEMPERATURE"],
+            )
+            .await?
             {
                 let parsed = parse_env_f64(&value)?;
                 let mut kwargs = Map::new();
@@ -245,43 +249,24 @@ pub async fn create_llm(
             anthropic = anthropic.with_generation_kwargs(kwargs);
             Box::new(anthropic)
         }
-        ProviderType::GoogleGenai | ProviderType::Gemini => {
-            // Intentional: use OpenAI-compatible Gemini endpoint via OpenAILegacy for now.
-            Box::new(
-                kosong::chat_provider::openai_legacy::OpenAILegacy::new(
-                    model.model.clone(),
-                    non_empty_provider_value(&provider.api_key),
-                    Some(provider.base_url.clone()),
-                    Some(default_headers.clone()),
-                )
-                .map_err(map_chat_provider_error)?
-                .with_provider_name("google_genai"),
+        ProviderType::GoogleGenai | ProviderType::Gemini => Box::new(
+            build_openai_compat_legacy_provider(
+                &provider.provider_type,
+                provider,
+                model,
+                default_headers.clone(),
             )
-        }
-        ProviderType::Vertexai => {
-            // Intentional: use Vertex AI OpenAI-compatible endpoint via OpenAILegacy for now.
-            let api_key = resolve_provider_value_with_explicit_env(
-                &provider.api_key,
-                provider.env.as_ref(),
-                "OPENAI_API_KEY",
-            );
-            let base_url = resolve_provider_value(
-                &provider.base_url,
-                provider.env.as_ref(),
-                "OPENAI_BASE_URL",
+            .await?,
+        ),
+        ProviderType::Vertexai => Box::new(
+            build_openai_compat_legacy_provider(
+                &provider.provider_type,
+                provider,
+                model,
+                default_headers.clone(),
             )
-            .await?;
-            Box::new(
-                kosong::chat_provider::openai_legacy::OpenAILegacy::new(
-                    model.model.clone(),
-                    api_key,
-                    Some(base_url),
-                    Some(default_headers.clone()),
-                )
-                .map_err(map_chat_provider_error)?
-                .with_provider_name("vertexai"),
-            )
-        }
+            .await?,
+        ),
         ProviderType::Echo => Box::new(kosong::chat_provider::echo::EchoChatProvider),
         ProviderType::ScriptedEcho => {
             let scripts = load_scripted_echo_scripts(provider.env.as_ref()).await?;
@@ -393,24 +378,130 @@ async fn read_backend_env_var(key: &str) -> Result<Option<String>, LLMError> {
     })
 }
 
-async fn read_non_empty_backend_env_var(key: &str) -> Result<Option<String>, LLMError> {
-    Ok(read_backend_env_var(key)
+async fn read_env_override_var(
+    provider_env: Option<&HashMap<String, String>>,
+    keys: &'static [&'static str],
+) -> Result<Option<(&'static str, String)>, LLMError> {
+    for key in keys {
+        if let Some(value) = provider_env.and_then(|envs| envs.get(*key)).cloned() {
+            return Ok(Some((*key, value)));
+        }
+        if let Some(value) = read_backend_env_var(key).await?
+            && !value.is_empty()
+        {
+            return Ok(Some((*key, value)));
+        }
+    }
+    Ok(None)
+}
+
+async fn read_non_empty_env_override_var(
+    provider_env: Option<&HashMap<String, String>>,
+    keys: &'static [&'static str],
+) -> Result<Option<String>, LLMError> {
+    Ok(read_env_override_var(provider_env, keys)
         .await?
+        .map(|(_, value)| value)
         .filter(|value| !value.is_empty()))
 }
 
-async fn apply_backend_provider_credentials(
+fn provider_credential_env_keys(provider_type: &ProviderType) -> Option<ProviderCredentialEnvKeys> {
+    match provider_type {
+        ProviderType::Kimi => Some(ProviderCredentialEnvKeys {
+            base_url: &["KIMI_BASE_URL"],
+            api_key: &["KIMI_API_KEY"],
+        }),
+        ProviderType::Anthropic => Some(ProviderCredentialEnvKeys {
+            base_url: &["ANTHROPIC_BASE_URL"],
+            api_key: &["ANTHROPIC_API_KEY"],
+        }),
+        _ => openai_compat_env_profile(provider_type).map(|profile| profile.credentials),
+    }
+}
+
+fn openai_compat_env_profile(provider_type: &ProviderType) -> Option<OpenAiCompatEnvProfile> {
+    match provider_type {
+        ProviderType::OpenaiLegacy => Some(OpenAiCompatEnvProfile {
+            provider_name: "openai",
+            credentials: ProviderCredentialEnvKeys {
+                base_url: &["OPENAI_BASE_URL"],
+                api_key: &["OPENAI_API_KEY"],
+            },
+            temperature: &["OPENAI_MODEL_TEMPERATURE"],
+        }),
+        ProviderType::GoogleGenai | ProviderType::Gemini => Some(OpenAiCompatEnvProfile {
+            provider_name: "google_genai",
+            credentials: ProviderCredentialEnvKeys {
+                base_url: &["GEMINI_BASE_URL", "GOOGLE_GENAI_BASE_URL"],
+                api_key: &["GEMINI_API_KEY", "GOOGLE_GENAI_API_KEY"],
+            },
+            temperature: &["GEMINI_MODEL_TEMPERATURE", "GOOGLE_GENAI_MODEL_TEMPERATURE"],
+        }),
+        ProviderType::Vertexai => Some(OpenAiCompatEnvProfile {
+            provider_name: "vertexai",
+            credentials: ProviderCredentialEnvKeys {
+                base_url: &["VERTEXAI_BASE_URL"],
+                api_key: &["VERTEXAI_API_KEY"],
+            },
+            temperature: &["VERTEXAI_MODEL_TEMPERATURE"],
+        }),
+        _ => None,
+    }
+}
+
+async fn resolve_provider_credentials_from_env_sources(
+    provider_env: Option<&HashMap<String, String>>,
+    env_keys: ProviderCredentialEnvKeys,
+) -> Result<ResolvedProviderCredentials, LLMError> {
+    Ok(ResolvedProviderCredentials {
+        base_url: read_env_override_var(provider_env, env_keys.base_url).await?,
+        api_key: read_env_override_var(provider_env, env_keys.api_key).await?,
+    })
+}
+
+fn apply_resolved_provider_credentials(
     provider: &mut LLMProvider,
-    base_url_key: &str,
-    api_key_key: &str,
-) -> Result<(), LLMError> {
-    if let Some(base_url) = read_non_empty_backend_env_var(base_url_key).await? {
-        provider.base_url = base_url;
+    credentials: &ResolvedProviderCredentials,
+) {
+    if let Some((_, base_url)) = credentials.base_url.as_ref() {
+        provider.base_url = base_url.clone();
     }
-    if let Some(api_key) = read_non_empty_backend_env_var(api_key_key).await? {
-        provider.api_key = api_key;
+    if let Some((_, api_key)) = credentials.api_key.as_ref() {
+        provider.api_key = api_key.clone();
     }
-    Ok(())
+}
+
+async fn build_openai_compat_legacy_provider(
+    provider_type: &ProviderType,
+    provider: &LLMProvider,
+    model: &LLMModel,
+    default_headers: reqwest::header::HeaderMap,
+) -> Result<kosong::chat_provider::openai_legacy::OpenAILegacy, LLMError> {
+    let env_profile = openai_compat_env_profile(provider_type).ok_or_else(|| {
+        LLMError::ChatProvider("missing OpenAI-compatible env profile".to_string())
+    })?;
+
+    // The transport is OpenAI-compatible, but the env family stays bound to
+    // the logical provider type (OpenAI, Gemini, Vertex AI).
+    let mut openai = kosong::chat_provider::openai_legacy::OpenAILegacy::new(
+        model.model.clone(),
+        non_empty_provider_value(&provider.api_key),
+        Some(provider.base_url.clone()),
+        Some(default_headers),
+    )
+    .map_err(map_chat_provider_error)?
+    .with_provider_name(env_profile.provider_name);
+
+    if let Some(value) =
+        read_non_empty_env_override_var(provider.env.as_ref(), env_profile.temperature).await?
+    {
+        let parsed = parse_env_f64(&value)?;
+        let mut kwargs = Map::new();
+        kwargs.insert("temperature".to_string(), Value::from(parsed));
+        openai = openai.with_generation_kwargs(kwargs);
+    }
+
+    Ok(openai)
 }
 
 async fn read_env_var(
@@ -429,30 +520,6 @@ fn non_empty_provider_value(value: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
-}
-
-async fn resolve_provider_value(
-    value: &str,
-    provider_env: Option<&HashMap<String, String>>,
-    env_key: &str,
-) -> Result<String, LLMError> {
-    if !value.is_empty() {
-        return Ok(value.to_string());
-    }
-    Ok(read_env_var(provider_env, env_key)
-        .await?
-        .unwrap_or_default())
-}
-
-fn resolve_provider_value_with_explicit_env(
-    value: &str,
-    provider_env: Option<&HashMap<String, String>>,
-    env_key: &str,
-) -> Option<String> {
-    if !value.is_empty() {
-        return Some(value.to_string());
-    }
-    provider_env.and_then(|envs| envs.get(env_key)).cloned()
 }
 
 async fn load_scripted_echo_scripts(
