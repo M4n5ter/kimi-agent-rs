@@ -381,7 +381,8 @@ fn parse_env_f64(value: &str) -> Result<f64, LLMError> {
 async fn read_backend_env_var(key: &str) -> Result<Option<String>, LLMError> {
     // Provider/model env overrides are intentionally scoped to the active backend.
     // This keeps LLM configuration aligned with the selected kaos environment
-    // instead of the launcher process environment. Host-local bootstrap
+    // instead of the launcher process environment, even though the HTTP client
+    // itself still runs in the local Rust process. Host-local bootstrap
     // exceptions such as KIMI_SHARE_DIR live outside this module.
     kaos::env_var(key).await.map_err(|err| {
         LLMError::EnvVar(format!(
