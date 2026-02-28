@@ -6,8 +6,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::process::Command;
 
 use crate::{
-    AsyncReadable, AsyncWritable, Kaos, KaosPath, KaosPlatform, KaosProcess, LineStream,
-    StatResult, StrOrKaosPath, line_stream::line_stream_from_async_read,
+    AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosPath, KaosPlatform, KaosProcess,
+    LineStream, StatResult, StrOrKaosPath, line_stream::line_stream_from_async_read,
 };
 
 #[cfg(unix)]
@@ -428,7 +428,7 @@ impl Kaos for LocalKaos {
         }
     }
 
-    async fn exec(&self, args: &[String]) -> Result<Box<dyn KaosProcess>> {
+    async fn exec(&self, args: &[String], options: ExecOptions) -> Result<Box<dyn KaosProcess>> {
         if args.is_empty() {
             return Err(anyhow!("missing command"));
         }
@@ -436,6 +436,7 @@ impl Kaos for LocalKaos {
         if args.len() > 1 {
             command.args(&args[1..]);
         }
+        command.envs(options.env_overrides.iter());
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());

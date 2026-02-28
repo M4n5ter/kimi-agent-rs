@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use kaos::{
-    CurrentKaosToken, Kaos, KaosPath, KaosProcess, LineStream, LocalKaos, StrOrKaosPath,
-    reset_current_kaos, set_current_kaos, with_current_kaos_scope,
+    CurrentKaosToken, ExecOptions, Kaos, KaosPath, KaosProcess, LineStream, LocalKaos,
+    StrOrKaosPath, reset_current_kaos, set_current_kaos, with_current_kaos_scope,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -156,8 +156,12 @@ impl Kaos for BackendEnvKaos {
         Ok(self.env.get(key).cloned())
     }
 
-    async fn exec(&self, args: &[String]) -> anyhow::Result<Box<dyn KaosProcess>> {
-        self.inner.exec(args).await
+    async fn exec(
+        &self,
+        args: &[String],
+        _options: ExecOptions,
+    ) -> anyhow::Result<Box<dyn KaosProcess>> {
+        self.inner.exec(args, ExecOptions::default()).await
     }
 }
 

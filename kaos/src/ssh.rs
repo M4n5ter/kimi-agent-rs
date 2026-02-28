@@ -21,8 +21,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use typed_path::Utf8TypedPathBuf;
 
 use crate::{
-    AsyncReadable, AsyncWritable, Kaos, KaosPath, KaosPathStyle, KaosPlatform, KaosProcess,
-    LineStream, ProcessOutputOverflow, StatResult, StrOrKaosPath,
+    AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosPath, KaosPathStyle, KaosPlatform,
+    KaosProcess, LineStream, ProcessOutputOverflow, StatResult, StrOrKaosPath,
     line_stream::line_stream_from_async_read,
 };
 
@@ -579,7 +579,7 @@ impl Kaos for SshKaos {
         Ok(value)
     }
 
-    async fn exec(&self, args: &[String]) -> Result<Box<dyn KaosProcess>> {
+    async fn exec(&self, args: &[String], options: ExecOptions) -> Result<Box<dyn KaosProcess>> {
         if args.is_empty() {
             bail!("missing command");
         }
@@ -595,7 +595,24 @@ impl Kaos for SshKaos {
         let handle = self.state.handle.lock().await;
         let channel = handle.channel_open_session().await?;
         let (mut read_half, write_half) = channel.split();
+        // Keep SSH env injection aligned with the Python AsyncSSH backend by using
+        // protocol-level "env" requests instead of shell-prefix tricks.
+        //
+        // Important caveat: common OpenSSH servers reject arbitrary environment
+        // variable names unless they are explicitly whitelisted via AcceptEnv in
+        // sshd_config. Callers should treat env_overrides on SSH as backend-
+        // dependent rather than universally portable.
+        for (key, value) in &options.env_overrides {
+            validate_env_var_key(key)?;
+            write_half.set_env(true, key, value).await?;
+            await_channel_request_reply(
+                &mut read_half,
+                &format!("set environment variable `{key}`"),
+            )
+            .await?;
+        }
         write_half.exec(true, command).await?;
+        await_channel_request_reply(&mut read_half, "execute remote command").await?;
         let write_half = Arc::new(AsyncMutex::new(Some(write_half)));
         let stdin_writer = ChannelStdin {
             write_half: Arc::clone(&write_half),
@@ -1125,6 +1142,7 @@ async fn exec_capture_raw(
 ) -> Result<(i32, String, String)> {
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, command).await?;
+    map_channel_request_reply("execute remote command", channel.wait().await)?;
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -1145,6 +1163,59 @@ async fn exec_capture_raw(
         String::from_utf8_lossy(&stdout).to_string(),
         String::from_utf8_lossy(&stderr).to_string(),
     ))
+}
+
+async fn await_channel_request_reply(
+    read_half: &mut russh::ChannelReadHalf,
+    request_label: &str,
+) -> Result<()> {
+    map_channel_request_reply(request_label, read_half.wait().await)
+}
+
+fn map_channel_request_reply(request_label: &str, message: Option<ChannelMsg>) -> Result<()> {
+    match message {
+        Some(ChannelMsg::Success) => Ok(()),
+        Some(ChannelMsg::Failure) => {
+            bail!("SSH server rejected request to {request_label}")
+        }
+        Some(ChannelMsg::OpenFailure(reason)) => {
+            bail!("SSH channel open failure while waiting to {request_label}: {reason:?}")
+        }
+        Some(ChannelMsg::Close) | Some(ChannelMsg::Eof) | None => {
+            bail!("SSH channel closed while waiting to {request_label}")
+        }
+        Some(other) => bail!(
+            "Unexpected SSH channel message while waiting to {request_label}: {}",
+            channel_message_name(&other)
+        ),
+    }
+}
+
+fn channel_message_name(message: &ChannelMsg) -> &'static str {
+    match message {
+        ChannelMsg::Open { .. } => "open",
+        ChannelMsg::Data { .. } => "data",
+        ChannelMsg::ExtendedData { .. } => "extended_data",
+        ChannelMsg::Eof => "eof",
+        ChannelMsg::Close => "close",
+        ChannelMsg::RequestPty { .. } => "request_pty",
+        ChannelMsg::RequestShell { .. } => "request_shell",
+        ChannelMsg::Exec { .. } => "exec",
+        ChannelMsg::Signal { .. } => "signal",
+        ChannelMsg::RequestSubsystem { .. } => "request_subsystem",
+        ChannelMsg::RequestX11 { .. } => "request_x11",
+        ChannelMsg::SetEnv { .. } => "set_env",
+        ChannelMsg::WindowChange { .. } => "window_change",
+        ChannelMsg::AgentForward { .. } => "agent_forward",
+        ChannelMsg::XonXoff { .. } => "xon_xoff",
+        ChannelMsg::ExitStatus { .. } => "exit_status",
+        ChannelMsg::ExitSignal { .. } => "exit_signal",
+        ChannelMsg::WindowAdjusted { .. } => "window_adjusted",
+        ChannelMsg::Success => "success",
+        ChannelMsg::Failure => "failure",
+        ChannelMsg::OpenFailure(_) => "open_failure",
+        _ => "other",
+    }
 }
 
 const SSH_ENV_VAR_UNSET_EXIT_CODE: i32 = 3;
@@ -1334,10 +1405,11 @@ fn build_storage_name(host: &str, port: u16, username: &str) -> String {
 mod tests {
     use super::{
         GlobTraversalPlan, SSH_ENV_VAR_UNSET_EXIT_CODE, build_storage_name,
-        map_env_var_lookup_result, normalize_glob_pattern, resolve_absolute_posix,
-        validate_env_var_key,
+        map_channel_request_reply, map_env_var_lookup_result, normalize_glob_pattern,
+        resolve_absolute_posix, validate_env_var_key,
     };
     use crate::{KaosPath, KaosPathStyle};
+    use russh::{ChannelMsg, ChannelOpenFailure};
 
     #[test]
     fn storage_name_is_deterministic() {
@@ -1441,5 +1513,53 @@ mod tests {
             map_env_var_lookup_result("PATH", 1, String::new(), "permission denied".to_string())
                 .expect_err("failure");
         assert!(err.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn map_channel_request_reply_accepts_success() {
+        map_channel_request_reply("execute remote command", Some(ChannelMsg::Success))
+            .expect("success");
+    }
+
+    #[test]
+    fn map_channel_request_reply_rejects_failure() {
+        let err = map_channel_request_reply("execute remote command", Some(ChannelMsg::Failure))
+            .expect_err("failure");
+        assert!(
+            err.to_string()
+                .contains("SSH server rejected request to execute remote command")
+        );
+    }
+
+    #[test]
+    fn map_channel_request_reply_rejects_close() {
+        let err = map_channel_request_reply("execute remote command", Some(ChannelMsg::Close))
+            .expect_err("close");
+        assert!(
+            err.to_string()
+                .contains("SSH channel closed while waiting to execute remote command")
+        );
+    }
+
+    #[test]
+    fn map_channel_request_reply_rejects_open_failure() {
+        let err = map_channel_request_reply(
+            "execute remote command",
+            Some(ChannelMsg::OpenFailure(
+                ChannelOpenFailure::AdministrativelyProhibited,
+            )),
+        )
+        .expect_err("open failure");
+        assert!(err.to_string().contains("AdministrativelyProhibited"));
+    }
+
+    #[test]
+    fn map_channel_request_reply_rejects_unexpected_message() {
+        let err = map_channel_request_reply(
+            "execute remote command",
+            Some(ChannelMsg::ExitStatus { exit_status: 0 }),
+        )
+        .expect_err("unexpected message");
+        assert!(err.to_string().contains("exit_status"));
     }
 }
