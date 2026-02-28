@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
-use kaos::{KaosPath, get_current_kaos};
+use kaos::KaosPath;
 use serde::Deserialize;
 use serde_yaml::Value;
 use tracing::{error, info, warn};
@@ -11,6 +10,7 @@ use crate::skill::flow::mermaid::parse_mermaid_flowchart;
 use crate::skill::flow::{Flow, FlowError};
 use crate::utils::parse_frontmatter;
 
+mod builtin;
 pub mod flow;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,12 +118,6 @@ pub fn get_skills_dir() -> KaosPath {
     KaosPath::home() / ".config" / "agents" / "skills"
 }
 
-pub fn get_builtin_skills_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("skills")
-}
-
 pub fn get_user_skills_dir_candidates() -> Vec<KaosPath> {
     vec![
         KaosPath::home() / ".config" / "agents" / "skills",
@@ -141,11 +135,6 @@ pub fn get_project_skills_dir_candidates(work_dir: &KaosPath) -> Vec<KaosPath> {
         work_dir.clone() / ".claude" / "skills",
         work_dir.clone() / ".codex" / "skills",
     ]
-}
-
-fn supports_builtin_skills() -> bool {
-    let current = get_current_kaos().name().to_string();
-    matches!(current.as_str(), "local" | "acp")
 }
 
 pub async fn find_first_existing_dir(candidates: &[KaosPath]) -> Option<KaosPath> {
@@ -169,13 +158,14 @@ pub async fn resolve_skills_roots(
     work_dir: &KaosPath,
     skills_dir_override: Option<KaosPath>,
 ) -> Vec<KaosPath> {
-    let mut roots = Vec::new();
-    if supports_builtin_skills() {
-        roots.push(KaosPath::unsafe_from_local_path(&get_builtin_skills_dir()));
-    }
     if let Some(override_dir) = skills_dir_override {
-        roots.push(override_dir);
-        return roots;
+        return vec![override_dir];
+    }
+
+    let mut roots = Vec::new();
+    match builtin::prepare_builtin_skills_root().await {
+        Ok(root) => roots.push(root),
+        Err(err) => warn!("Skipping builtin skills: {err}"),
     }
     if let Some(user_dir) = find_user_skills_dir().await {
         roots.push(user_dir);

@@ -119,6 +119,10 @@ pub trait Kaos: Send + Sync {
         }
     }
 
+    fn app_state_dir(&self, app_name: &str) -> KaosPath {
+        self.home().joinpath(&format!(".{app_name}"))
+    }
+
     fn normpath(&self, path: &StrOrKaosPath<'_>) -> KaosPath;
     fn home(&self) -> KaosPath;
     fn cwd(&self) -> KaosPath;
