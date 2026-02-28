@@ -342,6 +342,47 @@ async fn test_augment_provider_with_env_vars_google_genai_uses_gemini_env_family
 }
 
 #[tokio::test]
+async fn test_augment_provider_with_env_vars_openai_responses_uses_openai_env_family() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([
+            (
+                "OPENAI_BASE_URL".to_string(),
+                "https://backend.openai.test/v1".to_string(),
+            ),
+            (
+                "OPENAI_API_KEY".to_string(),
+                "backend-openai-key".to_string(),
+            ),
+        ]));
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::OpenaiResponses,
+            base_url: String::new(),
+            api_key: String::new(),
+            env: None,
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "openai-responses".to_string(),
+            model: "gpt-5-codex".to_string(),
+            max_context_size: 200_000,
+            capabilities: None,
+        };
+
+        let applied = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("env overrides");
+
+        assert!(applied.is_empty());
+        assert_eq!(provider.base_url, "https://backend.openai.test/v1");
+        assert_eq!(provider.api_key, "backend-openai-key");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_augment_provider_with_env_vars_uses_backend_env_without_process_fallback() {
     let _lock = ENV_LOCK.lock().await;
     let _guards = [

@@ -422,14 +422,16 @@ fn provider_credential_env_keys(provider_type: &ProviderType) -> Option<Provider
 
 fn openai_compat_env_profile(provider_type: &ProviderType) -> Option<OpenAiCompatEnvProfile> {
     match provider_type {
-        ProviderType::OpenaiLegacy => Some(OpenAiCompatEnvProfile {
-            provider_name: "openai",
-            credentials: ProviderCredentialEnvKeys {
-                base_url: &["OPENAI_BASE_URL"],
-                api_key: &["OPENAI_API_KEY"],
-            },
-            temperature: &["OPENAI_MODEL_TEMPERATURE"],
-        }),
+        ProviderType::OpenaiLegacy | ProviderType::OpenaiResponses => {
+            Some(OpenAiCompatEnvProfile {
+                provider_name: "openai",
+                credentials: ProviderCredentialEnvKeys {
+                    base_url: &["OPENAI_BASE_URL"],
+                    api_key: &["OPENAI_API_KEY"],
+                },
+                temperature: &["OPENAI_MODEL_TEMPERATURE"],
+            })
+        }
         ProviderType::GoogleGenai | ProviderType::Gemini => Some(OpenAiCompatEnvProfile {
             provider_name: "google_genai",
             credentials: ProviderCredentialEnvKeys {
