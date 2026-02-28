@@ -307,6 +307,70 @@ async fn test_augment_provider_with_env_vars_invalid_max_context_size() {
 }
 
 #[tokio::test]
+async fn test_augment_provider_with_env_vars_kimi_prefers_provider_env_for_model_defaults() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([
+            (
+                "KIMI_MODEL_NAME".to_string(),
+                "kimi-backend-model".to_string(),
+            ),
+            (
+                "KIMI_MODEL_MAX_CONTEXT_SIZE".to_string(),
+                "8192".to_string(),
+            ),
+            (
+                "KIMI_MODEL_CAPABILITIES".to_string(),
+                "image_in".to_string(),
+            ),
+        ]));
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::Kimi,
+            base_url: "https://configured.test/v1".to_string(),
+            api_key: "configured-key".to_string(),
+            env: Some(HashMap::from([
+                (
+                    "KIMI_MODEL_NAME".to_string(),
+                    "kimi-provider-model".to_string(),
+                ),
+                (
+                    "KIMI_MODEL_MAX_CONTEXT_SIZE".to_string(),
+                    "4096".to_string(),
+                ),
+                (
+                    "KIMI_MODEL_CAPABILITIES".to_string(),
+                    "video_in,thinking".to_string(),
+                ),
+            ])),
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "kimi".to_string(),
+            model: String::new(),
+            max_context_size: 0,
+            capabilities: None,
+        };
+
+        augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect("provider env should win");
+
+        assert_eq!(model.model, "kimi-provider-model");
+        assert_eq!(model.max_context_size, 4096);
+        assert_eq!(
+            model.capabilities,
+            Some(HashSet::from([
+                ModelCapability::VideoIn,
+                ModelCapability::Thinking,
+            ]))
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_augment_provider_with_env_vars_anthropic_uses_backend_env() {
     let _lock = ENV_LOCK.lock().await;
 
@@ -422,6 +486,39 @@ async fn test_augment_provider_with_env_vars_skips_backend_probe_for_explicit_cr
         assert!(applied.is_empty());
         assert_eq!(provider.base_url, "https://configured.anthropic.test");
         assert_eq!(provider.api_key, "configured-anthropic-key");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_augment_provider_with_env_vars_errors_when_required_backend_credential_lookup_fails()
+{
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::with_failing_keys(
+            HashMap::new(),
+            HashSet::from(["ANTHROPIC_API_KEY".to_string()]),
+        );
+
+        let mut provider = LLMProvider {
+            provider_type: ProviderType::Anthropic,
+            base_url: "https://configured.anthropic.test".to_string(),
+            api_key: String::new(),
+            env: None,
+            custom_headers: None,
+        };
+        let mut model = LLMModel {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4".to_string(),
+            max_context_size: 200_000,
+            capabilities: None,
+        };
+
+        let err = augment_provider_with_env_vars(&mut provider, &mut model)
+            .await
+            .expect_err("missing credential lookup should stay strict");
+        assert!(err.to_string().contains("backend env lookup failed"));
     })
     .await;
 }
@@ -737,6 +834,59 @@ async fn test_create_llm_kimi_model_parameters() {
 }
 
 #[tokio::test]
+async fn test_create_llm_kimi_prefers_provider_env_for_model_parameters() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([
+            ("KIMI_MODEL_TEMPERATURE".to_string(), "0.7".to_string()),
+            ("KIMI_MODEL_TOP_P".to_string(), "0.9".to_string()),
+            ("KIMI_MODEL_MAX_TOKENS".to_string(), "9999".to_string()),
+        ]));
+
+        let provider = LLMProvider {
+            provider_type: ProviderType::Kimi,
+            base_url: "https://api.test/v1".to_string(),
+            api_key: "test-key".to_string(),
+            env: Some(HashMap::from([
+                ("KIMI_MODEL_TEMPERATURE".to_string(), "0.2".to_string()),
+                ("KIMI_MODEL_TOP_P".to_string(), "0.8".to_string()),
+                ("KIMI_MODEL_MAX_TOKENS".to_string(), "1234".to_string()),
+            ])),
+            custom_headers: None,
+        };
+        let model = LLMModel {
+            provider: "kimi".to_string(),
+            model: "kimi-base".to_string(),
+            max_context_size: 4096,
+            capabilities: None,
+        };
+
+        let llm = create_llm(&provider, &model, None, None)
+            .await
+            .expect("create llm")
+            .expect("llm");
+
+        let kimi = llm
+            .chat_provider
+            .as_any()
+            .downcast_ref::<Kimi>()
+            .expect("kimi provider");
+
+        assert_eq!(
+            serde_json::Value::Object(kimi.model_parameters()),
+            json!({
+                "base_url": "https://api.test/v1/",
+                "temperature": 0.2,
+                "top_p": 0.8,
+                "max_tokens": 1234
+            })
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn test_create_llm_invalid_temperature_env() {
     let _lock = ENV_LOCK.lock().await;
     let _guard = EnvGuard::set("KIMI_MODEL_TEMPERATURE", "not-a-number");
@@ -958,6 +1108,54 @@ async fn test_create_llm_anthropic_provider() {
 
     assert!(llm.chat_provider.as_any().is::<Anthropic>());
     assert_eq!(llm.chat_provider.name(), "anthropic");
+}
+
+#[tokio::test]
+async fn test_create_llm_anthropic_prefers_provider_env_for_model_parameters() {
+    let _lock = ENV_LOCK.lock().await;
+
+    with_current_kaos_scope(async {
+        let _guard = BackendEnvKaosGuard::new(HashMap::from([
+            ("ANTHROPIC_MODEL_TEMPERATURE".to_string(), "0.7".to_string()),
+            ("ANTHROPIC_MODEL_TOP_P".to_string(), "0.9".to_string()),
+            ("ANTHROPIC_MODEL_MAX_TOKENS".to_string(), "9999".to_string()),
+        ]));
+
+        let provider = LLMProvider {
+            provider_type: ProviderType::Anthropic,
+            base_url: "https://api.anthropic.test".to_string(),
+            api_key: "test-key".to_string(),
+            env: Some(HashMap::from([
+                ("ANTHROPIC_MODEL_TEMPERATURE".to_string(), "0.2".to_string()),
+                ("ANTHROPIC_MODEL_TOP_P".to_string(), "0.8".to_string()),
+                ("ANTHROPIC_MODEL_MAX_TOKENS".to_string(), "1234".to_string()),
+            ])),
+            custom_headers: None,
+        };
+        let model = LLMModel {
+            provider: "anthropic".to_string(),
+            model: "claude-sonnet-4".to_string(),
+            max_context_size: 200_000,
+            capabilities: None,
+        };
+
+        let llm = create_llm(&provider, &model, None, None)
+            .await
+            .expect("create llm")
+            .expect("llm");
+
+        let anthropic = llm
+            .chat_provider
+            .as_any()
+            .downcast_ref::<Anthropic>()
+            .expect("anthropic provider");
+        let params = anthropic.model_parameters();
+
+        assert_eq!(params.get("temperature"), Some(&json!(0.2)));
+        assert_eq!(params.get("top_p"), Some(&json!(0.8)));
+        assert_eq!(params.get("max_tokens"), Some(&json!(1234)));
+    })
+    .await;
 }
 
 #[tokio::test]
