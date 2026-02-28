@@ -56,7 +56,7 @@ async fn detect_unix_shell() -> (String, KaosPath) {
 
     for (name, candidate) in unix_shell_candidates() {
         let path = KaosPath::new(candidate);
-        if path.is_file(true).await {
+        if is_executable_unix_shell(&path).await {
             return (name.to_string(), path);
         }
     }
@@ -79,7 +79,7 @@ async fn shell_from_backend_env() -> Option<(String, KaosPath)> {
         "zsh" => "zsh",
         _ => return None,
     };
-    if !path.is_file(true).await {
+    if !is_executable_unix_shell(&path).await {
         return None;
     }
 
@@ -95,4 +95,16 @@ fn unix_shell_candidates() -> [(&'static str, &'static str); 6] {
         ("zsh", "/usr/bin/zsh"),
         ("zsh", "/usr/local/bin/zsh"),
     ]
+}
+
+async fn is_executable_unix_shell(path: &KaosPath) -> bool {
+    let Ok(stat) = path.stat(true).await else {
+        return false;
+    };
+
+    is_regular_file(stat.st_mode) && stat.st_mode & 0o111 != 0
+}
+
+fn is_regular_file(mode: u32) -> bool {
+    mode & 0o170000 == 0o100000
 }

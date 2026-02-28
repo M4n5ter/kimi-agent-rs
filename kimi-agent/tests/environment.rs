@@ -8,6 +8,9 @@ use kaos::{
 use kimi_agent::utils::Environment;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 struct EnvOnlyKaos {
     inner: LocalKaos,
     env: HashMap<String, String>,
@@ -186,6 +189,9 @@ async fn test_environment_detection_accepts_backend_zsh_env() {
     let temp = TempDir::new().expect("temp dir");
     let zsh_path = temp.path().join("zsh");
     std::fs::write(&zsh_path, "#!/bin/zsh\n").expect("write fake zsh");
+    #[cfg(unix)]
+    std::fs::set_permissions(&zsh_path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake zsh");
 
     with_current_kaos_scope(async {
         let _guard = EnvOnlyKaosGuard::new(EnvOnlyKaos::new(
@@ -202,6 +208,34 @@ async fn test_environment_detection_accepts_backend_zsh_env() {
         let env = Environment::detect().await;
         assert_eq!(env.shell_name, "zsh");
         assert_eq!(env.shell_path.to_string_lossy(), zsh_path.to_string_lossy());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_environment_detection_ignores_non_executable_backend_shell_env() {
+    let temp = TempDir::new().expect("temp dir");
+    let zsh_path = temp.path().join("zsh");
+    std::fs::write(&zsh_path, "#!/bin/zsh\n").expect("write fake zsh");
+    #[cfg(unix)]
+    std::fs::set_permissions(&zsh_path, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod fake zsh");
+
+    with_current_kaos_scope(async {
+        let _guard = EnvOnlyKaosGuard::new(EnvOnlyKaos::new(
+            "ssh",
+            HashMap::from([("SHELL".to_string(), zsh_path.to_string_lossy().to_string())]),
+            KaosPlatform {
+                os: "linux".to_string(),
+                arch: "x86_64".to_string(),
+                abi: None,
+                libc: Some("gnu".to_string()),
+            },
+        ));
+
+        let env = Environment::detect().await;
+        assert_ne!(env.shell_path.to_string_lossy(), zsh_path.to_string_lossy());
+        assert!(env.shell_name == "bash" || env.shell_name == "zsh" || env.shell_name == "sh");
     })
     .await;
 }
