@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use kaos::{
-    CurrentKaosToken, Kaos, KaosPath, LocalKaos, get_current_kaos, reset_current_kaos,
+    CurrentKaosToken, ExecOptions, Kaos, KaosPath, LocalKaos, get_current_kaos, reset_current_kaos,
     set_current_kaos,
 };
 use kimi_agent::config::{
@@ -248,8 +248,12 @@ impl Kaos for TestKaos {
         self.inner.env_var(key).await
     }
 
-    async fn exec(&self, args: &[String]) -> anyhow::Result<Box<dyn kaos::KaosProcess>> {
-        self.inner.exec(args).await
+    async fn exec(
+        &self,
+        args: &[String],
+        _options: ExecOptions,
+    ) -> anyhow::Result<Box<dyn kaos::KaosProcess>> {
+        self.inner.exec(args, ExecOptions::default()).await
     }
 }
 

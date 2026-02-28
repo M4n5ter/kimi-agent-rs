@@ -15,6 +15,7 @@ pub use local::LocalKaos;
 pub use path::{KaosPath, KaosPathStyle};
 pub use ssh::{SshHostKeyPolicy, SshKaos, SshKaosOptions};
 
+use std::collections::BTreeMap;
 use std::pin::Pin;
 
 use anyhow::Result;
@@ -58,6 +59,12 @@ pub struct ProcessOutputOverflow {
     pub stdout_dropped_bytes: u64,
     pub stderr_dropped_chunks: u64,
     pub stderr_dropped_bytes: u64,
+}
+
+/// Process execution options for Kaos backends.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecOptions {
+    pub env_overrides: BTreeMap<String, String>,
 }
 
 impl ProcessOutputOverflow {
@@ -133,7 +140,7 @@ pub trait Kaos: Send + Sync {
     async fn chmod(&self, path: &KaosPath, mode: u32) -> Result<()>;
     async fn mkdir(&self, path: &KaosPath, parents: bool, exist_ok: bool) -> Result<()>;
     async fn env_var(&self, key: &str) -> Result<Option<String>>;
-    async fn exec(&self, args: &[String]) -> Result<Box<dyn KaosProcess>>;
+    async fn exec(&self, args: &[String], options: ExecOptions) -> Result<Box<dyn KaosProcess>>;
 }
 
 /// Stat result compatible with Python fields.
@@ -230,5 +237,12 @@ pub async fn env_var(key: &str) -> Result<Option<String>> {
 }
 
 pub async fn exec(args: &[String]) -> Result<Box<dyn KaosProcess>> {
-    get_current_kaos().exec(args).await
+    exec_with_options(args, ExecOptions::default()).await
+}
+
+pub async fn exec_with_options(
+    args: &[String],
+    options: ExecOptions,
+) -> Result<Box<dyn KaosProcess>> {
+    get_current_kaos().exec(args, options).await
 }

@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use kaos::{
-    CurrentKaosToken, Kaos, KaosPath, KaosProcess, LineStream, LocalKaos, StrOrKaosPath,
-    reset_current_kaos, set_current_kaos, with_current_kaos_scope,
+    CurrentKaosToken, ExecOptions, Kaos, KaosPath, KaosProcess, LineStream, LocalKaos,
+    StrOrKaosPath, reset_current_kaos, set_current_kaos, with_current_kaos_scope,
 };
 use kimi_agent::skill::{
     Skill, SkillMcpServer, SkillType, discover_skills, discover_skills_from_roots,
@@ -109,8 +109,12 @@ impl Kaos for FixedHomeKaos {
         self.inner.env_var(key).await
     }
 
-    async fn exec(&self, args: &[String]) -> anyhow::Result<Box<dyn KaosProcess>> {
-        self.inner.exec(args).await
+    async fn exec(
+        &self,
+        args: &[String],
+        _options: ExecOptions,
+    ) -> anyhow::Result<Box<dyn KaosProcess>> {
+        self.inner.exec(args, ExecOptions::default()).await
     }
 }
 
