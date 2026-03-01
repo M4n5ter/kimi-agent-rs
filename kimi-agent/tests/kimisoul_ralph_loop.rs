@@ -175,6 +175,7 @@ fn make_soul(runtime: Runtime, llm: LLM, toolset: KimiToolset) -> KimiSoul {
         agent.clone(),
         Context::new(
             agent.runtime.storage.clone(),
+            agent.runtime.session.db_id(),
             agent.runtime.session.id.clone(),
         ),
     )

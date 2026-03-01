@@ -272,7 +272,11 @@ impl KimiSoul {
         tmp_agent.runtime.storage = self.runtime.storage.clone();
         tmp_agent.runtime.config.kaos = self.runtime.config.kaos.clone();
         tmp_agent.runtime.session = tmp_session.clone();
-        let tmp_context = Context::new(self.runtime.storage.clone(), tmp_session.id.clone());
+        let tmp_context = Context::new(
+            self.runtime.storage.clone(),
+            tmp_session.db_id(),
+            tmp_session.id.clone(),
+        );
         let tmp_soul = KimiSoul::new(tmp_agent, tmp_context);
         let init_result = tmp_soul
             .run(UserInput::Text(crate::prompts::INIT.to_string()))

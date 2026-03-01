@@ -15,14 +15,14 @@ pub type WireMessageQueue = BroadcastQueue<WireMessage>;
 #[derive(Clone)]
 pub struct WireRecordTarget {
     storage: Storage,
-    session_id: String,
+    session_db_id: i64,
 }
 
 impl WireRecordTarget {
-    pub fn new(storage: Storage, session_id: impl Into<String>) -> Self {
+    pub fn new(storage: Storage, session_db_id: i64) -> Self {
         Self {
             storage,
-            session_id: session_id.into(),
+            session_db_id,
         }
     }
 }
@@ -257,7 +257,7 @@ impl WireRecorder {
             while let Ok(msg) = queue.get().await {
                 if let Err(err) = target
                     .storage
-                    .append_wire_message(&target.session_id, &msg, now_timestamp())
+                    .append_wire_message(target.session_db_id, &msg, now_timestamp())
                     .await
                 {
                     error!("Failed to append wire message: {}", err);

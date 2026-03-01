@@ -19,19 +19,22 @@ CREATE TABLE workspaces (
     kaos_scope_id TEXT NOT NULL REFERENCES kaos_scopes(id) ON DELETE RESTRICT,
     canonical_path TEXT NOT NULL,
     display_path TEXT NOT NULL,
-    -- Last resumable top-level session for this workspace and Kaos scope.
-    last_active_session_id TEXT NULL REFERENCES sessions(id) ON DELETE SET NULL,
+    -- Internal row id of the last resumable top-level session for this workspace and Kaos scope.
+    last_active_session_id INTEGER NULL REFERENCES sessions(id) ON DELETE SET NULL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE (kaos_scope_id, canonical_path)
 ) STRICT;
 
 CREATE TABLE sessions (
-    id TEXT PRIMARY KEY,
+    -- Internal stable row id used by foreign keys and runtime persistence.
+    id INTEGER PRIMARY KEY,
     workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    parent_session_id TEXT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
-    -- Stable tree root. Equals id for root sessions and stays fixed for child sessions.
-    root_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+    -- User-visible session id accepted by --session, unique only inside a workspace.
+    session_id TEXT NOT NULL,
+    parent_session_id INTEGER NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+    -- Internal row id of the stable tree root. Equals id for root sessions.
+    root_session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
     origin_kind TEXT NOT NULL,
     -- Origin payload keyed by origin_kind, for example subagent metadata.
     origin_json TEXT NOT NULL CHECK (json_valid(origin_json)),
@@ -45,12 +48,14 @@ CREATE TABLE sessions (
     next_wire_seq INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    last_activity_at REAL NOT NULL
+    last_activity_at REAL NOT NULL,
+    UNIQUE (workspace_id, session_id)
 ) STRICT;
 
 CREATE TABLE session_events (
     id INTEGER PRIMARY KEY,
-    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    -- Internal session row id that owns this event stream entry.
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     -- Logical stream name: context or wire.
     stream TEXT NOT NULL,
     -- Monotonic sequence within (session_id, stream).
@@ -90,6 +95,9 @@ CREATE INDEX workspaces_by_scope_path
 
 CREATE INDEX sessions_by_workspace_updated
     ON sessions (workspace_id, updated_at DESC);
+
+CREATE INDEX sessions_by_workspace_session_id
+    ON sessions (workspace_id, session_id);
 
 CREATE INDEX sessions_by_parent
     ON sessions (parent_session_id, created_at ASC);

@@ -29,7 +29,7 @@ pub struct WorkspaceRecord {
     pub kaos_scope_id: String,
     pub canonical_path: String,
     pub display_path: String,
-    pub last_active_session_id: Option<String>,
+    pub last_active_session_id: Option<i64>,
     pub created_at: f64,
     pub updated_at: f64,
 }
@@ -60,6 +60,7 @@ pub enum SessionState {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionRecord {
+    pub db_id: i64,
     pub id: String,
     pub workspace_id: i64,
     pub kaos_scope_id: String,
@@ -89,7 +90,7 @@ pub struct CreateSession {
 
 #[derive(Clone, Debug)]
 pub struct FinishSession {
-    pub session_id: String,
+    pub session_db_id: i64,
     pub state: SessionState,
     pub is_empty: bool,
 }

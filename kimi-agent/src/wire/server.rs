@@ -284,7 +284,7 @@ impl WireRpcState {
         let pending = Arc::clone(&self.pending);
         let wire_target = Some(crate::wire::WireRecordTarget::new(
             self.soul.runtime().storage.clone(),
-            self.soul.runtime().session.id.clone(),
+            self.soul.runtime().session.db_id(),
         ));
         let mut active_turn = self.active_turn.lock().await;
         if active_turn.is_some() {

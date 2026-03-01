@@ -9,6 +9,7 @@ use crate::storage::{
 #[derive(Clone, Debug)]
 pub struct Session {
     storage: Storage,
+    db_id: i64,
     pub id: String,
     pub work_dir: KaosPath,
     pub kaos: KaosConfig,
@@ -29,12 +30,16 @@ impl Session {
         &self.storage
     }
 
+    pub fn db_id(&self) -> i64 {
+        self.db_id
+    }
+
     pub fn kaos(&self) -> &KaosConfig {
         &self.kaos
     }
 
     pub async fn is_empty(&self) -> Result<bool> {
-        self.storage.session_is_empty(&self.id).await
+        self.storage.session_is_empty(self.db_id).await
     }
 
     pub async fn create(
@@ -113,6 +118,7 @@ impl Session {
     fn from_record(storage: Storage, kaos: KaosConfig, record: SessionRecord) -> Self {
         Self {
             storage,
+            db_id: record.db_id,
             id: record.id,
             work_dir: record.work_dir,
             kaos,
@@ -135,7 +141,7 @@ pub async fn post_run(session: &Session, state: SessionState) -> Result<()> {
     session
         .storage
         .finish_session(FinishSession {
-            session_id: session.id.clone(),
+            session_db_id: session.db_id,
             state,
             is_empty,
         })

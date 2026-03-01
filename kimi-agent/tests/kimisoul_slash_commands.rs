@@ -56,6 +56,7 @@ fn test_flow_skill_registers_skill_and_flow_commands() {
     let mut runtime = fixture.runtime.clone();
     runtime.skills = HashMap::from([("flow-skill".to_string(), flow_skill)]);
     let storage = runtime.storage.clone();
+    let session_db_id = runtime.session.db_id();
     let session_id = runtime.session.id.clone();
 
     let agent = Agent {
@@ -64,7 +65,7 @@ fn test_flow_skill_registers_skill_and_flow_commands() {
         toolset: std::sync::Arc::new(tokio::sync::Mutex::new(KimiToolset::new())),
         runtime,
     };
-    let soul = KimiSoul::new(agent, Context::new(storage, session_id));
+    let soul = KimiSoul::new(agent, Context::new(storage, session_db_id, session_id));
 
     let command_names: std::collections::HashSet<String> = soul
         .available_slash_commands()

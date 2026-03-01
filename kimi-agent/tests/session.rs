@@ -102,7 +102,7 @@ async fn test_find_uses_first_user_message_title() {
     .expect("create session");
     storage
         .append_context_messages(
-            &session.id,
+            session.db_id(),
             &[text_message(
                 Role::User,
                 "hello world from sqlite session title",
@@ -149,7 +149,7 @@ async fn test_list_sorts_by_updated_and_filters_empty_sessions() {
     .await
     .expect("create first session");
     storage
-        .append_context_messages(&first.id, &[text_message(Role::User, "old session")])
+        .append_context_messages(first.db_id(), &[text_message(Role::User, "old session")])
         .await
         .expect("append first message");
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -162,7 +162,7 @@ async fn test_list_sorts_by_updated_and_filters_empty_sessions() {
     .await
     .expect("create second session");
     storage
-        .append_context_messages(&second.id, &[text_message(Role::User, "new session")])
+        .append_context_messages(second.db_id(), &[text_message(Role::User, "new session")])
         .await
         .expect("append second message");
 
@@ -211,12 +211,12 @@ async fn test_continue_uses_last_active_root_session() {
     .await
     .expect("create session");
     storage
-        .append_context_messages(&session.id, &[text_message(Role::User, "persist me")])
+        .append_context_messages(session.db_id(), &[text_message(Role::User, "persist me")])
         .await
         .expect("append context");
     storage
         .finish_session(kimi_agent::storage::FinishSession {
-            session_id: session.id.clone(),
+            session_db_id: session.db_id(),
             state: SessionState::Completed,
             is_empty: false,
         })
@@ -277,7 +277,7 @@ async fn test_list_excludes_child_sessions() {
     .await
     .expect("create root");
     storage
-        .append_context_messages(&root.id, &[text_message(Role::User, "root session")])
+        .append_context_messages(root.db_id(), &[text_message(Role::User, "root session")])
         .await
         .expect("append root context");
     let child = Session::create_with_origin(
@@ -294,7 +294,7 @@ async fn test_list_excludes_child_sessions() {
     .await
     .expect("create child");
     storage
-        .append_context_messages(&child.id, &[text_message(Role::User, "child session")])
+        .append_context_messages(child.db_id(), &[text_message(Role::User, "child session")])
         .await
         .expect("append child context");
 
@@ -303,4 +303,55 @@ async fn test_list_excludes_child_sessions() {
         .expect("list sessions");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].id, root.id);
+}
+
+#[tokio::test]
+async fn test_same_named_session_can_exist_in_different_workspaces() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let _env = set_home_env(home_dir.path());
+    let storage = open_test_storage(home_dir.path()).await;
+
+    let first_work_dir = TempDir::new().expect("first work dir");
+    let first_work_path = KaosPath::from(first_work_dir.path().to_path_buf());
+    let second_work_dir = TempDir::new().expect("second work dir");
+    let second_work_path = KaosPath::from(second_work_dir.path().to_path_buf());
+
+    let first = Session::create(
+        storage.clone(),
+        KaosConfig::Local,
+        first_work_path.clone(),
+        Some("shared-name".to_string()),
+    )
+    .await
+    .expect("create first named session");
+    let second = Session::create(
+        storage.clone(),
+        KaosConfig::Local,
+        second_work_path.clone(),
+        Some("shared-name".to_string()),
+    )
+    .await
+    .expect("create second named session");
+
+    assert_eq!(first.id, "shared-name");
+    assert_eq!(second.id, "shared-name");
+    assert_ne!(first.db_id(), second.db_id());
+
+    let first_found = Session::find(
+        storage.clone(),
+        KaosConfig::Local,
+        first_work_path,
+        "shared-name",
+    )
+    .await
+    .expect("find first session")
+    .expect("first session");
+    let second_found = Session::find(storage, KaosConfig::Local, second_work_path, "shared-name")
+        .await
+        .expect("find second session")
+        .expect("second session");
+
+    assert_eq!(first_found.db_id(), first.db_id());
+    assert_eq!(second_found.db_id(), second.db_id());
 }

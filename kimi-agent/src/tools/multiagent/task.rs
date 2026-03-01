@@ -147,7 +147,11 @@ impl TaskTool {
             }
         };
 
-        let context = Context::new(agent.runtime.storage.clone(), child_session.id.clone());
+        let context = Context::new(
+            agent.runtime.storage.clone(),
+            child_session.db_id(),
+            child_session.id.clone(),
+        );
         let soul = std::sync::Arc::new(KimiSoul::new(agent, context));
         let soul_run = std::sync::Arc::clone(&soul);
         let ui_loop = make_ui_loop(
@@ -156,7 +160,7 @@ impl TaskTool {
         );
         let wire_target = Some(WireRecordTarget::new(
             self.session.storage().clone(),
-            child_session.id.clone(),
+            child_session.db_id(),
         ));
         let result = match tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
@@ -223,7 +227,7 @@ impl TaskTool {
                 task_tool_call_id.clone(),
             );
             let storage = self.session.storage().clone();
-            let child_session_id = child_session.id.clone();
+            let child_session_db_id = child_session.db_id();
             let _ = tokio::task::spawn_blocking(move || {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(run_soul(
@@ -231,7 +235,7 @@ impl TaskTool {
                     crate::wire::UserInput::from(CONTINUE_PROMPT),
                     ui_loop,
                     CancellationToken::new(),
-                    Some(WireRecordTarget::new(storage, child_session_id)),
+                    Some(WireRecordTarget::new(storage, child_session_db_id)),
                 ))
             })
             .await;

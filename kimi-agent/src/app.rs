@@ -165,7 +165,8 @@ impl KimiCLI {
         let agent_file = agent_file.unwrap_or_else(default_agent_file);
         let agent = load_agent(&agent_file, runtime.clone(), &mcp_configs).await?;
 
-        let mut context = Context::new(storage, runtime.session.id.clone());
+        let mut context =
+            Context::new(storage, runtime.session.db_id(), runtime.session.id.clone());
         let _ = context.restore().await;
         let soul = Arc::new(KimiSoul::new(agent, context));
 
@@ -194,10 +195,8 @@ impl KimiCLI {
         let tx_for_ui = tx.clone();
         let work_dir = self.runtime.session.work_dir.clone();
         let original_cwd = KaosPath::cwd();
-        let wire_target = WireRecordTarget::new(
-            self.runtime.storage.clone(),
-            self.runtime.session.id.clone(),
-        );
+        let wire_target =
+            WireRecordTarget::new(self.runtime.storage.clone(), self.runtime.session.db_id());
 
         let ui_loop = move |wire: Arc<crate::wire::Wire>| {
             let tx = tx_for_ui.clone();

@@ -9,6 +9,7 @@ use crate::storage::{ContextEventKind, Storage};
 #[derive(Clone, Debug)]
 pub struct Context {
     storage: Storage,
+    session_db_id: i64,
     session_id: String,
     history: Vec<Message>,
     token_count: i64,
@@ -16,9 +17,10 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(storage: Storage, session_id: String) -> Self {
+    pub fn new(storage: Storage, session_db_id: i64, session_id: String) -> Self {
         Self {
             storage,
+            session_db_id,
             session_id,
             history: Vec::new(),
             token_count: 0,
@@ -33,7 +35,7 @@ impl Context {
             return Err(anyhow!("The context storage is already modified"));
         }
 
-        let events = self.storage.load_context_events(&self.session_id).await?;
+        let events = self.storage.load_context_events(self.session_db_id).await?;
         if events.is_empty() {
             debug!("Empty context stream, skipping restoration");
             return Ok(false);
@@ -69,7 +71,7 @@ impl Context {
         debug!("Checkpointing, ID: {}", checkpoint_id);
 
         self.storage
-            .append_context_checkpoint(&self.session_id, checkpoint_id)
+            .append_context_checkpoint(self.session_db_id, checkpoint_id)
             .await?;
 
         if add_user_message {
@@ -85,7 +87,7 @@ impl Context {
 
     pub async fn revert_to(&mut self, checkpoint_id: i64) -> Result<()> {
         debug!("Reverting checkpoint, ID: {}", checkpoint_id);
-        let events = self.storage.load_context_events(&self.session_id).await?;
+        let events = self.storage.load_context_events(self.session_db_id).await?;
         let Some(checkpoint_seq) = events.iter().find_map(|event| match event.event {
             ContextEventKind::Checkpoint { checkpoint_id: id } if id == checkpoint_id => {
                 Some(event.seq)
@@ -97,7 +99,7 @@ impl Context {
         };
 
         self.storage
-            .truncate_context_from_seq(&self.session_id, checkpoint_seq)
+            .truncate_context_from_seq(self.session_db_id, checkpoint_seq)
             .await?;
         self.reset_in_memory_state();
         self.restore().await?;
@@ -106,7 +108,9 @@ impl Context {
 
     pub async fn clear(&mut self) -> Result<()> {
         debug!("Clearing context");
-        self.storage.clear_context_events(&self.session_id).await?;
+        self.storage
+            .clear_context_events(self.session_db_id)
+            .await?;
         self.reset_in_memory_state();
         Ok(())
     }
@@ -121,7 +125,7 @@ impl Context {
         };
         debug!("Appending message(s) to context: {:?}", messages);
         self.storage
-            .append_context_messages(&self.session_id, &messages)
+            .append_context_messages(self.session_db_id, &messages)
             .await?;
         self.history.extend(messages);
         Ok(())
@@ -130,7 +134,7 @@ impl Context {
     pub async fn update_token_count(&mut self, token_count: i64) -> Result<()> {
         debug!("Updating token count in context: {}", token_count);
         self.storage
-            .append_context_usage(&self.session_id, token_count)
+            .append_context_usage(self.session_db_id, token_count)
             .await?;
         self.token_count = token_count;
         Ok(())

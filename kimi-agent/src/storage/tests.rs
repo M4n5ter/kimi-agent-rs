@@ -101,7 +101,7 @@ async fn continue_session_uses_last_active_root_session() {
         .expect("create root session");
     storage
         .finish_session(FinishSession {
-            session_id: root.id.clone(),
+            session_db_id: root.db_id,
             state: SessionState::Completed,
             is_empty: false,
         })

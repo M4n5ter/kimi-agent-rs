@@ -23,6 +23,7 @@ use crate::mcp::{
     load_persisted_mcp_config, save_persisted_mcp_config,
 };
 use crate::mcp_http_proxy::KaosHttpProxyHandle;
+use crate::share::get_share_dir;
 use crate::soul::toolset::{McpConnectionContext, list_mcp_tools, parse_mcp_config};
 use crate::storage::Storage;
 
@@ -124,6 +125,7 @@ pub struct McpTestArgs {
 
 pub async fn run_mcp_command(args: McpArgs, config: &Config) -> Result<()> {
     let storage = Storage::open(&config.storage).await?;
+    warn_if_legacy_mcp_config_exists(&current_arg0()).await?;
     match args.command {
         McpCommand::Add(args) => mcp_add(&storage, config, args).await,
         McpCommand::Remove(args) => mcp_remove(&storage, config, args).await,
@@ -239,7 +241,7 @@ async fn mcp_list(storage: &Storage, runtime_config: &Config) -> Result<()> {
         {
             auth_required = !has_oauth_tokens(storage, &runtime_config.kaos, url).await?;
         }
-        let line = describe_mcp_server(name, server, auth_required);
+        let line = describe_mcp_server(name, server, auth_required, &current_arg0());
         println!("  {line}");
     }
     Ok(())
@@ -421,7 +423,7 @@ async fn mcp_test(storage: &Storage, runtime_config: &Config, args: McpTestArgs)
     Ok(())
 }
 
-fn describe_mcp_server(name: &str, server: &Value, auth_required: bool) -> String {
+fn describe_mcp_server(name: &str, server: &Value, auth_required: bool, arg0: &str) -> String {
     if let Some(command) = server.get("command").and_then(Value::as_str) {
         let args = server
             .get("args")
@@ -453,7 +455,9 @@ fn describe_mcp_server(name: &str, server: &Value, auth_required: bool) -> Strin
         }
         let mut line = format!("{name} ({transport}): {url}");
         if auth_required {
-            line.push_str(" [authorization required - run: kimi-agent mcp auth ");
+            line.push_str(" [authorization required - run: ");
+            line.push_str(arg0);
+            line.push_str(" mcp auth ");
             line.push_str(name);
             line.push(']');
         }
@@ -476,6 +480,7 @@ pub async fn load_mcp_configs(
         .collect::<Vec<_>>();
 
     if file_configs.is_empty() && raw.is_empty() {
+        warn_if_legacy_mcp_config_exists(&current_arg0()).await?;
         configs.push(load_persisted_mcp_config(storage, &runtime_config.kaos).await?);
     }
 
@@ -505,6 +510,33 @@ pub async fn load_mcp_configs(
     }
 
     Ok(configs)
+}
+
+async fn warn_if_legacy_mcp_config_exists(arg0: &str) -> Result<()> {
+    let legacy_path = get_share_dir().join("mcp.json");
+    if tokio::fs::try_exists(&legacy_path)
+        .await
+        .with_context(|| format!("probe legacy MCP config {}", legacy_path.display()))?
+    {
+        eprintln!(
+            "Warning: legacy MCP config {} is ignored. SQLite storage is authoritative now. Use `{} mcp ...` to manage MCP servers and auth.",
+            legacy_path.display(),
+            arg0,
+        );
+    }
+    Ok(())
+}
+
+fn current_arg0() -> String {
+    std::env::args_os()
+        .next()
+        .and_then(|arg0| {
+            let path = PathBuf::from(arg0);
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|arg0| !arg0.is_empty())
+        .unwrap_or_else(|| "kimi-agent".to_string())
 }
 
 async fn load_mcp_config_for_edit(storage: &Storage, runtime_config: &Config) -> Result<Value> {

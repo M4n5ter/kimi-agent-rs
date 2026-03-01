@@ -10,18 +10,17 @@ use crate::wire::{WireMessage, WireMessageRecord};
 impl Storage {
     pub async fn append_context_messages(
         &self,
-        session_id: &str,
+        session_db_id: i64,
         messages: &[Message],
     ) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
-        let session_id = session_id.to_string();
         let messages = messages.to_vec();
         let now = now_epoch_secs();
         self.with_connection(move |conn| {
             let tx = conn.transaction()?;
-            let mut next_seq = load_next_seq(&tx, &session_id, "context")?;
+            let mut next_seq = load_next_seq(&tx, session_db_id, "context")?;
 
             for message in &messages {
                 let payload_json =
@@ -32,7 +31,7 @@ impl Storage {
                     VALUES (?1, 'context', ?2, ?3, 'message', ?4, ?5)
                     ",
                     params![
-                        session_id,
+                        session_db_id,
                         next_seq,
                         now,
                         role_label(&message.role),
@@ -42,36 +41,35 @@ impl Storage {
                 next_seq += 1;
             }
 
-            update_session_stream_after_append(&tx, &session_id, "context", next_seq, now)?;
-            maybe_update_session_title(&tx, &session_id, &messages)?;
+            update_session_stream_after_append(&tx, session_db_id, "context", next_seq, now)?;
+            maybe_update_session_title(&tx, session_db_id, &messages)?;
             tx.commit()?;
             Ok(())
         })
         .await
     }
 
-    pub async fn append_context_usage(&self, session_id: &str, token_count: i64) -> Result<()> {
-        let session_id = session_id.to_string();
+    pub async fn append_context_usage(&self, session_db_id: i64, token_count: i64) -> Result<()> {
         let now = now_epoch_secs();
         self.with_connection(move |conn| {
             let tx = conn.transaction()?;
-            let next_seq = load_next_seq(&tx, &session_id, "context")?;
+            let next_seq = load_next_seq(&tx, session_db_id, "context")?;
             let payload_json = serde_json::json!({ "token_count": token_count }).to_string();
             tx.execute(
                 "
                 INSERT INTO session_events (session_id, stream, seq, created_at, kind, role, payload_json)
                 VALUES (?1, 'context', ?2, ?3, 'usage', NULL, ?4)
                 ",
-                params![session_id, next_seq, now, payload_json],
+                params![session_db_id, next_seq, now, payload_json],
             )?;
-            update_session_stream_after_append(&tx, &session_id, "context", next_seq + 1, now)?;
+            update_session_stream_after_append(&tx, session_db_id, "context", next_seq + 1, now)?;
             tx.execute(
                 "
                 UPDATE sessions
                 SET token_count = ?2, updated_at = ?3, last_activity_at = ?3, is_empty = 0
                 WHERE id = ?1
                 ",
-                params![session_id, token_count, now],
+                params![session_db_id, token_count, now],
             )?;
             tx.commit()?;
             Ok(())
@@ -81,31 +79,29 @@ impl Storage {
 
     pub async fn append_context_checkpoint(
         &self,
-        session_id: &str,
+        session_db_id: i64,
         checkpoint_id: i64,
     ) -> Result<()> {
-        let session_id = session_id.to_string();
         let now = now_epoch_secs();
         self.with_connection(move |conn| {
             let tx = conn.transaction()?;
-            let next_seq = load_next_seq(&tx, &session_id, "context")?;
+            let next_seq = load_next_seq(&tx, session_db_id, "context")?;
             let payload_json = serde_json::json!({ "checkpoint_id": checkpoint_id }).to_string();
             tx.execute(
                 "
                 INSERT INTO session_events (session_id, stream, seq, created_at, kind, role, payload_json)
                 VALUES (?1, 'context', ?2, ?3, 'checkpoint', NULL, ?4)
                 ",
-                params![session_id, next_seq, now, payload_json],
+                params![session_db_id, next_seq, now, payload_json],
             )?;
-            update_session_stream_after_append(&tx, &session_id, "context", next_seq + 1, now)?;
+            update_session_stream_after_append(&tx, session_db_id, "context", next_seq + 1, now)?;
             tx.commit()?;
             Ok(())
         })
         .await
     }
 
-    pub async fn load_context_events(&self, session_id: &str) -> Result<Vec<ContextEventRecord>> {
-        let session_id = session_id.to_string();
+    pub async fn load_context_events(&self, session_db_id: i64) -> Result<Vec<ContextEventRecord>> {
         self.with_connection(move |conn| {
             let mut stmt = conn.prepare(
                 "
@@ -115,7 +111,7 @@ impl Storage {
                 ORDER BY seq ASC
                 ",
             )?;
-            let rows = stmt.query_map(params![session_id], |row| {
+            let rows = stmt.query_map(params![session_db_id], |row| {
                 let seq: i64 = row.get(0)?;
                 let created_at: f64 = row.get(1)?;
                 let kind: String = row.get(2)?;
@@ -203,8 +199,7 @@ impl Storage {
         .await
     }
 
-    pub async fn truncate_context_from_seq(&self, session_id: &str, from_seq: i64) -> Result<()> {
-        let session_id = session_id.to_string();
+    pub async fn truncate_context_from_seq(&self, session_db_id: i64, from_seq: i64) -> Result<()> {
         let now = now_epoch_secs();
         self.with_connection(move |conn| {
             let tx = conn.transaction()?;
@@ -213,17 +208,16 @@ impl Storage {
                 DELETE FROM session_events
                 WHERE session_id = ?1 AND stream = 'context' AND seq >= ?2
                 ",
-                params![session_id, from_seq],
+                params![session_db_id, from_seq],
             )?;
-            refresh_context_session_state(&tx, &session_id, now)?;
+            refresh_context_session_state(&tx, session_db_id, now)?;
             tx.commit()?;
             Ok(())
         })
         .await
     }
 
-    pub async fn clear_context_events(&self, session_id: &str) -> Result<()> {
-        let session_id = session_id.to_string();
+    pub async fn clear_context_events(&self, session_db_id: i64) -> Result<()> {
         let now = now_epoch_secs();
         self.with_connection(move |conn| {
             let tx = conn.transaction()?;
@@ -232,9 +226,9 @@ impl Storage {
                 DELETE FROM session_events
                 WHERE session_id = ?1 AND stream = 'context'
                 ",
-                params![session_id],
+                params![session_db_id],
             )?;
-            refresh_context_session_state(&tx, &session_id, now)?;
+            refresh_context_session_state(&tx, session_db_id, now)?;
             tx.commit()?;
             Ok(())
         })
@@ -243,16 +237,15 @@ impl Storage {
 
     pub async fn append_wire_message(
         &self,
-        session_id: &str,
+        session_db_id: i64,
         message: &WireMessage,
         timestamp: f64,
     ) -> Result<()> {
-        let session_id = session_id.to_string();
         let message = message.clone();
         let now = now_epoch_secs();
         self.with_connection(move |conn| {
             let tx = conn.transaction()?;
-            let next_seq = load_next_seq(&tx, &session_id, "wire")?;
+            let next_seq = load_next_seq(&tx, session_db_id, "wire")?;
             let record =
                 WireMessageRecord::from_wire_message(&message, timestamp).map_err(anyhow::Error::msg)?;
             let payload_json = serde_json::to_string(&record).context("serialize wire message")?;
@@ -261,17 +254,16 @@ impl Storage {
                 INSERT INTO session_events (session_id, stream, seq, created_at, kind, role, payload_json)
                 VALUES (?1, 'wire', ?2, ?3, 'wire_message', NULL, ?4)
                 ",
-                params![session_id, next_seq, now, payload_json],
+                params![session_db_id, next_seq, now, payload_json],
             )?;
-            update_session_stream_after_append(&tx, &session_id, "wire", next_seq + 1, now)?;
+            update_session_stream_after_append(&tx, session_db_id, "wire", next_seq + 1, now)?;
             tx.commit()?;
             Ok(())
         })
         .await
     }
 
-    pub async fn load_wire_events(&self, session_id: &str) -> Result<Vec<WireEventRecord>> {
-        let session_id = session_id.to_string();
+    pub async fn load_wire_events(&self, session_db_id: i64) -> Result<Vec<WireEventRecord>> {
         self.with_connection(move |conn| {
             let mut stmt = conn.prepare(
                 "
@@ -281,7 +273,7 @@ impl Storage {
                 ORDER BY seq ASC
                 ",
             )?;
-            let rows = stmt.query_map(params![session_id], |row| {
+            let rows = stmt.query_map(params![session_db_id], |row| {
                 let seq: i64 = row.get(0)?;
                 let created_at: f64 = row.get(1)?;
                 let payload_json: String = row.get(2)?;
@@ -306,20 +298,20 @@ impl Storage {
     }
 }
 
-fn load_next_seq(conn: &Connection, session_id: &str, stream: &str) -> Result<i64> {
+fn load_next_seq(conn: &Connection, session_db_id: i64, stream: &str) -> Result<i64> {
     let sql = match stream {
         "context" => "SELECT next_context_seq FROM sessions WHERE id = ?1",
         "wire" => "SELECT next_wire_seq FROM sessions WHERE id = ?1",
         _ => return Err(anyhow!("unknown session event stream: {stream}")),
     };
-    conn.query_row(sql, params![session_id], |row| row.get::<_, i64>(0))
+    conn.query_row(sql, params![session_db_id], |row| row.get::<_, i64>(0))
         .optional()?
-        .ok_or_else(|| anyhow!("session not found: {session_id}"))
+        .ok_or_else(|| anyhow!("session not found: {session_db_id}"))
 }
 
 fn update_session_stream_after_append(
     conn: &Connection,
-    session_id: &str,
+    session_db_id: i64,
     stream: &str,
     next_seq: i64,
     now: f64,
@@ -341,18 +333,18 @@ fn update_session_stream_after_append(
         }
         _ => return Err(anyhow!("unknown session event stream: {stream}")),
     };
-    conn.execute(sql, params![session_id, next_seq, now])?;
+    conn.execute(sql, params![session_db_id, next_seq, now])?;
     Ok(())
 }
 
-fn refresh_context_session_state(conn: &Connection, session_id: &str, now: f64) -> Result<()> {
+fn refresh_context_session_state(conn: &Connection, session_db_id: i64, now: f64) -> Result<()> {
     let next_context_seq = conn.query_row(
         "
         SELECT COALESCE(MAX(seq) + 1, 0)
         FROM session_events
         WHERE session_id = ?1 AND stream = 'context'
         ",
-        params![session_id],
+        params![session_db_id],
         |row| row.get::<_, i64>(0),
     )?;
     let token_count = conn
@@ -364,7 +356,7 @@ fn refresh_context_session_state(conn: &Connection, session_id: &str, now: f64) 
         ORDER BY seq DESC
         LIMIT 1
         ",
-            params![session_id],
+            params![session_db_id],
             |row| row.get::<_, String>(0),
         )
         .optional()?
@@ -376,7 +368,7 @@ fn refresh_context_session_state(conn: &Connection, session_id: &str, now: f64) 
         .unwrap_or(0);
     let has_events = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id = ?1)",
-        params![session_id],
+        params![session_db_id],
         |row| row.get::<_, i64>(0),
     )?;
     conn.execute(
@@ -390,7 +382,7 @@ fn refresh_context_session_state(conn: &Connection, session_id: &str, now: f64) 
         WHERE id = ?1
         ",
         params![
-            session_id,
+            session_db_id,
             next_context_seq,
             token_count,
             i64::from(has_events == 0),
@@ -402,12 +394,17 @@ fn refresh_context_session_state(conn: &Connection, session_id: &str, now: f64) 
 
 fn maybe_update_session_title(
     conn: &Connection,
-    session_id: &str,
+    session_db_id: i64,
     messages: &[Message],
 ) -> Result<()> {
     let Some(title_source) = messages.iter().find_map(session_title_from_message) else {
         return Ok(());
     };
+    let session_id = conn.query_row(
+        "SELECT session_id FROM sessions WHERE id = ?1",
+        params![session_db_id],
+        |row| row.get::<_, String>(0),
+    )?;
     conn.execute(
         "
         UPDATE sessions
@@ -415,7 +412,7 @@ fn maybe_update_session_title(
         WHERE id = ?1 AND title = ?3
         ",
         params![
-            session_id,
+            session_db_id,
             format!("{} ({session_id})", shorten_text(&title_source, 50)),
             format!("Untitled ({session_id})"),
         ],
