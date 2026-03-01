@@ -36,8 +36,7 @@ impl Storage {
         let inserted_id = self
             .with_connection(move |conn| {
                 let tx = conn.transaction()?;
-                let session_db_id = allocate_session_id(&tx)?;
-                let (parent_db_id, root_session_db_id) =
+                let (parent_db_id, root_session_db_id): (Option<i64>, Option<i64>) =
                     if let Some(parent_id) = parent_for_insert.as_ref() {
                         let Some((parent_db_id, root_db_id)) = tx
                             .query_row(
@@ -53,22 +52,21 @@ impl Storage {
                         else {
                             return Err(anyhow!("parent session not found: {parent_id}"));
                         };
-                        (Some(parent_db_id), root_db_id)
+                        (Some(parent_db_id), Some(root_db_id))
                     } else {
-                        (None, session_db_id)
+                        (None, None)
                     };
 
                 tx.execute(
                     "
                     INSERT INTO sessions (
-                        id, workspace_id, session_id, parent_session_id, root_session_id,
+                        workspace_id, session_id, parent_session_id, root_session_id,
                         origin_kind, origin_json, title, state, token_count, is_empty,
                         next_context_seq, next_wire_seq, created_at, updated_at, last_activity_at
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 1, 0, 0, ?10, ?11, ?12)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 1, 0, 0, ?9, ?10, ?11)
                     ",
                     params![
-                        session_db_id,
                         workspace_id,
                         session_id_for_insert,
                         parent_db_id,
@@ -82,6 +80,13 @@ impl Storage {
                         now,
                     ],
                 )?;
+                let session_db_id = tx.last_insert_rowid();
+                if parent_db_id.is_none() {
+                    tx.execute(
+                        "UPDATE sessions SET root_session_id = ?2 WHERE id = ?1",
+                        params![session_db_id, session_db_id],
+                    )?;
+                }
                 tx.commit()?;
                 Ok(session_db_id)
             })
@@ -288,13 +293,6 @@ fn load_session_by_db_id(
     )
     .optional()
     .map_err(Into::into)
-}
-
-fn allocate_session_id(conn: &Connection) -> Result<i64> {
-    let next_id = conn.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM sessions", [], |row| {
-        row.get::<_, i64>(0)
-    })?;
-    Ok(next_id)
 }
 
 fn session_from_row(

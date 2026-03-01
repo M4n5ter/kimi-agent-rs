@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 const MIGRATION_1: &str = "
 CREATE TABLE kaos_scopes (
@@ -33,8 +33,8 @@ CREATE TABLE sessions (
     -- User-visible session id accepted by --session, unique only inside a workspace.
     session_id TEXT NOT NULL,
     parent_session_id INTEGER NULL REFERENCES sessions(id) ON DELETE RESTRICT,
-    -- Internal row id of the stable tree root. Equals id for root sessions.
-    root_session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+    -- Internal row id of the stable tree root. Root sessions backfill this to their own id before commit.
+    root_session_id INTEGER NULL REFERENCES sessions(id) ON DELETE RESTRICT,
     origin_kind TEXT NOT NULL,
     -- Origin payload keyed by origin_kind, for example subagent metadata.
     origin_json TEXT NOT NULL CHECK (json_valid(origin_json)),
@@ -128,11 +128,20 @@ pub fn apply(conn: &mut Connection) -> Result<()> {
         ));
     }
 
-    if version < 1 {
+    if version == 0 {
         let tx = conn.transaction()?;
         tx.execute_batch(MIGRATION_1)?;
-        tx.pragma_update(None, "user_version", 1_i64)?;
+        tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         tx.commit()?;
+        return Ok(());
+    }
+
+    if version < CURRENT_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "SQLite schema version {} is unsupported by this build. Delete the existing database and let kimi-agent recreate it with schema version {}.",
+            version,
+            CURRENT_SCHEMA_VERSION
+        ));
     }
 
     Ok(())
