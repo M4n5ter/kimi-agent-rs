@@ -21,8 +21,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use typed_path::Utf8TypedPathBuf;
 
 use crate::{
-    AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosPath, KaosPathStyle, KaosPlatform,
-    KaosProcess, LineStream, ProcessOutputOverflow, StatResult, StrOrKaosPath,
+    AsyncReadWrite, AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosPath, KaosPathStyle,
+    KaosPlatform, KaosProcess, LineStream, ProcessOutputOverflow, StatResult, StrOrKaosPath,
     line_stream::line_stream_from_async_read,
 };
 
@@ -583,13 +583,16 @@ impl Kaos for SshKaos {
         if args.is_empty() {
             bail!("missing command");
         }
+        let ExecOptions { cwd, env_overrides } = options;
 
         let quoted = args
             .iter()
             .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
-        let cwd = self.cwd();
+        let cwd = cwd
+            .map(|path| self.resolve_path(&path))
+            .unwrap_or_else(|| self.cwd());
         let command = format!("cd {} && {}", shell_quote(cwd.as_str()), quoted);
 
         let handle = self.state.handle.lock().await;
@@ -602,7 +605,7 @@ impl Kaos for SshKaos {
         // variable names unless they are explicitly whitelisted via AcceptEnv in
         // sshd_config. Callers should treat env_overrides on SSH as backend-
         // dependent rather than universally portable.
-        for (key, value) in &options.env_overrides {
+        for (key, value) in &env_overrides {
             validate_env_var_key(key)?;
             write_half.set_env(true, key, value).await?;
             await_channel_request_reply(
@@ -679,6 +682,14 @@ impl Kaos for SshKaos {
             overflow_state,
             write_half,
         }))
+    }
+
+    async fn connect_tcp(&self, host: &str, port: u16) -> Result<Box<dyn AsyncReadWrite>> {
+        let handle = self.state.handle.lock().await;
+        let channel = handle
+            .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0)
+            .await?;
+        Ok(Box::new(channel.into_stream()))
     }
 }
 
@@ -1142,7 +1153,11 @@ async fn exec_capture_raw(
 ) -> Result<(i32, String, String)> {
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, command).await?;
-    map_channel_request_reply("execute remote command", channel.wait().await)?;
+    loop {
+        if map_channel_request_reply("execute remote command", channel.wait().await)?.is_some() {
+            break;
+        }
+    }
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -1169,12 +1184,19 @@ async fn await_channel_request_reply(
     read_half: &mut russh::ChannelReadHalf,
     request_label: &str,
 ) -> Result<()> {
-    map_channel_request_reply(request_label, read_half.wait().await)
+    loop {
+        if map_channel_request_reply(request_label, read_half.wait().await)?.is_some() {
+            return Ok(());
+        }
+    }
 }
 
-fn map_channel_request_reply(request_label: &str, message: Option<ChannelMsg>) -> Result<()> {
+fn map_channel_request_reply(
+    request_label: &str,
+    message: Option<ChannelMsg>,
+) -> Result<Option<()>> {
     match message {
-        Some(ChannelMsg::Success) => Ok(()),
+        Some(ChannelMsg::Success) => Ok(Some(())),
         Some(ChannelMsg::Failure) => {
             bail!("SSH server rejected request to {request_label}")
         }
@@ -1184,6 +1206,10 @@ fn map_channel_request_reply(request_label: &str, message: Option<ChannelMsg>) -
         Some(ChannelMsg::Close) | Some(ChannelMsg::Eof) | None => {
             bail!("SSH channel closed while waiting to {request_label}")
         }
+        // OpenSSH can send window-size updates before the reply to an exec/env
+        // request. Those are transport-level flow-control events, not an
+        // answer to the request we are waiting on, so keep polling.
+        Some(ChannelMsg::WindowAdjusted { .. }) => Ok(None),
         Some(other) => bail!(
             "Unexpected SSH channel message while waiting to {request_label}: {}",
             channel_message_name(&other)
@@ -1517,8 +1543,19 @@ mod tests {
 
     #[test]
     fn map_channel_request_reply_accepts_success() {
-        map_channel_request_reply("execute remote command", Some(ChannelMsg::Success))
+        let result = map_channel_request_reply("execute remote command", Some(ChannelMsg::Success))
             .expect("success");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn map_channel_request_reply_ignores_window_adjusted() {
+        let result = map_channel_request_reply(
+            "execute remote command",
+            Some(ChannelMsg::WindowAdjusted { new_size: 1024 }),
+        )
+        .expect("window adjusted");
+        assert!(result.is_none());
     }
 
     #[test]

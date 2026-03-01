@@ -47,6 +47,7 @@ rmcp = { version = "0.17", features = [
     "auth",
     "client",
     "reqwest",
+    "transport-async-rw",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
 ] }

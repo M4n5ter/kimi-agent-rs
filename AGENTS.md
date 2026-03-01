@@ -7,6 +7,8 @@
 - `cargo test -p kosong`
 - `cargo test -p kaos`
 - `cargo test` (workspace)
+- `cargo test -p kimi-agent --features boxlite-e2e --test mcp_boxlite_ssh_e2e -- --ignored --nocapture`
+- `cargo test -p kimi-agent --features boxlite-e2e --test mcp_boxlite_ssh_oauth_e2e -- --ignored --nocapture`
 - `cargo fmt`
 - `cargo clippy --workspace --all-targets`
 
@@ -90,7 +92,7 @@ The Rust workspace version is managed by the Rust project itself. It does not ne
 ## Providers and tools
 
 - Providers: Kimi, Echo, ScriptedEcho (Echo variants used for tests).
-- Kaos: LocalKaos only (SSH Kaos omitted for now).
+- Kaos: LocalKaos plus SSH Kaos.
 - Built-in tools: Shell, Read/Write/Replace/Glob/Grep/ReadMedia, SearchWeb/FetchURL,
   SetTodoList, CreateSubagent, Task, SendDMail, Think; test tools Plus/Compare/Panic.
 - Tool descriptions live under `kimi-agent/src/tools/desc/`; wire-visible tool names and schemas
@@ -106,6 +108,17 @@ The Rust workspace version is managed by the Rust project itself. It does not ne
 
 - Rust tests live under `kimi-agent/tests`, `kosong/tests`, `kaos/tests`.
 - E2E tests cover wire-mode behavior using ScriptedEcho and mock services.
+- BoxLite-backed SSH MCP E2E tests live under `kimi-agent/tests/mcp_boxlite_ssh_e2e.rs` and
+  `kimi-agent/tests/mcp_boxlite_ssh_oauth_e2e.rs`.
+- Those BoxLite tests are behind the optional `boxlite-e2e` feature and are intentionally
+  `#[ignore]` by default.
+- BoxLite E2E prerequisites: BoxLite runtime binaries, hardware virtualization/KVM, `protoc` in
+  `PATH`, network access for guest package installation, and host access to the cached BoxLite
+  runtime directory.
+- The shared BoxLite test harness lives under `kimi-agent/tests/support/` and the guest-side
+  Python fixtures live under `kimi-agent/tests/fixtures/boxlite_e2e/`.
+- `KIMI_BOXLITE_DEBUG_TMUX=1` enables guest-side `tmux` sessions plus extra pane/log dumping for
+  debugging long-lived guest services.
 - Run Python E2E against Rust after building the binary (from `kimi-cli` submodule):
   - `cargo build -p kimi-agent`
   - `KIMI_E2E_WIRE_CMD=../target/debug/kimi-agent uv run pytest tests_e2e`

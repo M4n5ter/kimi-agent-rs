@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 
 use crate::{
-    AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosPath, KaosPlatform, KaosProcess,
-    LineStream, StatResult, StrOrKaosPath, line_stream::line_stream_from_async_read,
+    AsyncReadWrite, AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosPath, KaosPlatform,
+    KaosProcess, LineStream, StatResult, StrOrKaosPath, line_stream::line_stream_from_async_read,
 };
 
 #[cfg(unix)]
@@ -442,11 +443,15 @@ impl Kaos for LocalKaos {
         if args.is_empty() {
             return Err(anyhow!("missing command"));
         }
+        let ExecOptions { cwd, env_overrides } = options;
         let mut command = Command::new(&args[0]);
         if args.len() > 1 {
             command.args(&args[1..]);
         }
-        command.envs(options.env_overrides.iter());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd.unsafe_to_local_path());
+        }
+        command.envs(env_overrides.iter());
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
@@ -469,6 +474,11 @@ impl Kaos for LocalKaos {
             null_stderr: StdIoReader::new(tokio::io::empty()),
             exit_status: None,
         }))
+    }
+
+    async fn connect_tcp(&self, host: &str, port: u16) -> Result<Box<dyn AsyncReadWrite>> {
+        let stream = TcpStream::connect((host, port)).await?;
+        Ok(Box::new(stream))
     }
 }
 

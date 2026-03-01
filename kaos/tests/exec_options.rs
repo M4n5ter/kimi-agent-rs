@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use kaos::{AsyncReadable, ExecOptions, Kaos, LocalKaos};
+use kaos::{AsyncReadable, ExecOptions, Kaos, KaosPath, LocalKaos};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -100,6 +103,7 @@ async fn exec_options_adds_child_environment_variables() {
     let output = run_command(
         &args,
         ExecOptions {
+            cwd: None,
             env_overrides: BTreeMap::from([(
                 "KAOS_EXEC_CHILD_ONLY".to_string(),
                 "child-value".to_string(),
@@ -121,6 +125,7 @@ async fn exec_options_overrides_inherited_environment_values() {
     let output = run_command(
         &args,
         ExecOptions {
+            cwd: None,
             env_overrides: BTreeMap::from([(
                 "KAOS_EXEC_OVERRIDE".to_string(),
                 "child-value".to_string(),
@@ -144,4 +149,71 @@ async fn empty_exec_options_preserve_inherited_environment() {
         .expect("run command");
 
     assert_eq!(output, "parent-value");
+}
+
+#[tokio::test]
+async fn exec_options_override_child_working_directory() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let test_dir =
+        std::env::temp_dir().join(format!("kaos-exec-cwd-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&test_dir).expect("create test dir");
+
+    #[cfg(windows)]
+    let args = vec![
+        "powershell.exe".to_string(),
+        "-Command".to_string(),
+        "[Console]::Out.Write((Get-Location).Path)".to_string(),
+    ];
+
+    #[cfg(not(windows))]
+    let args = vec!["/bin/sh".to_string(), "-c".to_string(), "pwd".to_string()];
+
+    let output = run_command(
+        &args,
+        ExecOptions {
+            cwd: Some(KaosPath::from(test_dir.clone())),
+            env_overrides: BTreeMap::new(),
+        },
+    )
+    .await
+    .expect("run command");
+
+    let normalized_output = output.trim_end_matches(['\r', '\n']);
+    let expected = std::fs::canonicalize(&test_dir).expect("canonical expected dir");
+    let actual = std::fs::canonicalize(normalized_output).expect("canonical actual dir");
+    assert_eq!(actual, expected);
+
+    std::fs::remove_dir_all(&test_dir).expect("cleanup test dir");
+}
+
+#[tokio::test]
+async fn local_kaos_connect_tcp_returns_duplex_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("listener addr");
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut buf = [0u8; 4];
+        socket.read_exact(&mut buf).await.expect("read ping");
+        assert_eq!(&buf, b"ping");
+        socket.write_all(b"pong").await.expect("write pong");
+    });
+
+    let kaos = LocalKaos::new();
+    let mut stream = kaos
+        .connect_tcp("127.0.0.1", addr.port())
+        .await
+        .expect("connect tcp");
+    stream.write_all(b"ping").await.expect("write ping");
+    stream.flush().await.expect("flush ping");
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf).await.expect("read pong");
+    assert_eq!(&buf, b"pong");
+
+    server.await.expect("join server");
 }
