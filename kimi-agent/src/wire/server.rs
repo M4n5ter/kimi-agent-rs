@@ -60,16 +60,18 @@ struct WireRpcState {
     pending: Arc<tokio::sync::Mutex<HashMap<String, PendingRequest>>>,
     active_turn: Arc<tokio::sync::Mutex<Option<ActiveTurn>>>,
     next_turn_id: Arc<AtomicU64>,
+    created_new_session: bool,
 }
 
 impl WireRpcState {
-    fn new(soul: Arc<KimiSoul>) -> Self {
+    fn new(soul: Arc<KimiSoul>, created_new_session: bool) -> Self {
         Self {
             soul,
             write_queue: Queue::new(),
             pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_turn: Arc::new(tokio::sync::Mutex::new(None)),
             next_turn_id: Arc::new(AtomicU64::new(1)),
+            created_new_session,
         }
     }
 
@@ -79,6 +81,10 @@ impl WireRpcState {
 
     fn session(&self) -> Session {
         self.soul.runtime().session.clone()
+    }
+
+    fn created_new_session(&self) -> bool {
+        self.created_new_session
     }
 
     async fn handle_json_line(&self, line: &str) {
@@ -280,6 +286,7 @@ impl WireRpcState {
         let turn_cancel_token = cancel_token.clone();
         let active_turn_slot = Arc::clone(&self.active_turn);
         let soul = Arc::clone(&self.soul);
+        let session = self.session();
         let write_queue = self.write_queue.clone();
         let pending = Arc::clone(&self.pending);
         let wire_target = Some(crate::wire::WireRecordTarget::new(
@@ -332,7 +339,7 @@ impl WireRpcState {
                     let _ = write_queue
                         .put_nowait(serde_json::to_value(response).unwrap_or(Value::Null));
                 }
-                Err(err) => {
+                Err(ref err) => {
                     if err.is::<LLMNotSet>() {
                         let response = JsonRpcErrorResponse {
                             jsonrpc: "2.0",
@@ -404,6 +411,18 @@ impl WireRpcState {
                             .put_nowait(serde_json::to_value(response).unwrap_or(Value::Null));
                     }
                 }
+            }
+            let state = match &run_result {
+                Ok(()) => SessionState::Completed,
+                Err(err) if err.is::<RunCancelled>() => SessionState::Cancelled,
+                Err(_) => SessionState::Failed,
+            };
+            if let Err(err) = post_run_session(&session, state).await {
+                warn!(
+                    session_id = %session.id,
+                    "Failed to persist session state after websocket turn: {}",
+                    err
+                );
             }
             let mut slot = active_turn_slot.lock().await;
             if slot.as_ref().is_some_and(|turn| turn.id == turn_id) {
@@ -611,6 +630,16 @@ async fn cancel_and_wait_active_turn(
     }
 }
 
+async fn finalize_unused_ws_session(
+    session: &Session,
+    created_new_session: bool,
+) -> anyhow::Result<()> {
+    if !created_new_session || !session.is_empty().await? {
+        return Ok(());
+    }
+    post_run_session(session, SessionState::Empty).await
+}
+
 pub struct WireServer {
     rpc: WireRpcState,
 }
@@ -620,7 +649,7 @@ pub type WireOverStdio = WireServer;
 impl WireServer {
     pub fn new(soul: Arc<KimiSoul>) -> Self {
         Self {
-            rpc: WireRpcState::new(soul),
+            rpc: WireRpcState::new(soul, false),
         }
     }
 
@@ -846,7 +875,7 @@ impl WsServerState {
             }
         };
 
-        Ok(WireRpcState::new(cli.soul()))
+        Ok(WireRpcState::new(cli.soul(), created_new_session))
     }
 }
 
@@ -901,8 +930,11 @@ async fn ws_upgrade_handler(
         tokio::spawn(async move {
             if let Some(rpc) = rpc_slot_for_failed_upgrade.lock().await.take() {
                 let session = rpc.session();
+                let created_new_session = rpc.created_new_session();
                 rpc.shutdown().await;
-                if let Err(post_run_err) = post_run_session(&session, SessionState::Failed).await {
+                if let Err(post_run_err) =
+                    finalize_unused_ws_session(&session, created_new_session).await
+                {
                     warn!(
                         session_id = %session_id_for_failed_upgrade,
                         "Failed to finalize session metadata after failed websocket upgrade: {}",
@@ -987,8 +1019,9 @@ async fn handle_ws_socket(
     }
 
     let session = rpc.session();
+    let created_new_session = rpc.created_new_session();
     rpc.shutdown().await;
-    if let Err(err) = post_run_session(&session, SessionState::Completed).await {
+    if let Err(err) = finalize_unused_ws_session(&session, created_new_session).await {
         warn!(
             session_id = %session_id,
             "Failed to finalize session metadata after websocket close: {}",
