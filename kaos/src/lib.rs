@@ -20,6 +20,7 @@ use std::pin::Pin;
 
 use anyhow::Result;
 use futures::stream::Stream;
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// A path-like argument accepted by Kaos operations.
@@ -57,6 +58,47 @@ pub trait AsyncWritable: Send + Sync {
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum KaosFileErrorKind {
+    #[error("not found")]
+    NotFound,
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("already exists")]
+    AlreadyExists,
+    #[error("i/o failure")]
+    Other,
+}
+
+#[derive(Debug, Error)]
+#[error("{operation} {} failed: {kind}: {message}", .path.to_string_lossy())]
+pub struct KaosFileError {
+    path: KaosPath,
+    operation: &'static str,
+    kind: KaosFileErrorKind,
+    message: String,
+}
+
+impl KaosFileError {
+    pub fn new(
+        path: &KaosPath,
+        operation: &'static str,
+        kind: KaosFileErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.clone(),
+            operation,
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> KaosFileErrorKind {
+        self.kind
+    }
+}
 
 /// Summary of output dropped by a process transport layer under backpressure.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -171,6 +213,16 @@ pub struct StatResult {
 }
 
 pub type LineStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
+
+pub fn file_error_kind(err: &anyhow::Error) -> Option<KaosFileErrorKind> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<KaosFileError>())
+        .map(KaosFileError::kind)
+}
+
+pub fn is_not_found_error(err: &anyhow::Error) -> bool {
+    matches!(file_error_kind(err), Some(KaosFileErrorKind::NotFound))
+}
 
 /// Helper to map string/KaosPath to KaosPath.
 pub fn normalize_path_arg(arg: &StrOrKaosPath<'_>) -> KaosPath {

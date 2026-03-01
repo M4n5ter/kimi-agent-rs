@@ -21,9 +21,9 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use typed_path::Utf8TypedPathBuf;
 
 use crate::{
-    AsyncReadWrite, AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosPath, KaosPathStyle,
-    KaosPlatform, KaosProcess, LineStream, ProcessOutputOverflow, StatResult, StrOrKaosPath,
-    line_stream::line_stream_from_async_read,
+    AsyncReadWrite, AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosFileError,
+    KaosFileErrorKind, KaosPath, KaosPathStyle, KaosPlatform, KaosProcess, LineStream,
+    ProcessOutputOverflow, StatResult, StrOrKaosPath, line_stream::line_stream_from_async_read,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -205,15 +205,28 @@ impl SshKaos {
 
             let home = KaosPath::from_style(
                 KaosPathStyle::Posix,
-                sftp.canonicalize(".").await.map_err(sftp_error)?,
+                sftp.canonicalize(".").await.map_err(|err| {
+                    sftp_error(
+                        &KaosPath::from_style(KaosPathStyle::Posix, "."),
+                        "canonicalize",
+                        err,
+                    )
+                })?,
             );
             let cwd = if let Some(cwd) = options.cwd.as_deref() {
                 let resolved = resolve_absolute_posix(&home, cwd);
-                let canonical = sftp.canonicalize(resolved).await.map_err(sftp_error)?;
-                let attrs = sftp
-                    .metadata(canonical.as_str())
+                let requested_cwd = KaosPath::from_style(KaosPathStyle::Posix, &resolved);
+                let canonical = sftp
+                    .canonicalize(&resolved)
                     .await
-                    .map_err(sftp_error)?;
+                    .map_err(|err| sftp_error(&requested_cwd, "canonicalize", err))?;
+                let attrs = sftp.metadata(canonical.as_str()).await.map_err(|err| {
+                    sftp_error(
+                        &KaosPath::from_style(KaosPathStyle::Posix, canonical.as_str()),
+                        "stat",
+                        err,
+                    )
+                })?;
                 if !attrs.is_dir() {
                     bail!("Configured SSH cwd is not a directory: {canonical}");
                 }
@@ -317,13 +330,19 @@ impl Kaos for SshKaos {
             .sftp
             .canonicalize(resolved.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "canonicalize", err))?;
         let attrs = self
             .state
             .sftp
             .metadata(canonical.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| {
+                sftp_error(
+                    &KaosPath::from_style(KaosPathStyle::Posix, canonical.as_str()),
+                    "stat",
+                    err,
+                )
+            })?;
         if !attrs.is_dir() {
             bail!("Not a directory: {}", canonical);
         }
@@ -343,13 +362,13 @@ impl Kaos for SshKaos {
                 .sftp
                 .metadata(resolved.as_str())
                 .await
-                .map_err(sftp_error)?
+                .map_err(|err| sftp_error(&resolved, "stat", err))?
         } else {
             self.state
                 .sftp
                 .symlink_metadata(resolved.as_str())
                 .await
-                .map_err(sftp_error)?
+                .map_err(|err| sftp_error(&resolved, "stat", err))?
         };
 
         let st_mode = attrs.permissions.unwrap_or(0);
@@ -375,7 +394,7 @@ impl Kaos for SshKaos {
             .sftp
             .read_dir(resolved.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "read directory", err))?;
         for entry in dir {
             let full = resolved.joinpath(&entry.file_name());
             entries.push(full);
@@ -411,7 +430,7 @@ impl Kaos for SshKaos {
                 .sftp
                 .read_dir(dir.as_str())
                 .await
-                .map_err(sftp_error)?;
+                .map_err(|err| sftp_error(&dir, "read directory", err))?;
 
             for entry in entries {
                 let name = entry.file_name();
@@ -447,7 +466,7 @@ impl Kaos for SshKaos {
             .sftp
             .read(resolved.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "read bytes", err))?;
         if let Some(n) = limit {
             data.truncate(n);
         }
@@ -475,7 +494,7 @@ impl Kaos for SshKaos {
             .sftp
             .open(resolved.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "open text stream", err))?;
         Ok(line_stream_from_async_read(file))
     }
 
@@ -489,7 +508,7 @@ impl Kaos for SshKaos {
                 OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
             )
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "write bytes", err))?;
         file.write_all(data).await?;
         file.shutdown().await?;
         Ok(data.len())
@@ -507,7 +526,7 @@ impl Kaos for SshKaos {
             .sftp
             .open_with_flags(resolved.as_str(), flags)
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "write text", err))?;
         file.write_all(data.as_bytes()).await?;
         file.shutdown().await?;
         Ok(data.len())
@@ -520,14 +539,14 @@ impl Kaos for SshKaos {
             .sftp
             .metadata(resolved.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "stat", err))?;
         let file_type_bits = attrs.permissions.unwrap_or(0) & 0o170000;
         attrs.permissions = Some(file_type_bits | (mode & 0o7777));
         self.state
             .sftp
             .set_metadata(resolved.as_str(), attrs)
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "chmod", err))?;
         Ok(())
     }
 
@@ -1272,10 +1291,18 @@ async fn mkdir_once(sftp: &SftpSession, path: &str, exist_ok: bool) -> Result<()
             match sftp.metadata(path).await {
                 Ok(attrs) if attrs.is_dir() => Ok(()),
                 Ok(_) => bail!("Path exists but is not a directory: {path}"),
-                Err(err) => Err(sftp_error(err)),
+                Err(err) => Err(sftp_error(
+                    &KaosPath::from_style(KaosPathStyle::Posix, path),
+                    "stat",
+                    err,
+                )),
             }
         }
-        Err(err) => Err(sftp_error(err)),
+        Err(err) => Err(sftp_error(
+            &KaosPath::from_style(KaosPathStyle::Posix, path),
+            "create directory",
+            err,
+        )),
     }
 }
 
@@ -1355,8 +1382,25 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r#"'"'"'"#))
 }
 
-fn sftp_error(err: SftpError) -> anyhow::Error {
-    anyhow!("SFTP error: {err}")
+fn sftp_error(path: &KaosPath, operation: &'static str, err: SftpError) -> anyhow::Error {
+    KaosFileError::new(
+        path,
+        operation,
+        classify_sftp_error_kind(&err),
+        format!("SFTP error: {err}"),
+    )
+    .into()
+}
+
+fn classify_sftp_error_kind(err: &SftpError) -> KaosFileErrorKind {
+    match err {
+        SftpError::Status(status) => match status.status_code {
+            StatusCode::NoSuchFile => KaosFileErrorKind::NotFound,
+            StatusCode::PermissionDenied => KaosFileErrorKind::PermissionDenied,
+            _ => KaosFileErrorKind::Other,
+        },
+        _ => KaosFileErrorKind::Other,
+    }
 }
 
 fn expand_home(path: impl AsRef<str>) -> PathBuf {
@@ -1431,11 +1475,13 @@ fn build_storage_name(host: &str, port: u16, username: &str) -> String {
 mod tests {
     use super::{
         GlobTraversalPlan, SSH_ENV_VAR_UNSET_EXIT_CODE, build_storage_name,
-        map_channel_request_reply, map_env_var_lookup_result, normalize_glob_pattern,
-        resolve_absolute_posix, validate_env_var_key,
+        classify_sftp_error_kind, map_channel_request_reply, map_env_var_lookup_result,
+        normalize_glob_pattern, resolve_absolute_posix, validate_env_var_key,
     };
-    use crate::{KaosPath, KaosPathStyle};
+    use crate::{KaosFileErrorKind, KaosPath, KaosPathStyle};
     use russh::{ChannelMsg, ChannelOpenFailure};
+    use russh_sftp::client::error::Error as SftpError;
+    use russh_sftp::protocol::{Status, StatusCode};
 
     #[test]
     fn storage_name_is_deterministic() {
@@ -1539,6 +1585,17 @@ mod tests {
             map_env_var_lookup_result("PATH", 1, String::new(), "permission denied".to_string())
                 .expect_err("failure");
         assert!(err.to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn classify_sftp_error_kind_recognizes_not_found() {
+        let err = SftpError::Status(Status {
+            id: 1,
+            status_code: StatusCode::NoSuchFile,
+            error_message: "missing".to_string(),
+            language_tag: String::new(),
+        });
+        assert_eq!(classify_sftp_error_kind(&err), KaosFileErrorKind::NotFound);
     }
 
     #[test]
