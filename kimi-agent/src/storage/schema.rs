@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 1;
 
 const MIGRATION_1: &str = "
 CREATE TABLE kaos_scopes (
