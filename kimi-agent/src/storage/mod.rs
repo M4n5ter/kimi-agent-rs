@@ -13,9 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use types::{
-    ContextEventKind, ContextEventRecord, CreateSession, FinishSession, KaosScopeKind,
-    KaosScopeRecord, McpServerRecord, SessionOrigin, SessionRecord, SessionState, WireEventRecord,
-    WorkspaceRecord,
+    ContextEventKind, ContextEventRecord, ContextMessageOrigin, CreateSession, FinishSession,
+    KaosScopeKind, KaosScopeRecord, McpServerRecord, SessionOrigin, SessionRecord, SessionState,
+    WireEventRecord, WorkspaceRecord,
 };
 
 #[derive(Clone, Debug)]

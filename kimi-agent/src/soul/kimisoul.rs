@@ -299,7 +299,7 @@ impl KimiSoul {
         ));
         let mut context = self.context.lock().await;
         context
-            .append_messages(Message::new(Role::User, vec![system_message]))
+            .append_synthetic_messages(Message::new(Role::User, vec![system_message]))
             .await?;
         Ok(())
     }
@@ -482,7 +482,7 @@ impl KimiSoul {
         self.checkpoint().await?;
         {
             let mut context = self.context.lock().await;
-            context.append_messages(user_message).await?;
+            context.append_user_messages(user_message).await?;
         }
         debug!("Appended user message to context");
         self.agent_loop().await
@@ -577,7 +577,9 @@ impl KimiSoul {
                 self.checkpoint().await?;
                 {
                     let mut context = self.context.lock().await;
-                    context.append_messages(back_to_future.messages).await?;
+                    context
+                        .append_synthetic_messages(back_to_future.messages)
+                        .await?;
                 }
             }
         }
@@ -756,7 +758,9 @@ impl KimiSoul {
         }
 
         let mut context = self.context.lock().await;
-        context.append_messages(result.message.clone()).await?;
+        context
+            .append_synthetic_messages(result.message.clone())
+            .await?;
         if let Some(usage) = &result.usage {
             context.update_token_count(usage.total()).await?;
         }
@@ -764,7 +768,7 @@ impl KimiSoul {
             "Appending tool messages to context: {}",
             tool_messages.len()
         );
-        context.append_messages(tool_messages).await?;
+        context.append_synthetic_messages(tool_messages).await?;
         Ok(())
     }
 
@@ -799,7 +803,7 @@ impl KimiSoul {
             context
                 .checkpoint(self.checkpoint_with_user_message)
                 .await?;
-            context.append_messages(compacted).await?;
+            context.append_synthetic_messages(compacted).await?;
         }
         wire_send(WireMessage::CompactionEnd(CompactionEnd {}));
         Ok(())

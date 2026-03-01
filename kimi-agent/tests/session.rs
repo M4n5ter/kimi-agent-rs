@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use kaos::KaosPath;
 use kimi_agent::config::{KaosConfig, StorageConfig};
 use kimi_agent::session::Session;
-use kimi_agent::storage::{SessionOrigin, SessionState, Storage};
+use kimi_agent::storage::{ContextMessageOrigin, SessionOrigin, SessionState, Storage};
 use kosong::message::{Message, Role, TextPart};
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -107,6 +107,7 @@ async fn test_find_uses_first_user_message_title() {
                 Role::User,
                 "hello world from sqlite session title",
             )],
+            ContextMessageOrigin::UserInput,
         )
         .await
         .expect("append context message");
@@ -119,6 +120,55 @@ async fn test_find_uses_first_user_message_title() {
         found
             .title
             .starts_with("hello world from sqlite session title")
+    );
+}
+
+#[tokio::test]
+async fn test_find_ignores_synthetic_user_messages_for_title() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let _env = set_home_env(home_dir.path());
+    let storage = open_test_storage(home_dir.path()).await;
+
+    let work_dir = TempDir::new().expect("work dir");
+    let work_path = KaosPath::from(work_dir.path().to_path_buf());
+
+    let session = Session::create(
+        storage.clone(),
+        KaosConfig::Local,
+        work_path.clone(),
+        Some("synthetic-title-session".to_string()),
+    )
+    .await
+    .expect("create session");
+    storage
+        .append_context_messages(
+            session.db_id(),
+            &[text_message(Role::User, "<system>CHECKPOINT 0</system>")],
+            ContextMessageOrigin::Synthetic,
+        )
+        .await
+        .expect("append synthetic checkpoint message");
+    storage
+        .append_context_messages(
+            session.db_id(),
+            &[text_message(
+                Role::User,
+                "real title from first user request",
+            )],
+            ContextMessageOrigin::UserInput,
+        )
+        .await
+        .expect("append real user message");
+
+    let found = Session::find(storage, KaosConfig::Local, work_path, &session.id)
+        .await
+        .expect("find session")
+        .expect("session");
+    assert!(
+        found
+            .title
+            .starts_with("real title from first user request")
     );
 }
 
@@ -149,7 +199,11 @@ async fn test_list_sorts_by_updated_and_filters_empty_sessions() {
     .await
     .expect("create first session");
     storage
-        .append_context_messages(first.db_id(), &[text_message(Role::User, "old session")])
+        .append_context_messages(
+            first.db_id(),
+            &[text_message(Role::User, "old session")],
+            ContextMessageOrigin::UserInput,
+        )
         .await
         .expect("append first message");
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -162,7 +216,11 @@ async fn test_list_sorts_by_updated_and_filters_empty_sessions() {
     .await
     .expect("create second session");
     storage
-        .append_context_messages(second.db_id(), &[text_message(Role::User, "new session")])
+        .append_context_messages(
+            second.db_id(),
+            &[text_message(Role::User, "new session")],
+            ContextMessageOrigin::UserInput,
+        )
         .await
         .expect("append second message");
 
@@ -211,7 +269,11 @@ async fn test_continue_uses_last_active_root_session() {
     .await
     .expect("create session");
     storage
-        .append_context_messages(session.db_id(), &[text_message(Role::User, "persist me")])
+        .append_context_messages(
+            session.db_id(),
+            &[text_message(Role::User, "persist me")],
+            ContextMessageOrigin::UserInput,
+        )
         .await
         .expect("append context");
     storage
@@ -277,7 +339,11 @@ async fn test_list_excludes_child_sessions() {
     .await
     .expect("create root");
     storage
-        .append_context_messages(root.db_id(), &[text_message(Role::User, "root session")])
+        .append_context_messages(
+            root.db_id(),
+            &[text_message(Role::User, "root session")],
+            ContextMessageOrigin::UserInput,
+        )
         .await
         .expect("append root context");
     let child = Session::create_with_origin(
@@ -294,7 +360,11 @@ async fn test_list_excludes_child_sessions() {
     .await
     .expect("create child");
     storage
-        .append_context_messages(child.db_id(), &[text_message(Role::User, "child session")])
+        .append_context_messages(
+            child.db_id(),
+            &[text_message(Role::User, "child session")],
+            ContextMessageOrigin::UserInput,
+        )
         .await
         .expect("append child context");
 

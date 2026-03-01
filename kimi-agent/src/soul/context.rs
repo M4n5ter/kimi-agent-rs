@@ -4,7 +4,7 @@ use tracing::{debug, error};
 use kosong::message::{Message, Role};
 
 use crate::soul::message::system;
-use crate::storage::{ContextEventKind, Storage};
+use crate::storage::{ContextEventKind, ContextMessageOrigin, Storage};
 
 #[derive(Clone, Debug)]
 pub struct Context {
@@ -43,7 +43,7 @@ impl Context {
 
         for event in events {
             match event.event {
-                ContextEventKind::Message(message) => self.history.push(message),
+                ContextEventKind::Message { message, .. } => self.history.push(message),
                 ContextEventKind::Usage { token_count } => self.token_count = token_count,
                 ContextEventKind::Checkpoint { checkpoint_id } => {
                     self.next_checkpoint_id = checkpoint_id + 1;
@@ -79,7 +79,7 @@ impl Context {
                 Role::User,
                 vec![system(&format!("CHECKPOINT {checkpoint_id}"))],
             );
-            self.append_messages(message).await?;
+            self.append_synthetic_messages(message).await?;
         }
 
         Ok(())
@@ -115,20 +115,20 @@ impl Context {
         Ok(())
     }
 
-    pub async fn append_messages<M>(&mut self, messages: M) -> Result<()>
+    pub async fn append_user_messages<M>(&mut self, messages: M) -> Result<()>
     where
         M: Into<ContextMessages>,
     {
-        let messages = match messages.into() {
-            ContextMessages::One(message) => vec![message],
-            ContextMessages::Many(messages) => messages,
-        };
-        debug!("Appending message(s) to context: {:?}", messages);
-        self.storage
-            .append_context_messages(self.session_db_id, &messages)
-            .await?;
-        self.history.extend(messages);
-        Ok(())
+        self.append_messages(messages, ContextMessageOrigin::UserInput)
+            .await
+    }
+
+    pub async fn append_synthetic_messages<M>(&mut self, messages: M) -> Result<()>
+    where
+        M: Into<ContextMessages>,
+    {
+        self.append_messages(messages, ContextMessageOrigin::Synthetic)
+            .await
     }
 
     pub async fn update_token_count(&mut self, token_count: i64) -> Result<()> {
@@ -144,6 +144,22 @@ impl Context {
         self.history.clear();
         self.token_count = 0;
         self.next_checkpoint_id = 0;
+    }
+
+    async fn append_messages<M>(&mut self, messages: M, origin: ContextMessageOrigin) -> Result<()>
+    where
+        M: Into<ContextMessages>,
+    {
+        let messages = match messages.into() {
+            ContextMessages::One(message) => vec![message],
+            ContextMessages::Many(messages) => messages,
+        };
+        debug!("Appending message(s) to context: {:?}", messages);
+        self.storage
+            .append_context_messages(self.session_db_id, &messages, origin)
+            .await?;
+        self.history.extend(messages);
+        Ok(())
     }
 }
 

@@ -102,11 +102,25 @@ pub struct ContextEventRecord {
     pub event: ContextEventKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextMessageOrigin {
+    UserInput,
+    Synthetic,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContextEventKind {
-    Message(Message),
-    Usage { token_count: i64 },
-    Checkpoint { checkpoint_id: i64 },
+    Message {
+        message: Message,
+        origin: ContextMessageOrigin,
+    },
+    Usage {
+        token_count: i64,
+    },
+    Checkpoint {
+        checkpoint_id: i64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -163,6 +177,23 @@ impl SessionOrigin {
             Self::User => "user",
             Self::Subagent { .. } => "subagent",
             Self::System { .. } => "system",
+        }
+    }
+}
+
+impl ContextMessageOrigin {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::UserInput => "user_input",
+            Self::Synthetic => "synthetic",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "user_input" => Ok(Self::UserInput),
+            "synthetic" => Ok(Self::Synthetic),
+            _ => Err(anyhow!("unknown context message origin: {value}")),
         }
     }
 }

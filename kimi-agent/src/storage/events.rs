@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use super::db::now_epoch_secs;
-use super::{ContextEventKind, ContextEventRecord, Storage, WireEventRecord};
+use super::{ContextEventKind, ContextEventRecord, ContextMessageOrigin, Storage, WireEventRecord};
 use crate::wire::{WireMessage, WireMessageRecord};
 
 impl Storage {
@@ -12,6 +12,7 @@ impl Storage {
         &self,
         session_db_id: i64,
         messages: &[Message],
+        origin: ContextMessageOrigin,
     ) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -27,14 +28,17 @@ impl Storage {
                     serde_json::to_string(message).context("serialize context message")?;
                 tx.execute(
                     "
-                    INSERT INTO session_events (session_id, stream, seq, created_at, kind, role, payload_json)
-                    VALUES (?1, 'context', ?2, ?3, 'message', ?4, ?5)
+                    INSERT INTO session_events (
+                        session_id, stream, seq, created_at, kind, role, message_origin, payload_json
+                    )
+                    VALUES (?1, 'context', ?2, ?3, 'message', ?4, ?5, ?6)
                     ",
                     params![
                         session_db_id,
                         next_seq,
                         now,
                         role_label(&message.role),
+                        origin.as_str(),
                         payload_json,
                     ],
                 )?;
@@ -42,7 +46,7 @@ impl Storage {
             }
 
             update_session_stream_after_append(&tx, session_db_id, "context", next_seq, now)?;
-            maybe_update_session_title(&tx, session_db_id, &messages)?;
+            maybe_update_session_title(&tx, session_db_id, &messages, origin)?;
             tx.commit()?;
             Ok(())
         })
@@ -57,8 +61,10 @@ impl Storage {
             let payload_json = serde_json::json!({ "token_count": token_count }).to_string();
             tx.execute(
                 "
-                INSERT INTO session_events (session_id, stream, seq, created_at, kind, role, payload_json)
-                VALUES (?1, 'context', ?2, ?3, 'usage', NULL, ?4)
+                INSERT INTO session_events (
+                    session_id, stream, seq, created_at, kind, role, message_origin, payload_json
+                )
+                VALUES (?1, 'context', ?2, ?3, 'usage', NULL, NULL, ?4)
                 ",
                 params![session_db_id, next_seq, now, payload_json],
             )?;
@@ -89,8 +95,10 @@ impl Storage {
             let payload_json = serde_json::json!({ "checkpoint_id": checkpoint_id }).to_string();
             tx.execute(
                 "
-                INSERT INTO session_events (session_id, stream, seq, created_at, kind, role, payload_json)
-                VALUES (?1, 'context', ?2, ?3, 'checkpoint', NULL, ?4)
+                INSERT INTO session_events (
+                    session_id, stream, seq, created_at, kind, role, message_origin, payload_json
+                )
+                VALUES (?1, 'context', ?2, ?3, 'checkpoint', NULL, NULL, ?4)
                 ",
                 params![session_db_id, next_seq, now, payload_json],
             )?;
@@ -105,7 +113,7 @@ impl Storage {
         self.with_connection(move |conn| {
             let mut stmt = conn.prepare(
                 "
-                SELECT seq, created_at, kind, payload_json
+                SELECT seq, created_at, kind, message_origin, payload_json
                 FROM session_events
                 WHERE session_id = ?1 AND stream = 'context'
                 ORDER BY seq ASC
@@ -115,24 +123,49 @@ impl Storage {
                 let seq: i64 = row.get(0)?;
                 let created_at: f64 = row.get(1)?;
                 let kind: String = row.get(2)?;
-                let payload_json: String = row.get(3)?;
+                let message_origin: Option<String> = row.get(3)?;
+                let payload_json: String = row.get(4)?;
                 let event = match kind.as_str() {
                     "message" => {
+                        let origin = message_origin
+                            .as_deref()
+                            .ok_or_else(|| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    3,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "context message missing message_origin",
+                                    )),
+                                )
+                            })
+                            .and_then(|origin| {
+                                ContextMessageOrigin::parse(origin).map_err(|err: anyhow::Error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        3,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            err.to_string(),
+                                        )),
+                                    )
+                                })
+                            })?;
                         let message =
                             serde_json::from_str::<Message>(&payload_json).map_err(|err| {
                                 rusqlite::Error::FromSqlConversionFailure(
-                                    3,
+                                    4,
                                     rusqlite::types::Type::Text,
                                     Box::new(err),
                                 )
                             })?;
-                        ContextEventKind::Message(message)
+                        ContextEventKind::Message { message, origin }
                     }
                     "usage" => {
                         let payload =
                             serde_json::from_str::<Value>(&payload_json).map_err(|err| {
                                 rusqlite::Error::FromSqlConversionFailure(
-                                    3,
+                                    4,
                                     rusqlite::types::Type::Text,
                                     Box::new(err),
                                 )
@@ -142,7 +175,7 @@ impl Storage {
                             .and_then(Value::as_i64)
                             .ok_or_else(|| {
                                 rusqlite::Error::FromSqlConversionFailure(
-                                    3,
+                                    4,
                                     rusqlite::types::Type::Text,
                                     Box::new(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
@@ -156,7 +189,7 @@ impl Storage {
                         let payload =
                             serde_json::from_str::<Value>(&payload_json).map_err(|err| {
                                 rusqlite::Error::FromSqlConversionFailure(
-                                    3,
+                                    4,
                                     rusqlite::types::Type::Text,
                                     Box::new(err),
                                 )
@@ -166,7 +199,7 @@ impl Storage {
                             .and_then(Value::as_i64)
                             .ok_or_else(|| {
                                 rusqlite::Error::FromSqlConversionFailure(
-                                    3,
+                                    4,
                                     rusqlite::types::Type::Text,
                                     Box::new(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
@@ -246,13 +279,15 @@ impl Storage {
         self.with_connection(move |conn| {
             let tx = conn.transaction()?;
             let next_seq = load_next_seq(&tx, session_db_id, "wire")?;
-            let record =
-                WireMessageRecord::from_wire_message(&message, timestamp).map_err(anyhow::Error::msg)?;
+            let record = WireMessageRecord::from_wire_message(&message, timestamp)
+                .map_err(anyhow::Error::msg)?;
             let payload_json = serde_json::to_string(&record).context("serialize wire message")?;
             tx.execute(
                 "
-                INSERT INTO session_events (session_id, stream, seq, created_at, kind, role, payload_json)
-                VALUES (?1, 'wire', ?2, ?3, 'wire_message', NULL, ?4)
+                INSERT INTO session_events (
+                    session_id, stream, seq, created_at, kind, role, message_origin, payload_json
+                )
+                VALUES (?1, 'wire', ?2, ?3, 'wire_message', NULL, NULL, ?4)
                 ",
                 params![session_db_id, next_seq, now, payload_json],
             )?;
@@ -396,7 +431,11 @@ fn maybe_update_session_title(
     conn: &Connection,
     session_db_id: i64,
     messages: &[Message],
+    origin: ContextMessageOrigin,
 ) -> Result<()> {
+    if origin != ContextMessageOrigin::UserInput {
+        return Ok(());
+    }
     let Some(title_source) = messages.iter().find_map(session_title_from_message) else {
         return Ok(());
     };

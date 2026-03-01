@@ -64,6 +64,8 @@ CREATE TABLE session_events (
     -- Event discriminator within the stream, such as message or checkpoint.
     kind TEXT NOT NULL,
     role TEXT NULL,
+    -- Message source within the context stream: direct user input or synthetic runtime injection.
+    message_origin TEXT NULL,
     -- Canonical JSON payload for the event kind.
     payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
     UNIQUE (session_id, stream, seq)
