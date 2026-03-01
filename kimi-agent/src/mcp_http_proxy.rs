@@ -46,6 +46,14 @@ impl KaosHttpProxyHandle {
     }
 }
 
+impl Drop for KaosHttpProxyHandle {
+    fn drop(&mut self) {
+        // Drop cannot await the proxy task, but it must still stop accepting
+        // new work on early-return paths that never reach `close()`.
+        self.shutdown.cancel();
+    }
+}
+
 async fn run_proxy(
     listener: TcpListener,
     kaos: Arc<dyn Kaos>,
@@ -250,7 +258,15 @@ fn io_other(err: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedHttpRequest, rewrite_target, split_authority};
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use kaos::LocalKaos;
+    use tokio::net::TcpStream;
+    use tokio::time::{Instant, sleep};
+
+    use super::{KaosHttpProxyHandle, ParsedHttpRequest, rewrite_target, split_authority};
 
     #[test]
     fn split_authority_supports_ipv4_and_ipv6() {
@@ -309,5 +325,47 @@ mod tests {
                 .rewritten_head
                 .ends_with("Connection: close\r\n\r\n")
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_proxy_handle_stops_accepting_connections() {
+        let proxy_url = {
+            let proxy = KaosHttpProxyHandle::bind(Arc::new(LocalKaos::new()))
+                .await
+                .expect("bind proxy");
+            let proxy_url = proxy.proxy_url();
+            TcpStream::connect(proxy_url.strip_prefix("http://").expect("proxy host"))
+                .await
+                .expect("proxy accepts connections before drop");
+            proxy_url
+        };
+
+        let proxy_host = proxy_url.strip_prefix("http://").expect("proxy host");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match TcpStream::connect(proxy_host).await {
+                Ok(stream) => {
+                    drop(stream);
+                    assert!(
+                        Instant::now() < deadline,
+                        "proxy still accepted connections after drop"
+                    );
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => {
+                    assert!(
+                        matches!(
+                            err.kind(),
+                            ErrorKind::ConnectionRefused
+                                | ErrorKind::ConnectionAborted
+                                | ErrorKind::ConnectionReset
+                                | ErrorKind::NotConnected
+                        ),
+                        "unexpected connection error after drop: {err}"
+                    );
+                    break;
+                }
+            }
+        }
     }
 }
