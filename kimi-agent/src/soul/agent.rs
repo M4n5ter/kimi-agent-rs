@@ -16,6 +16,7 @@ use crate::skill::{Skill, discover_skills_from_roots, index_skills, resolve_skil
 use crate::soul::approval::Approval;
 use crate::soul::denwarenji::DenwaRenji;
 use crate::soul::toolset::KimiToolset;
+use crate::storage::Storage;
 use crate::utils::{Environment, list_directory};
 
 #[derive(Clone, Debug)]
@@ -66,6 +67,7 @@ pub async fn load_agents_md(work_dir: &KaosPath) -> Option<String> {
 #[derive(Clone)]
 pub struct Runtime {
     pub config: Config,
+    pub storage: Storage,
     pub llm: Option<Arc<LLM>>,
     pub session: Session,
     pub builtin_args: BuiltinSystemPromptArgs,
@@ -79,6 +81,7 @@ pub struct Runtime {
 impl Runtime {
     pub async fn create(
         config: Config,
+        storage: Storage,
         llm: Option<Arc<LLM>>,
         session: Session,
         yolo: bool,
@@ -114,6 +117,7 @@ impl Runtime {
 
         Runtime {
             config,
+            storage,
             llm,
             session,
             builtin_args: BuiltinSystemPromptArgs {
@@ -134,6 +138,7 @@ impl Runtime {
     pub fn copy_for_fixed_subagent(&self) -> Runtime {
         Runtime {
             config: self.config.clone(),
+            storage: self.storage.clone(),
             llm: self.llm.clone(),
             session: self.session.clone(),
             builtin_args: self.builtin_args.clone(),
@@ -148,6 +153,7 @@ impl Runtime {
     pub fn copy_for_dynamic_subagent(&self) -> Runtime {
         Runtime {
             config: self.config.clone(),
+            storage: self.storage.clone(),
             llm: self.llm.clone(),
             session: self.session.clone(),
             builtin_args: self.builtin_args.clone(),

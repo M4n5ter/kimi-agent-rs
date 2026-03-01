@@ -18,8 +18,9 @@ use crate::soul::agent::{Runtime, load_agent};
 use crate::soul::context::Context;
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::run_soul;
-use crate::wire::WireMessage;
+use crate::storage::Storage;
 use crate::wire::server::{WireServer, WireWsServer, WsSessionRuntimeOptions};
+use crate::wire::{WireMessage, WireRecordTarget};
 
 const DEFAULT_FALLBACK_MAX_CONTEXT_SIZE: i64 = 100_000;
 
@@ -46,6 +47,7 @@ impl ConfigInput {
 
 pub struct CreateOptions {
     pub config: Option<ConfigInput>,
+    pub storage: Option<Storage>,
     pub model_name: Option<String>,
     pub thinking: Option<bool>,
     pub yolo: bool,
@@ -61,6 +63,7 @@ impl KimiCLI {
     pub async fn create(session: Session, options: CreateOptions) -> anyhow::Result<KimiCLI> {
         let CreateOptions {
             config,
+            storage,
             model_name,
             thinking,
             yolo,
@@ -75,6 +78,10 @@ impl KimiCLI {
         let mut config = match config {
             Some(config) => config.load().await?,
             None => load_config(None).await?,
+        };
+        let storage = match storage {
+            Some(storage) => storage,
+            None => Storage::open(&config.storage).await?,
         };
         if let Some(max_steps) = max_steps_per_turn {
             config.loop_control.max_steps_per_turn = max_steps;
@@ -152,12 +159,13 @@ impl KimiCLI {
             .map_err(anyhow::Error::new)?
             .map(Arc::new);
 
-        let runtime = Runtime::create(config, llm, session, yolo, skills_dir).await;
+        let runtime =
+            Runtime::create(config, storage.clone(), llm, session, yolo, skills_dir).await;
 
         let agent_file = agent_file.unwrap_or_else(default_agent_file);
         let agent = load_agent(&agent_file, runtime.clone(), &mcp_configs).await?;
 
-        let mut context = Context::new(runtime.session.context_file.clone());
+        let mut context = Context::new(storage, runtime.session.id.clone());
         let _ = context.restore().await;
         let soul = Arc::new(KimiSoul::new(agent, context));
 
@@ -186,7 +194,10 @@ impl KimiCLI {
         let tx_for_ui = tx.clone();
         let work_dir = self.runtime.session.work_dir.clone();
         let original_cwd = KaosPath::cwd();
-        let wire_file = self.runtime.session.wire_file();
+        let wire_target = WireRecordTarget::new(
+            self.runtime.storage.clone(),
+            self.runtime.session.id.clone(),
+        );
 
         let ui_loop = move |wire: Arc<crate::wire::Wire>| {
             let tx = tx_for_ui.clone();
@@ -205,7 +216,7 @@ impl KimiCLI {
             user_input,
             ui_loop,
             cancel_token,
-            Some(wire_file),
+            Some(wire_target),
         )
         .await;
         let _ = kaos::chdir(&original_cwd).await;

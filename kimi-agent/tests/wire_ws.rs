@@ -13,10 +13,55 @@ use kaos::KaosPath;
 use kimi_agent::config::{Config, LLMModel, LLMProvider, ProviderType, get_default_config};
 use kimi_agent::constant::{NAME, VERSION};
 use kimi_agent::session::Session;
+use kimi_agent::storage::Storage;
 use kimi_agent::wire::protocol::WIRE_PROTOCOL_VERSION;
 use kimi_agent::wire::server::{WireWsServer, WsSessionRuntimeOptions};
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+fn block_on_test_future<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            tokio::runtime::RuntimeFlavor::CurrentThread => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("build test runtime")
+                            .block_on(future)
+                    })
+                    .join()
+                    .expect("join scoped test runtime")
+            }),
+            _ => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("build test runtime")
+                            .block_on(future)
+                    })
+                    .join()
+                    .expect("join scoped test runtime")
+            }),
+        }
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(future)
+    }
+}
 
 struct EnvGuard {
     key: &'static str,
@@ -162,10 +207,13 @@ fn scripted_runtime_options(
     work_dir: &TempDir,
     default_session_id: &str,
 ) -> WsSessionRuntimeOptions {
+    let config = scripted_config();
+    let storage = block_on_test_future(Storage::open(&config.storage)).expect("open storage");
     WsSessionRuntimeOptions {
+        storage,
         work_dir: KaosPath::from(work_dir.path().to_path_buf()),
         default_session_id: default_session_id.to_string(),
-        config: scripted_config(),
+        config,
         model_name: None,
         thinking: Some(false),
         yolo: true,
@@ -269,7 +317,8 @@ async fn test_wire_ws_initialize_and_prompt() {
             .get("result")
             .and_then(|v| v.get("status"))
             .and_then(Value::as_str),
-        Some("finished")
+        Some("finished"),
+        "unexpected prompt response: {prompt_resp}"
     );
 
     ws.close(None).await.expect("close ws");
@@ -559,14 +608,16 @@ async fn test_wire_ws_allows_parallel_sessions() {
             .get("result")
             .and_then(|v| v.get("status"))
             .and_then(Value::as_str),
-        Some("finished")
+        Some("finished"),
+        "unexpected prompt-a response: {resp_a}"
     );
     assert_eq!(
         resp_b
             .get("result")
             .and_then(|v| v.get("status"))
             .and_then(Value::as_str),
-        Some("finished")
+        Some("finished"),
+        "unexpected prompt-b response: {resp_b}"
     );
 
     ws_a.close(None).await.expect("close ws a");
@@ -587,6 +638,8 @@ async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_rolls_back_ses
 
     let mut options = scripted_runtime_options(&work_dir, "default-session");
     options.agent_file = Some(home_dir.path().join("missing-agent.yaml"));
+    let storage = options.storage.clone();
+    let kaos = options.config.kaos.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
@@ -610,11 +663,12 @@ async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_rolls_back_ses
     }
 
     let work_path = KaosPath::from(work_dir.path().to_path_buf());
-    let session = Session::find(work_path, failed_session_id).await;
-    assert!(
-        session.is_none(),
-        "expected failed websocket runtime init to roll back new session"
-    );
+    let session = Session::find(storage, kaos, work_path, failed_session_id)
+        .await
+        .expect("find failed session")
+        .expect("failed session should be retained");
+    assert_eq!(session.state.as_str(), "failed");
+    assert!(session.is_empty().await.expect("failed session empty"));
 
     server_task.abort();
     let join_err = server_task

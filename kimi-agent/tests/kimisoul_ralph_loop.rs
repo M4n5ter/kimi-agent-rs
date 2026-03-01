@@ -163,12 +163,7 @@ fn runtime_with_llm(mut runtime: Runtime, llm: LLM) -> Runtime {
     runtime
 }
 
-fn make_soul(
-    runtime: Runtime,
-    llm: LLM,
-    toolset: KimiToolset,
-    tmp_path: &std::path::Path,
-) -> KimiSoul {
+fn make_soul(runtime: Runtime, llm: LLM, toolset: KimiToolset) -> KimiSoul {
     let agent = Agent {
         name: "Test Agent".to_string(),
         system_prompt: "Test system prompt.".to_string(),
@@ -176,7 +171,13 @@ fn make_soul(
         runtime: runtime_with_llm(runtime, llm),
     };
 
-    KimiSoul::new(agent, Context::new(tmp_path.join("history.jsonl")))
+    KimiSoul::new(
+        agent.clone(),
+        Context::new(
+            agent.runtime.storage.clone(),
+            agent.runtime.session.id.clone(),
+        ),
+    )
 }
 
 async fn run_and_collect_turns(soul: &KimiSoul, user_input: UserInput) -> Vec<UserInput> {
@@ -230,8 +231,8 @@ async fn test_ralph_loop_replays_original_prompt() {
     );
 
     let toolset = KimiToolset::new();
-    let tmp = TempDir::new().expect("temp dir");
-    let soul = make_soul(runtime, llm, toolset, tmp.path());
+    let _tmp = TempDir::new().expect("temp dir");
+    let soul = make_soul(runtime, llm, toolset);
 
     run_and_collect_turns(&soul, user_input).await;
 
@@ -291,8 +292,8 @@ async fn test_ralph_loop_stops_on_choice() {
     );
 
     let toolset = KimiToolset::new();
-    let tmp = TempDir::new().expect("temp dir");
-    let soul = make_soul(runtime, llm, toolset, tmp.path());
+    let _tmp = TempDir::new().expect("temp dir");
+    let soul = make_soul(runtime, llm, toolset);
 
     run_and_collect_turns(&soul, UserInput::Text("do it".to_string())).await;
 
@@ -338,8 +339,8 @@ async fn test_ralph_loop_stops_on_tool_rejected() {
     let mut toolset = KimiToolset::new();
     toolset.add(Arc::new(RejectTool));
 
-    let tmp = TempDir::new().expect("temp dir");
-    let soul = make_soul(runtime, llm, toolset, tmp.path());
+    let _tmp = TempDir::new().expect("temp dir");
+    let soul = make_soul(runtime, llm, toolset);
 
     run_and_collect_turns(&soul, UserInput::Text("do it".to_string())).await;
 
@@ -378,8 +379,8 @@ async fn test_ralph_loop_disabled_skips_loop_prompt() {
     );
 
     let toolset = KimiToolset::new();
-    let tmp = TempDir::new().expect("temp dir");
-    let soul = make_soul(runtime, llm, toolset, tmp.path());
+    let _tmp = TempDir::new().expect("temp dir");
+    let soul = make_soul(runtime, llm, toolset);
 
     run_and_collect_turns(&soul, UserInput::Text("hello".to_string())).await;
 

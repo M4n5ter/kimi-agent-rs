@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -7,14 +5,15 @@ use tokio_util::sync::CancellationToken;
 use kosong::message::Role;
 use kosong::tooling::{CallableTool2, ToolReturnValue, tool_error, tool_ok};
 
+use crate::session::post_run;
 use crate::soul::agent::{Agent, LaborMarket, Runtime};
 use crate::soul::context::Context;
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::toolset::get_current_tool_call_or_none;
 use crate::soul::{MaxStepsReached, get_current_wire_or_none, run_soul};
+use crate::storage::{SessionOrigin, SessionState};
 use crate::tools::utils::load_desc;
-use crate::utils::next_available_rotation;
-use crate::wire::{SubagentEvent, Wire, WireMessage};
+use crate::wire::{SubagentEvent, Wire, WireMessage, WireRecordTarget};
 
 const TASK_DESC: &str = include_str!("../desc/multiagent/task.md");
 
@@ -66,28 +65,12 @@ impl TaskTool {
         }
     }
 
-    async fn subagent_context_file(&self) -> Result<PathBuf, String> {
-        let main_context = self.session.context_file.clone();
-        let stem = main_context
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("context");
-        let suffix = main_context
-            .extension()
-            .map(|s| format!(".{}", s.to_string_lossy()))
-            .unwrap_or_default();
-        let base = main_context
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join(format!("{stem}_sub{suffix}"));
-        if let Some(path) = next_available_rotation(&base).await {
-            Ok(path)
-        } else {
-            Err("No available context path for subagent".to_string())
-        }
-    }
-
-    async fn run_subagent(&self, agent: Agent, prompt: String) -> ToolReturnValue {
+    async fn run_subagent(
+        &self,
+        mut agent: Agent,
+        subagent_name: String,
+        prompt: String,
+    ) -> ToolReturnValue {
         let super_wire = match get_current_wire_or_none() {
             Some(wire) => wire,
             None => {
@@ -109,6 +92,31 @@ impl TaskTool {
             }
         };
         let task_tool_call_id = tool_call.id.clone();
+        let child_session = match crate::session::Session::create_with_origin(
+            self.session.storage().clone(),
+            self.session.kaos().clone(),
+            self.session.work_dir.clone(),
+            None,
+            Some(self.session.id.clone()),
+            SessionOrigin::Subagent {
+                parent_tool_call_id: Some(task_tool_call_id.clone()),
+                subagent_name,
+            },
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                return tool_error(
+                    "",
+                    format!("Failed to create subagent session: {err}"),
+                    "Failed to run subagent",
+                );
+            }
+        };
+        agent.runtime.session = child_session.clone();
+        agent.runtime.storage = self.session.storage().clone();
+        agent.runtime.config.kaos = self.session.kaos().clone();
 
         let make_ui_loop = |super_wire: std::sync::Arc<Wire>, task_tool_call_id: String| {
             move |wire: std::sync::Arc<Wire>| {
@@ -139,23 +147,17 @@ impl TaskTool {
             }
         };
 
-        let context_file = match self.subagent_context_file().await {
-            Ok(path) => path,
-            Err(err) => {
-                return tool_error(
-                    "",
-                    format!("Failed to run subagent: {err}"),
-                    "Failed to run subagent",
-                );
-            }
-        };
-        let context = Context::new(context_file);
+        let context = Context::new(agent.runtime.storage.clone(), child_session.id.clone());
         let soul = std::sync::Arc::new(KimiSoul::new(agent, context));
         let soul_run = std::sync::Arc::clone(&soul);
         let ui_loop = make_ui_loop(
             std::sync::Arc::clone(&super_wire),
             task_tool_call_id.clone(),
         );
+        let wire_target = Some(WireRecordTarget::new(
+            self.session.storage().clone(),
+            child_session.id.clone(),
+        ));
         let result = match tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(run_soul(
@@ -163,13 +165,14 @@ impl TaskTool {
                 crate::wire::UserInput::from(prompt),
                 ui_loop,
                 CancellationToken::new(),
-                None,
+                wire_target,
             ))
         })
         .await
         {
             Ok(result) => result,
             Err(err) => {
+                let _ = post_run(&child_session, SessionState::Failed).await;
                 return tool_error(
                     "",
                     format!("Failed to run subagent: {err}"),
@@ -179,6 +182,7 @@ impl TaskTool {
         };
 
         if let Err(err) = result {
+            let _ = post_run(&child_session, SessionState::Failed).await;
             if let Some(MaxStepsReached { n_steps }) = err.downcast_ref::<MaxStepsReached>() {
                 return tool_error(
                     "",
@@ -204,6 +208,7 @@ impl TaskTool {
             .unwrap_or_default();
 
         if final_text.is_empty() {
+            let _ = post_run(&child_session, SessionState::Failed).await;
             return tool_error(
                 "",
                 "The subagent seemed not to run properly. Maybe you have to do the task yourself.",
@@ -217,6 +222,8 @@ impl TaskTool {
                 std::sync::Arc::clone(&super_wire),
                 task_tool_call_id.clone(),
             );
+            let storage = self.session.storage().clone();
+            let child_session_id = child_session.id.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 let handle = tokio::runtime::Handle::current();
                 handle.block_on(run_soul(
@@ -224,7 +231,7 @@ impl TaskTool {
                     crate::wire::UserInput::from(CONTINUE_PROMPT),
                     ui_loop,
                     CancellationToken::new(),
-                    None,
+                    Some(WireRecordTarget::new(storage, child_session_id)),
                 ))
             })
             .await;
@@ -238,6 +245,7 @@ impl TaskTool {
         }
 
         if final_text.is_empty() {
+            let _ = post_run(&child_session, SessionState::Failed).await;
             return tool_error(
                 "",
                 "The subagent seemed not to run properly. Maybe you have to do the task yourself.",
@@ -245,6 +253,7 @@ impl TaskTool {
             );
         }
 
+        let _ = post_run(&child_session, SessionState::Completed).await;
         tool_ok(final_text, "", "")
     }
 }
@@ -274,6 +283,7 @@ impl CallableTool2 for TaskTool {
             }
         };
 
-        self.run_subagent(agent, params.prompt).await
+        self.run_subagent(agent, params.subagent_name, params.prompt)
+            .await
     }
 }

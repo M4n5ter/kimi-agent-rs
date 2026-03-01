@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use kimi_agent::config::{
-    Config, KaosConfig, LoopControl, MCPConfig, Services, get_default_config,
+    Config, KaosConfig, LoopControl, MCPConfig, Services, StorageConfig, get_default_config,
     load_config_from_string,
 };
 
@@ -18,6 +18,7 @@ fn test_default_config() {
         services: Services::default(),
         mcp: MCPConfig::default(),
         kaos: KaosConfig::default(),
+        storage: StorageConfig::default(),
     };
     assert_eq!(config, expected);
 }
@@ -48,6 +49,10 @@ fn test_default_config_dump() {
             },
             "kaos": {
                 "type": "local",
+            },
+            "storage": {
+                "database_path": format!("{}/state.db", dirs::home_dir().expect("home dir").join(".kimi").display()),
+                "busy_timeout_ms": 5000,
             },
         })
     );

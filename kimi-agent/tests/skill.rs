@@ -8,17 +8,60 @@ use kaos::{
     AsyncReadWrite, CurrentKaosToken, ExecOptions, Kaos, KaosPath, KaosProcess, LineStream,
     LocalKaos, StrOrKaosPath, reset_current_kaos, set_current_kaos, with_current_kaos_scope,
 };
-use kimi_agent::config::get_default_config;
-use kimi_agent::metadata::WorkDirMeta;
+use kimi_agent::config::{StorageConfig, get_default_config};
 use kimi_agent::session::Session;
 use kimi_agent::skill::{
     Skill, SkillMcpServer, SkillType, discover_skills, discover_skills_from_roots,
     find_user_skills_dir, resolve_skills_roots,
 };
 use kimi_agent::soul::agent::Runtime;
-use kimi_agent::wire::WireFile;
+use kimi_agent::storage::Storage;
 
 static ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+fn block_on_test_future<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            tokio::runtime::RuntimeFlavor::CurrentThread => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("build test runtime")
+                            .block_on(future)
+                    })
+                    .join()
+                    .expect("join scoped test runtime")
+            }),
+            _ => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("build test runtime")
+                            .block_on(future)
+                    })
+                    .join()
+                    .expect("join scoped test runtime")
+            }),
+        }
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(future)
+    }
+}
 
 struct EnvGuard {
     key: &'static str,
@@ -277,23 +320,20 @@ fn assert_is_managed_builtin_root(root: &KaosPath, home: &KaosPath) {
 }
 
 fn build_test_session(work_dir: &KaosPath, share_dir: &Path) -> Session {
-    let work_dir_meta = WorkDirMeta {
-        path: work_dir.to_string_lossy(),
-        kaos: "test".to_string(),
-        last_session_id: None,
-    };
-    let context_file = share_dir.join("context.jsonl");
-    std::fs::write(&context_file, "").expect("context file");
-
-    Session {
-        id: "skill-runtime".to_string(),
-        work_dir: work_dir.clone(),
-        work_dir_meta,
-        context_file,
-        wire_file: WireFile::new(share_dir.join("wire.jsonl")),
-        title: "Skill Runtime".to_string(),
-        updated_at: 0.0,
-    }
+    let storage = block_on_test_future(Storage::open(&StorageConfig {
+        database_path: share_dir.join("state.db").display().to_string(),
+        busy_timeout_ms: 1_000,
+    }))
+    .expect("open test storage");
+    let mut session = block_on_test_future(Session::create(
+        storage,
+        get_default_config().kaos,
+        work_dir.clone(),
+        Some("skill-runtime".to_string()),
+    ))
+    .expect("create skill runtime session");
+    session.title = "Skill Runtime".to_string();
+    session
 }
 
 #[tokio::test]
@@ -671,7 +711,9 @@ async fn test_runtime_create_lists_managed_builtin_skill_paths() {
             FixedHomeKaosGuard::new("ssh", root_path, home_path, work_path.clone(), false);
 
         let session = build_test_session(&work_path, &share_dir);
-        let runtime = Runtime::create(get_default_config(), None, session, true, None).await;
+        let config = get_default_config();
+        let runtime =
+            Runtime::create(config, session.storage().clone(), None, session, true, None).await;
 
         assert!(
             runtime
@@ -815,7 +857,9 @@ async fn test_runtime_create_continues_without_builtin_skills_when_managed_dir_i
             FixedHomeKaosGuard::new("ssh", root_path, home_path, work_path.clone(), true);
 
         let session = build_test_session(&work_path, &share_dir);
-        let runtime = Runtime::create(get_default_config(), None, session, true, None).await;
+        let config = get_default_config();
+        let runtime =
+            Runtime::create(config, session.storage().clone(), None, session, true, None).await;
         assert_eq!(runtime.builtin_args.KIMI_SKILLS, "No skills found.");
     })
     .await;

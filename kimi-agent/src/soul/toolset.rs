@@ -32,6 +32,7 @@ use crate::mcp_http_proxy::KaosHttpProxyHandle;
 use crate::mcp_transport::KaosChildProcessTransport;
 use crate::soul::agent::Runtime;
 use crate::soul::get_current_wire_or_none;
+use crate::storage::Storage;
 use crate::tools::utils::tool_rejected_error;
 use crate::tools::{ToolDeps, load_tool};
 use crate::wire::ToolCallRequest;
@@ -204,9 +205,12 @@ impl KimiToolset {
                 if let McpServerConfig::Http(http) = &server
                     && http.auth.as_deref() == Some("oauth")
                 {
-                    let authorized = has_oauth_tokens(&http.url)
-                        .await
-                        .map_err(|err| anyhow::anyhow!("Failed to read MCP auth tokens: {err}"))?;
+                    let authorized =
+                        has_oauth_tokens(&runtime.storage, &runtime.config.kaos, &http.url)
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!("Failed to read MCP auth tokens: {err}")
+                            })?;
                     if !authorized {
                         self.mcp_servers
                             .entry(name.clone())
@@ -544,22 +548,24 @@ pub enum McpServerConfig {
 
 pub type McpToolSpec = rmcp::model::Tool;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct McpConnectionContext {
     pub cwd: KaosPath,
+    pub storage: Storage,
+    pub kaos: crate::config::KaosConfig,
 }
 
 impl McpConnectionContext {
     pub fn from_runtime(runtime: &Runtime) -> Self {
         Self {
             cwd: runtime.session.work_dir.clone(),
+            storage: runtime.storage.clone(),
+            kaos: runtime.config.kaos.clone(),
         }
     }
 
-    pub fn current() -> Self {
-        Self {
-            cwd: KaosPath::cwd(),
-        }
+    pub fn new(cwd: KaosPath, storage: Storage, kaos: crate::config::KaosConfig) -> Self {
+        Self { cwd, storage, kaos }
     }
 }
 
@@ -707,7 +713,11 @@ async fn connect_mcp_client(
                 manager
                     .with_client(client.clone())
                     .map_err(|err| McpClientError::Other(format!("OAuth init failed: {err}")))?;
-                manager.set_credential_store(get_mcp_credential_store(&server.url).await);
+                manager.set_credential_store(get_mcp_credential_store(
+                    &context.storage,
+                    &context.kaos,
+                    &server.url,
+                ));
                 let has_tokens = manager
                     .initialize_from_store()
                     .await

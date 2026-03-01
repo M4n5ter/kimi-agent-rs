@@ -3,9 +3,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use boxlite::BoxCommand;
+use serde_json::{Map, Value, json};
 use tokio::time::sleep;
 
-use crate::boxlite_e2e::{BoxliteServices, BoxliteSshFixture, exec_box_checked};
+use crate::boxlite_e2e::{BoxliteServices, BoxliteSshFixture};
 
 pub use crate::boxlite_e2e::{GUEST_FIXTURE_DIR, GUEST_PYTHON, HTTP_ENV_VALUE};
 
@@ -32,17 +33,41 @@ impl BoxliteSshFixture {
             .guest_port
     }
 
-    pub async fn read_remote_mcp_config(&self) -> Result<String> {
-        exec_box_checked(
-            &self.litebox,
-            BoxCommand::new("cat").arg("/root/.kimi/mcp.json"),
-        )
-        .await
-        .context("read remote MCP config")
+    pub fn local_legacy_mcp_config_path(&self) -> PathBuf {
+        self.host_home().join(".kimi").join("mcp.json")
     }
 
-    pub fn local_mcp_config_path(&self) -> PathBuf {
-        self.host_home().join(".kimi").join("mcp.json")
+    pub async fn remote_legacy_mcp_config_exists(&self) -> Result<bool> {
+        self.remote_file_exists("/root/.kimi/mcp.json").await
+    }
+
+    pub fn read_host_mcp_config(&self) -> Result<Value> {
+        self.with_local_state_db(|conn| {
+            let rows = {
+                let mut stmt = conn.prepare(
+                    "
+                    SELECT mcp_servers.name, mcp_servers.config_json
+                    FROM mcp_servers
+                    JOIN kaos_scopes ON kaos_scopes.id = mcp_servers.kaos_scope_id
+                    WHERE kaos_scopes.kind = 'ssh'
+                    ORDER BY mcp_servers.name ASC
+                    ",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            let mut servers = Map::new();
+            for (name, config_json) in rows {
+                let config: Value =
+                    serde_json::from_str(&config_json).context("parse MCP server config JSON")?;
+                servers.insert(name, config);
+            }
+
+            Ok(json!({ "mcpServers": servers }))
+        })
     }
 
     pub async fn wait_for_remote_process_exit(&self, pid: u32) -> Result<()> {

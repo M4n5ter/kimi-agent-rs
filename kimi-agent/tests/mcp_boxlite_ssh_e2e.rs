@@ -15,7 +15,7 @@ use boxlite_mcp::{
     GUEST_FIXTURE_DIR, GUEST_PYTHON, GUEST_STDIO_SCRIPT, HTTP_ENV_VALUE, HTTP_SERVER_NAME,
     HTTP_TOOL_NAME, STDIO_ENV_VALUE, STDIO_SERVER_NAME, STDIO_TOOL_NAME, provision_mcp_fixture,
 };
-use kaos::{KaosPath, get_current_kaos};
+use kaos::KaosPath;
 use kosong::message::{ContentPart, TextPart, ToolCall};
 use kosong::tooling::{CallableTool, ToolOutput, ToolReturnValue};
 use serde::Deserialize;
@@ -43,7 +43,7 @@ use kimi_agent::soul::toolset::{KimiToolset, wait_mcp_loading_tasks, with_curren
 ///
 /// Coverage:
 /// - CLI `mcp add/test/list/remove` against a real SSH backend
-/// - remote persistence of `mcp.json`
+/// - host-local SQLite persistence scoped by the active SSH Kaos backend
 /// - stdio MCP spawn semantics over SSH, including remote `cwd` and configured `env`
 /// - HTTP MCP access to a guest-only `127.0.0.1` listener through the Kaos TCP tunnel
 /// - runtime tool invocation through `KimiToolset`
@@ -81,8 +81,12 @@ async fn exercise_cli_roundtrip(fixture: &BoxliteSshFixture) -> Result<()> {
     );
 
     assert!(
-        !fixture.local_mcp_config_path().exists(),
-        "local mcp.json should not be written when Kaos backend is SSH"
+        !fixture.local_state_db_path().exists(),
+        "SQLite state should not exist before the first MCP mutation"
+    );
+    assert!(
+        !fixture.local_legacy_mcp_config_path().exists(),
+        "legacy local mcp.json should not be written"
     );
 
     run_kimi_agent(
@@ -104,12 +108,16 @@ async fn exercise_cli_roundtrip(fixture: &BoxliteSshFixture) -> Result<()> {
         ],
     )?;
 
-    let remote_config = parse_remote_mcp_config(&fixture.read_remote_mcp_config().await?)?;
-    let stdio_server = server_config(&remote_config, STDIO_SERVER_NAME)?;
+    let host_config = fixture.read_host_mcp_config()?;
+    let stdio_server = server_config(&host_config, STDIO_SERVER_NAME)?;
     assert_eq!(stdio_server["command"], GUEST_PYTHON);
     assert_eq!(stdio_server["args"], json!([GUEST_STDIO_SCRIPT]));
     assert_eq!(stdio_server["env"]["BOX_MCP_ENV"], STDIO_ENV_VALUE);
     assert_eq!(stdio_server["env"]["FIXTURE_TRANSPORT"], json!("stdio"));
+    assert!(
+        !fixture.remote_legacy_mcp_config_exists().await?,
+        "legacy remote mcp.json should not be written when SQLite is authoritative"
+    );
 
     let stdio_test = run_kimi_agent(
         fixture.host_home(),
@@ -131,8 +139,8 @@ async fn exercise_cli_roundtrip(fixture: &BoxliteSshFixture) -> Result<()> {
         ],
     )?;
 
-    let remote_config = parse_remote_mcp_config(&fixture.read_remote_mcp_config().await?)?;
-    let http_server = server_config(&remote_config, HTTP_SERVER_NAME)?;
+    let host_config = fixture.read_host_mcp_config()?;
+    let http_server = server_config(&host_config, HTTP_SERVER_NAME)?;
     assert_eq!(
         http_server["url"],
         json!(format!(
@@ -168,22 +176,22 @@ async fn exercise_cli_roundtrip(fixture: &BoxliteSshFixture) -> Result<()> {
         &["mcp", "remove", HTTP_SERVER_NAME],
     )?;
 
-    let remote_config = parse_remote_mcp_config(&fixture.read_remote_mcp_config().await?)?;
-    let servers = remote_config["mcpServers"]
+    let host_config = fixture.read_host_mcp_config()?;
+    let servers = host_config["mcpServers"]
         .as_object()
         .context("mcpServers should be an object")?;
     assert!(
         !servers.contains_key(STDIO_SERVER_NAME),
-        "removed stdio server should disappear from remote mcp.json"
+        "removed stdio server should disappear from SQLite-backed MCP config"
     );
     assert!(
         !servers.contains_key(HTTP_SERVER_NAME),
-        "removed HTTP server should disappear from remote mcp.json"
+        "removed HTTP server should disappear from SQLite-backed MCP config"
     );
     assert_eq!(
         servers.len(),
         0,
-        "remote config should be empty after cleanup"
+        "SQLite-backed MCP config should be empty after cleanup"
     );
 
     let list_output = run_kimi_agent(
@@ -206,8 +214,6 @@ async fn exercise_runtime_tool_invocation(fixture: &BoxliteSshFixture) -> Result
 
     let mut runtime_fixture = RuntimeFixture::new();
     runtime_fixture.runtime.session.work_dir = remote_work_dir.clone();
-    runtime_fixture.runtime.session.work_dir_meta.path = remote_work_dir.to_string_lossy();
-    runtime_fixture.runtime.session.work_dir_meta.kaos = get_current_kaos().storage_name();
     runtime_fixture.runtime.builtin_args.KIMI_WORK_DIR = remote_work_dir;
 
     let toolset = Arc::new(tokio::sync::Mutex::new(KimiToolset::new()));
@@ -343,10 +349,6 @@ fn extract_text_output(result: &ToolReturnValue) -> Result<String> {
             Ok(text)
         }
     }
-}
-
-fn parse_remote_mcp_config(text: &str) -> Result<Value> {
-    serde_json::from_str(text).context("parse remote mcp.json")
 }
 
 fn server_config<'a>(config: &'a Value, name: &str) -> Result<&'a Value> {

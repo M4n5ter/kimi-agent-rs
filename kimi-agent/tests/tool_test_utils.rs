@@ -1,31 +1,75 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use kaos::{
-    AsyncReadWrite, CurrentKaosToken, ExecOptions, Kaos, KaosPath, LocalKaos, get_current_kaos,
-    reset_current_kaos, set_current_kaos,
+    AsyncReadWrite, CurrentKaosToken, ExecOptions, Kaos, KaosPath, LocalKaos, reset_current_kaos,
+    set_current_kaos,
 };
 use kimi_agent::config::{
-    ModelCapability, MoonshotFetchConfig, MoonshotSearchConfig, get_default_config,
+    ModelCapability, MoonshotFetchConfig, MoonshotSearchConfig, StorageConfig, get_default_config,
 };
 use kimi_agent::llm::LLM;
-use kimi_agent::metadata::WorkDirMeta;
 use kimi_agent::session::Session;
 use kimi_agent::soul::agent::{Agent, BuiltinSystemPromptArgs, LaborMarket, Runtime};
 use kimi_agent::soul::approval::Approval;
 use kimi_agent::soul::denwarenji::DenwaRenji;
 use kimi_agent::soul::toolset::KimiToolset;
+use kimi_agent::storage::Storage;
 use kimi_agent::utils::Environment;
-use kimi_agent::wire::WireFile;
 use kosong::chat_provider::echo::EchoChatProvider;
 use tempfile::TempDir;
 
 pub struct RuntimeFixture {
     pub runtime: Runtime,
     _work_dir: TempDir,
-    _share_dir: TempDir,
+    _storage_dir: TempDir,
+}
+
+fn block_on_test_future<F>(future: F) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            tokio::runtime::RuntimeFlavor::CurrentThread => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("build test runtime")
+                            .block_on(future)
+                    })
+                    .join()
+                    .expect("join scoped test runtime")
+            }),
+            _ => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("build test runtime")
+                            .block_on(future)
+                    })
+                    .join()
+                    .expect("join scoped test runtime")
+            }),
+        }
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(future)
+    }
 }
 
 impl RuntimeFixture {
@@ -39,30 +83,14 @@ impl RuntimeFixture {
 
     pub fn with_capabilities(capabilities: HashSet<ModelCapability>) -> Self {
         let work_dir = TempDir::new().expect("temp work dir");
-        let share_dir = TempDir::new().expect("temp share dir");
+        let storage_dir = TempDir::new().expect("temp storage dir");
 
         let work_path = KaosPath::from(PathBuf::from(work_dir.path()));
-        let work_dir_meta = WorkDirMeta {
-            path: work_path.to_string_lossy(),
-            kaos: get_current_kaos().name().to_string(),
-            last_session_id: None,
-        };
-
-        let context_file = share_dir.path().join("context.jsonl");
-        std::fs::write(&context_file, "").expect("context file");
-        let wire_file = WireFile::new(share_dir.path().join("wire.jsonl"));
-
-        let session = Session {
-            id: "test".to_string(),
-            work_dir: work_path.clone(),
-            work_dir_meta,
-            context_file,
-            wire_file,
-            title: "Test Session".to_string(),
-            updated_at: 0.0,
-        };
-
         let mut config = get_default_config();
+        config.storage = StorageConfig {
+            database_path: storage_dir.path().join("state.db").display().to_string(),
+            busy_timeout_ms: 1_000,
+        };
         config.services.moonshot_search = Some(MoonshotSearchConfig {
             base_url: "https://api.kimi.com/coding/v1/search".to_string(),
             api_key: "test-api-key".to_string(),
@@ -73,6 +101,16 @@ impl RuntimeFixture {
             api_key: "test-api-key".to_string(),
             custom_headers: None,
         });
+        let storage =
+            block_on_test_future(Storage::open(&config.storage)).expect("open test storage");
+        let mut session = block_on_test_future(Session::create(
+            storage.clone(),
+            config.kaos.clone(),
+            work_path.clone(),
+            Some("test".to_string()),
+        ))
+        .expect("create test session");
+        session.title = "Test Session".to_string();
 
         let llm = LLM {
             chat_provider: Box::new(EchoChatProvider),
@@ -101,6 +139,7 @@ impl RuntimeFixture {
 
         let runtime = Runtime {
             config,
+            storage: storage.clone(),
             llm: Some(Arc::new(llm)),
             session: session.clone(),
             builtin_args: BuiltinSystemPromptArgs {
@@ -137,7 +176,7 @@ impl RuntimeFixture {
         Self {
             runtime,
             _work_dir: work_dir,
-            _share_dir: share_dir,
+            _storage_dir: storage_dir,
         }
     }
 }

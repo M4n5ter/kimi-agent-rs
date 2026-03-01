@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
-use tempfile::tempdir;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -13,6 +12,7 @@ use kosong::message::{ContentPart, Message, Role, StreamedMessagePart, TextPart}
 use kosong::{StepResult, step as kosong_step};
 
 use crate::config::ModelCapability;
+use crate::session::{Session, post_run};
 use crate::skill::flow::{Flow, FlowEdge, FlowLabel, FlowNode, FlowNodeKind, parse_choice};
 use crate::skill::{Skill, SkillType, read_skill_text};
 use crate::soul::agent::{Agent, Runtime};
@@ -25,6 +25,7 @@ use crate::soul::{
     message::{check_message, system, tool_result_to_message},
     wire_send,
 };
+use crate::storage::{SessionOrigin, SessionState};
 use crate::tools::utils::is_tool_rejected;
 use crate::utils::{SlashCommandInfo, parse_slash_command_call};
 use crate::wire::{
@@ -256,13 +257,33 @@ impl KimiSoul {
     }
 
     async fn slash_init(&self) -> anyhow::Result<()> {
-        let temp_dir = tempdir()?;
-        let tmp_path = temp_dir.path().join("context.jsonl");
-        let tmp_context = Context::new(tmp_path);
-        let tmp_soul = KimiSoul::new(self.agent.clone(), tmp_context);
-        tmp_soul
+        let tmp_session = Session::create_with_origin(
+            self.runtime.storage.clone(),
+            self.runtime.config.kaos.clone(),
+            self.runtime.session.work_dir.clone(),
+            None,
+            Some(self.runtime.session.id.clone()),
+            SessionOrigin::System {
+                reason: "slash_init".to_string(),
+            },
+        )
+        .await?;
+        let mut tmp_agent = self.agent.clone();
+        tmp_agent.runtime.storage = self.runtime.storage.clone();
+        tmp_agent.runtime.config.kaos = self.runtime.config.kaos.clone();
+        tmp_agent.runtime.session = tmp_session.clone();
+        let tmp_context = Context::new(self.runtime.storage.clone(), tmp_session.id.clone());
+        let tmp_soul = KimiSoul::new(tmp_agent, tmp_context);
+        let init_result = tmp_soul
             .run(UserInput::Text(crate::prompts::INIT.to_string()))
-            .await?;
+            .await;
+        let state = if init_result.is_ok() {
+            SessionState::Completed
+        } else {
+            SessionState::Failed
+        };
+        let _ = post_run(&tmp_session, state).await;
+        init_result?;
 
         let agents_md =
             crate::soul::agent::load_agents_md(&self.runtime.builtin_args.KIMI_WORK_DIR)

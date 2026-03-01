@@ -28,6 +28,7 @@ use crate::session::{Session, post_run as post_run_session};
 use crate::session_id::normalize_session_id;
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::{LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul};
+use crate::storage::{SessionState, Storage};
 use crate::utils::{Queue, QueueShutDown};
 use crate::wire::jsonrpc::{
     InitializeParams, JsonRpcErrorObject, JsonRpcErrorResponse, JsonRpcErrorResponseNullableId,
@@ -281,7 +282,10 @@ impl WireRpcState {
         let soul = Arc::clone(&self.soul);
         let write_queue = self.write_queue.clone();
         let pending = Arc::clone(&self.pending);
-        let wire_file = Some(self.soul.runtime().session.wire_file());
+        let wire_target = Some(crate::wire::WireRecordTarget::new(
+            self.soul.runtime().storage.clone(),
+            self.soul.runtime().session.id.clone(),
+        ));
         let mut active_turn = self.active_turn.lock().await;
         if active_turn.is_some() {
             drop(active_turn);
@@ -310,7 +314,7 @@ impl WireRpcState {
                         )
                     },
                     turn_cancel_token,
-                    wire_file,
+                    wire_target,
                 ))
             });
             let run_result = match run_handle.await {
@@ -682,6 +686,7 @@ pub struct WireWsServer {
 
 #[derive(Clone)]
 pub struct WsSessionRuntimeOptions {
+    pub storage: Storage,
     pub work_dir: KaosPath,
     pub default_session_id: String,
     pub config: Config,
@@ -781,12 +786,24 @@ impl WsServerState {
 
     async fn create_rpc(&self, session_id: &str) -> anyhow::Result<WireRpcState> {
         let options = &self.options;
-        let found_session = Session::find(options.work_dir.clone(), session_id).await;
+        let found_session = Session::find(
+            options.storage.clone(),
+            options.config.kaos.clone(),
+            options.work_dir.clone(),
+            session_id,
+        )
+        .await?;
         let created_new_session = found_session.is_none();
         let session = match found_session {
             Some(session) => session,
             None => {
-                Session::create(options.work_dir.clone(), Some(session_id.to_string()), None).await
+                Session::create(
+                    options.storage.clone(),
+                    options.config.kaos.clone(),
+                    options.work_dir.clone(),
+                    Some(session_id.to_string()),
+                )
+                .await?
             }
         };
         let rollback_session = if created_new_session {
@@ -799,6 +816,7 @@ impl WsServerState {
             session,
             CreateOptions {
                 config: Some(ConfigInput::Inline(Box::new(options.config.clone()))),
+                storage: Some(options.storage.clone()),
                 model_name: options.model_name.clone(),
                 thinking: options.thinking,
                 yolo: options.yolo,
@@ -815,7 +833,8 @@ impl WsServerState {
             Ok(cli) => cli,
             Err(err) => {
                 if let Some(rollback_session) = rollback_session
-                    && let Err(post_run_err) = post_run_session(&rollback_session).await
+                    && let Err(post_run_err) =
+                        post_run_session(&rollback_session, SessionState::Failed).await
                 {
                     warn!(
                         session_id = %session_id,
@@ -883,7 +902,7 @@ async fn ws_upgrade_handler(
             if let Some(rpc) = rpc_slot_for_failed_upgrade.lock().await.take() {
                 let session = rpc.session();
                 rpc.shutdown().await;
-                if let Err(post_run_err) = post_run_session(&session).await {
+                if let Err(post_run_err) = post_run_session(&session, SessionState::Failed).await {
                     warn!(
                         session_id = %session_id_for_failed_upgrade,
                         "Failed to finalize session metadata after failed websocket upgrade: {}",
@@ -969,7 +988,7 @@ async fn handle_ws_socket(
 
     let session = rpc.session();
     rpc.shutdown().await;
-    if let Err(err) = post_run_session(&session).await {
+    if let Err(err) = post_run_session(&session, SessionState::Completed).await {
         warn!(
             session_id = %session_id,
             "Failed to finalize session metadata after websocket close: {}",

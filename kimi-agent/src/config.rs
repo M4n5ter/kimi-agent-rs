@@ -141,6 +141,35 @@ pub struct MCPConfig {
     pub client: MCPClientConfig,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default = "default_storage_database_path")]
+    pub database_path: String,
+    #[serde(default = "default_storage_busy_timeout_ms")]
+    pub busy_timeout_ms: u64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            database_path: default_storage_database_path(),
+            busy_timeout_ms: default_storage_busy_timeout_ms(),
+        }
+    }
+}
+
+impl StorageConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.database_path.trim().is_empty() {
+            return Err(ConfigError::new("storage.database_path cannot be empty"));
+        }
+        if self.busy_timeout_ms == 0 {
+            return Err(ConfigError::new("storage.busy_timeout_ms must be >= 1"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KaosConfig {
@@ -181,11 +210,14 @@ pub struct Config {
     pub mcp: MCPConfig,
     #[serde(default)]
     pub kaos: KaosConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.loop_control.validate()?;
+        self.storage.validate()?;
         if !self.default_model.is_empty() && !self.models.contains_key(&self.default_model) {
             return Err(ConfigError::new(format!(
                 "Default model {} not found in models",
@@ -224,6 +256,7 @@ pub fn get_default_config() -> Config {
         services: Services::default(),
         mcp: MCPConfig::default(),
         kaos: KaosConfig::default(),
+        storage: StorageConfig::default(),
     }
 }
 
@@ -439,4 +472,12 @@ fn default_reserved_context_size() -> i64 {
 
 fn default_mcp_tool_timeout() -> i64 {
     60_000
+}
+
+fn default_storage_database_path() -> String {
+    get_share_dir().join("state.db").display().to_string()
+}
+
+const fn default_storage_busy_timeout_ms() -> u64 {
+    5_000
 }

@@ -17,12 +17,14 @@ use tokio::net::TcpListener;
 use tokio::time::timeout;
 use url::Url;
 
+use crate::config::Config;
 use crate::mcp::{
-    ensure_mcp_servers, get_global_mcp_config_file, get_mcp_credential_store, has_oauth_tokens,
-    load_mcp_config_file, load_mcp_config_string, save_mcp_config,
+    ensure_mcp_servers, get_mcp_credential_store, has_oauth_tokens, load_mcp_config_string,
+    load_persisted_mcp_config, save_persisted_mcp_config,
 };
 use crate::mcp_http_proxy::KaosHttpProxyHandle;
 use crate::soul::toolset::{McpConnectionContext, list_mcp_tools, parse_mcp_config};
+use crate::storage::Storage;
 
 #[derive(Args, Debug)]
 #[command(about = "Manage MCP server configurations.")]
@@ -120,19 +122,20 @@ pub struct McpTestArgs {
     pub name: String,
 }
 
-pub async fn run_mcp_command(args: McpArgs) -> Result<()> {
+pub async fn run_mcp_command(args: McpArgs, config: &Config) -> Result<()> {
+    let storage = Storage::open(&config.storage).await?;
     match args.command {
-        McpCommand::Add(args) => mcp_add(args).await,
-        McpCommand::Remove(args) => mcp_remove(args).await,
-        McpCommand::List => mcp_list().await,
-        McpCommand::Auth(args) => mcp_auth(args).await,
-        McpCommand::ResetAuth(args) => mcp_reset_auth(args).await,
-        McpCommand::Test(args) => mcp_test(args).await,
+        McpCommand::Add(args) => mcp_add(&storage, config, args).await,
+        McpCommand::Remove(args) => mcp_remove(&storage, config, args).await,
+        McpCommand::List => mcp_list(&storage, config).await,
+        McpCommand::Auth(args) => mcp_auth(&storage, config, args).await,
+        McpCommand::ResetAuth(args) => mcp_reset_auth(&storage, config, args).await,
+        McpCommand::Test(args) => mcp_test(&storage, config, args).await,
     }
 }
 
-async fn mcp_add(args: McpAddArgs) -> Result<()> {
-    let mut config = load_mcp_config_for_edit().await?;
+async fn mcp_add(storage: &Storage, runtime_config: &Config, args: McpAddArgs) -> Result<()> {
+    let mut config = load_mcp_config_for_edit(storage, runtime_config).await?;
     let servers = ensure_mcp_servers(&mut config)?;
 
     match args.transport.as_str() {
@@ -194,39 +197,36 @@ async fn mcp_add(args: McpAddArgs) -> Result<()> {
         }
     }
 
-    save_mcp_config(&config).await?;
-    let config_file = get_global_mcp_config_file().await;
+    save_persisted_mcp_config(storage, &runtime_config.kaos, &config).await?;
     println!(
-        "Added MCP server '{}' to {}.",
+        "Added MCP server '{}' to SQLite storage at {}.",
         args.name,
-        config_file.to_string_lossy()
+        storage.database_path().display()
     );
     Ok(())
 }
 
-async fn mcp_remove(args: McpRemoveArgs) -> Result<()> {
-    let mut config = load_mcp_config_for_edit().await?;
+async fn mcp_remove(storage: &Storage, runtime_config: &Config, args: McpRemoveArgs) -> Result<()> {
+    let mut config = load_mcp_config_for_edit(storage, runtime_config).await?;
     let servers = ensure_mcp_servers(&mut config)?;
     if !servers.contains_key(&args.name) {
         anyhow::bail!("MCP server '{}' not found.", args.name);
     }
     servers.remove(&args.name);
-    save_mcp_config(&config).await?;
-    let config_file = get_global_mcp_config_file().await;
+    save_persisted_mcp_config(storage, &runtime_config.kaos, &config).await?;
     println!(
-        "Removed MCP server '{}' from {}.",
+        "Removed MCP server '{}' from SQLite storage at {}.",
         args.name,
-        config_file.to_string_lossy()
+        storage.database_path().display()
     );
     Ok(())
 }
 
-async fn mcp_list() -> Result<()> {
-    let config_file = get_global_mcp_config_file().await;
-    let mut config = load_mcp_config_for_edit().await?;
+async fn mcp_list(storage: &Storage, runtime_config: &Config) -> Result<()> {
+    let mut config = load_mcp_config_for_edit(storage, runtime_config).await?;
     let servers = ensure_mcp_servers(&mut config)?;
 
-    println!("MCP config file: {}", config_file.to_string_lossy());
+    println!("MCP storage: {}", storage.database_path().display());
     if servers.is_empty() {
         println!("No MCP servers configured.");
         return Ok(());
@@ -237,7 +237,7 @@ async fn mcp_list() -> Result<()> {
         if server.get("auth").and_then(Value::as_str) == Some("oauth")
             && let Some(url) = server.get("url").and_then(Value::as_str)
         {
-            auth_required = !has_oauth_tokens(url).await?;
+            auth_required = !has_oauth_tokens(storage, &runtime_config.kaos, url).await?;
         }
         let line = describe_mcp_server(name, server, auth_required);
         println!("  {line}");
@@ -245,8 +245,8 @@ async fn mcp_list() -> Result<()> {
     Ok(())
 }
 
-async fn mcp_auth(args: McpAuthArgs) -> Result<()> {
-    let mut config = load_mcp_config_for_edit().await?;
+async fn mcp_auth(storage: &Storage, runtime_config: &Config, args: McpAuthArgs) -> Result<()> {
+    let mut config = load_mcp_config_for_edit(storage, runtime_config).await?;
     let servers = ensure_mcp_servers(&mut config)?;
     let server = servers.get(&args.name).cloned();
     let Some(server) = server else {
@@ -277,7 +277,7 @@ async fn mcp_auth(args: McpAuthArgs) -> Result<()> {
         .context("Failed to read callback address")?;
     let redirect_uri = format!("http://{addr}/callback");
 
-    let credential_store = get_mcp_credential_store(&url).await;
+    let credential_store = get_mcp_credential_store(storage, &runtime_config.kaos, &url);
     let state_store = InMemoryStateStore::new();
     let (http_client, mut proxy) = build_oauth_http_client().await?;
     let mut manager = AuthorizationManager::new(&url).await?;
@@ -324,9 +324,16 @@ async fn mcp_auth(args: McpAuthArgs) -> Result<()> {
         let server_config = parsed
             .get(&args.name)
             .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found.", args.name))?;
-        let tools = list_mcp_tools(server_config, &McpConnectionContext::current())
-            .await
-            .map_err(|err| anyhow::anyhow!("Failed to list MCP tools: {err}"))?;
+        let tools = list_mcp_tools(
+            server_config,
+            &McpConnectionContext::new(
+                KaosPath::cwd(),
+                storage.clone(),
+                runtime_config.kaos.clone(),
+            ),
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to list MCP tools: {err}"))?;
         println!("Available tools: {}", tools.len());
         Ok::<(), anyhow::Error>(())
     }
@@ -339,8 +346,12 @@ async fn mcp_auth(args: McpAuthArgs) -> Result<()> {
     result
 }
 
-async fn mcp_reset_auth(args: McpResetAuthArgs) -> Result<()> {
-    let mut config = load_mcp_config_for_edit().await?;
+async fn mcp_reset_auth(
+    storage: &Storage,
+    runtime_config: &Config,
+    args: McpResetAuthArgs,
+) -> Result<()> {
+    let mut config = load_mcp_config_for_edit(storage, runtime_config).await?;
     let servers = ensure_mcp_servers(&mut config)?;
     let server = servers.get(&args.name);
     let Some(server) = server else {
@@ -353,13 +364,15 @@ async fn mcp_reset_auth(args: McpResetAuthArgs) -> Result<()> {
         .get("url")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("MCP server '{}' is missing url.", args.name))?;
-    get_mcp_credential_store(url).await.clear().await?;
+    get_mcp_credential_store(storage, &runtime_config.kaos, url)
+        .clear()
+        .await?;
     println!("OAuth tokens cleared for '{}'.", args.name);
     Ok(())
 }
 
-async fn mcp_test(args: McpTestArgs) -> Result<()> {
-    let mut config = load_mcp_config_for_edit().await?;
+async fn mcp_test(storage: &Storage, runtime_config: &Config, args: McpTestArgs) -> Result<()> {
+    let mut config = load_mcp_config_for_edit(storage, runtime_config).await?;
     let servers = ensure_mcp_servers(&mut config)?;
     if !servers.contains_key(&args.name) {
         anyhow::bail!("MCP server '{}' not found.", args.name);
@@ -372,9 +385,16 @@ async fn mcp_test(args: McpTestArgs) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found.", args.name))?;
 
     println!("Testing connection to '{}'...", args.name);
-    let tools = list_mcp_tools(server_config, &McpConnectionContext::current())
-        .await
-        .map_err(|err| anyhow::anyhow!("✗ Connection failed: {err}"))?;
+    let tools = list_mcp_tools(
+        server_config,
+        &McpConnectionContext::new(
+            KaosPath::cwd(),
+            storage.clone(),
+            runtime_config.kaos.clone(),
+        ),
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("✗ Connection failed: {err}"))?;
 
     println!("✓ Connected to '{}'", args.name);
     println!("  Available tools: {}", tools.len());
@@ -443,18 +463,20 @@ fn describe_mcp_server(name: &str, server: &Value, auth_required: bool) -> Strin
     format!("{name}: {server}")
 }
 
-pub async fn load_mcp_configs(files: &[PathBuf], raw: &[String]) -> Result<Vec<Value>> {
+pub async fn load_mcp_configs(
+    storage: &Storage,
+    runtime_config: &Config,
+    files: &[PathBuf],
+    raw: &[String],
+) -> Result<Vec<Value>> {
     let mut configs = Vec::new();
-    let mut file_configs = files
+    let file_configs = files
         .iter()
         .map(AsKaosPath::as_kaos_path)
         .collect::<Vec<_>>();
 
     if file_configs.is_empty() && raw.is_empty() {
-        let default_path = get_global_mcp_config_file().await;
-        if default_path.exists(true).await {
-            file_configs.push(default_path);
-        }
+        configs.push(load_persisted_mcp_config(storage, &runtime_config.kaos).await?);
     }
 
     for path in file_configs {
@@ -485,17 +507,10 @@ pub async fn load_mcp_configs(files: &[PathBuf], raw: &[String]) -> Result<Vec<V
     Ok(configs)
 }
 
-async fn load_mcp_config_for_edit() -> Result<Value> {
-    let path = get_global_mcp_config_file().await;
-    if !path.exists(true).await {
-        return Ok(json!({"mcpServers": {}}));
-    }
-    let mut value = load_mcp_config_file(&path).await.map_err(|err| {
-        anyhow::anyhow!(
-            "Invalid JSON in MCP config file '{}': {err}",
-            path.to_string_lossy()
-        )
-    })?;
+async fn load_mcp_config_for_edit(storage: &Storage, runtime_config: &Config) -> Result<Value> {
+    let mut value = load_persisted_mcp_config(storage, &runtime_config.kaos)
+        .await
+        .map_err(|err| anyhow::anyhow!("Invalid MCP config in SQLite storage: {err}"))?;
     ensure_mcp_servers(&mut value)?;
     Ok(value)
 }

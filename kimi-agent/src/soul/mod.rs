@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 
 use crate::config::ModelCapability;
 use crate::utils::{QueueShutDown, SlashCommandInfo};
-use crate::wire::{UserInput, Wire, WireFile, WireMessage};
+use crate::wire::{UserInput, Wire, WireMessage, WireRecordTarget};
 
 pub mod agent;
 pub mod approval;
@@ -97,14 +97,14 @@ pub async fn run_soul<S, F, Fut>(
     user_input: UserInput,
     ui_loop_fn: F,
     cancel_token: CancellationToken,
-    wire_file: Option<WireFile>,
+    wire_target: Option<WireRecordTarget>,
 ) -> anyhow::Result<()>
 where
     S: Soul + ?Sized,
     F: Fn(Arc<Wire>) -> Fut + Send + Sync,
     Fut: Future<Output = UILoopResult> + Send + 'static,
 {
-    let wire = Arc::new(Wire::new(wire_file));
+    let wire = Arc::new(Wire::new(wire_target));
 
     debug!(
         "Starting UI loop with function: {:?}",
