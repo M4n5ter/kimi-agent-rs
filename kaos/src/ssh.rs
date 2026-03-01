@@ -21,9 +21,9 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use typed_path::Utf8TypedPathBuf;
 
 use crate::{
-    AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosPath, KaosPathStyle, KaosPlatform,
-    KaosProcess, LineStream, ProcessOutputOverflow, StatResult, StrOrKaosPath,
-    line_stream::line_stream_from_async_read,
+    AsyncReadWrite, AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosFileError,
+    KaosFileErrorKind, KaosPath, KaosPathStyle, KaosPlatform, KaosProcess, LineStream,
+    ProcessOutputOverflow, StatResult, StrOrKaosPath, line_stream::line_stream_from_async_read,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -205,15 +205,28 @@ impl SshKaos {
 
             let home = KaosPath::from_style(
                 KaosPathStyle::Posix,
-                sftp.canonicalize(".").await.map_err(sftp_error)?,
+                sftp.canonicalize(".").await.map_err(|err| {
+                    sftp_error(
+                        &KaosPath::from_style(KaosPathStyle::Posix, "."),
+                        "canonicalize",
+                        err,
+                    )
+                })?,
             );
             let cwd = if let Some(cwd) = options.cwd.as_deref() {
                 let resolved = resolve_absolute_posix(&home, cwd);
-                let canonical = sftp.canonicalize(resolved).await.map_err(sftp_error)?;
-                let attrs = sftp
-                    .metadata(canonical.as_str())
+                let requested_cwd = KaosPath::from_style(KaosPathStyle::Posix, &resolved);
+                let canonical = sftp
+                    .canonicalize(&resolved)
                     .await
-                    .map_err(sftp_error)?;
+                    .map_err(|err| sftp_error(&requested_cwd, "canonicalize", err))?;
+                let attrs = sftp.metadata(canonical.as_str()).await.map_err(|err| {
+                    sftp_error(
+                        &KaosPath::from_style(KaosPathStyle::Posix, canonical.as_str()),
+                        "stat",
+                        err,
+                    )
+                })?;
                 if !attrs.is_dir() {
                     bail!("Configured SSH cwd is not a directory: {canonical}");
                 }
@@ -317,13 +330,19 @@ impl Kaos for SshKaos {
             .sftp
             .canonicalize(resolved.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "canonicalize", err))?;
         let attrs = self
             .state
             .sftp
             .metadata(canonical.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| {
+                sftp_error(
+                    &KaosPath::from_style(KaosPathStyle::Posix, canonical.as_str()),
+                    "stat",
+                    err,
+                )
+            })?;
         if !attrs.is_dir() {
             bail!("Not a directory: {}", canonical);
         }
@@ -343,13 +362,13 @@ impl Kaos for SshKaos {
                 .sftp
                 .metadata(resolved.as_str())
                 .await
-                .map_err(sftp_error)?
+                .map_err(|err| sftp_error(&resolved, "stat", err))?
         } else {
             self.state
                 .sftp
                 .symlink_metadata(resolved.as_str())
                 .await
-                .map_err(sftp_error)?
+                .map_err(|err| sftp_error(&resolved, "stat", err))?
         };
 
         let st_mode = attrs.permissions.unwrap_or(0);
@@ -375,7 +394,7 @@ impl Kaos for SshKaos {
             .sftp
             .read_dir(resolved.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "read directory", err))?;
         for entry in dir {
             let full = resolved.joinpath(&entry.file_name());
             entries.push(full);
@@ -411,7 +430,7 @@ impl Kaos for SshKaos {
                 .sftp
                 .read_dir(dir.as_str())
                 .await
-                .map_err(sftp_error)?;
+                .map_err(|err| sftp_error(&dir, "read directory", err))?;
 
             for entry in entries {
                 let name = entry.file_name();
@@ -447,7 +466,7 @@ impl Kaos for SshKaos {
             .sftp
             .read(resolved.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "read bytes", err))?;
         if let Some(n) = limit {
             data.truncate(n);
         }
@@ -475,7 +494,7 @@ impl Kaos for SshKaos {
             .sftp
             .open(resolved.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "open text stream", err))?;
         Ok(line_stream_from_async_read(file))
     }
 
@@ -489,7 +508,7 @@ impl Kaos for SshKaos {
                 OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
             )
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "write bytes", err))?;
         file.write_all(data).await?;
         file.shutdown().await?;
         Ok(data.len())
@@ -507,7 +526,7 @@ impl Kaos for SshKaos {
             .sftp
             .open_with_flags(resolved.as_str(), flags)
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "write text", err))?;
         file.write_all(data.as_bytes()).await?;
         file.shutdown().await?;
         Ok(data.len())
@@ -520,14 +539,14 @@ impl Kaos for SshKaos {
             .sftp
             .metadata(resolved.as_str())
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "stat", err))?;
         let file_type_bits = attrs.permissions.unwrap_or(0) & 0o170000;
         attrs.permissions = Some(file_type_bits | (mode & 0o7777));
         self.state
             .sftp
             .set_metadata(resolved.as_str(), attrs)
             .await
-            .map_err(sftp_error)?;
+            .map_err(|err| sftp_error(&resolved, "chmod", err))?;
         Ok(())
     }
 
@@ -583,13 +602,16 @@ impl Kaos for SshKaos {
         if args.is_empty() {
             bail!("missing command");
         }
+        let ExecOptions { cwd, env_overrides } = options;
 
         let quoted = args
             .iter()
             .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" ");
-        let cwd = self.cwd();
+        let cwd = cwd
+            .map(|path| self.resolve_path(&path))
+            .unwrap_or_else(|| self.cwd());
         let command = format!("cd {} && {}", shell_quote(cwd.as_str()), quoted);
 
         let handle = self.state.handle.lock().await;
@@ -602,7 +624,7 @@ impl Kaos for SshKaos {
         // variable names unless they are explicitly whitelisted via AcceptEnv in
         // sshd_config. Callers should treat env_overrides on SSH as backend-
         // dependent rather than universally portable.
-        for (key, value) in &options.env_overrides {
+        for (key, value) in &env_overrides {
             validate_env_var_key(key)?;
             write_half.set_env(true, key, value).await?;
             await_channel_request_reply(
@@ -679,6 +701,14 @@ impl Kaos for SshKaos {
             overflow_state,
             write_half,
         }))
+    }
+
+    async fn connect_tcp(&self, host: &str, port: u16) -> Result<Box<dyn AsyncReadWrite>> {
+        let handle = self.state.handle.lock().await;
+        let channel = handle
+            .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", 0)
+            .await?;
+        Ok(Box::new(channel.into_stream()))
     }
 }
 
@@ -1142,7 +1172,11 @@ async fn exec_capture_raw(
 ) -> Result<(i32, String, String)> {
     let mut channel = handle.channel_open_session().await?;
     channel.exec(true, command).await?;
-    map_channel_request_reply("execute remote command", channel.wait().await)?;
+    loop {
+        if map_channel_request_reply("execute remote command", channel.wait().await)?.is_some() {
+            break;
+        }
+    }
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -1169,12 +1203,19 @@ async fn await_channel_request_reply(
     read_half: &mut russh::ChannelReadHalf,
     request_label: &str,
 ) -> Result<()> {
-    map_channel_request_reply(request_label, read_half.wait().await)
+    loop {
+        if map_channel_request_reply(request_label, read_half.wait().await)?.is_some() {
+            return Ok(());
+        }
+    }
 }
 
-fn map_channel_request_reply(request_label: &str, message: Option<ChannelMsg>) -> Result<()> {
+fn map_channel_request_reply(
+    request_label: &str,
+    message: Option<ChannelMsg>,
+) -> Result<Option<()>> {
     match message {
-        Some(ChannelMsg::Success) => Ok(()),
+        Some(ChannelMsg::Success) => Ok(Some(())),
         Some(ChannelMsg::Failure) => {
             bail!("SSH server rejected request to {request_label}")
         }
@@ -1184,6 +1225,10 @@ fn map_channel_request_reply(request_label: &str, message: Option<ChannelMsg>) -
         Some(ChannelMsg::Close) | Some(ChannelMsg::Eof) | None => {
             bail!("SSH channel closed while waiting to {request_label}")
         }
+        // OpenSSH can send window-size updates before the reply to an exec/env
+        // request. Those are transport-level flow-control events, not an
+        // answer to the request we are waiting on, so keep polling.
+        Some(ChannelMsg::WindowAdjusted { .. }) => Ok(None),
         Some(other) => bail!(
             "Unexpected SSH channel message while waiting to {request_label}: {}",
             channel_message_name(&other)
@@ -1246,10 +1291,18 @@ async fn mkdir_once(sftp: &SftpSession, path: &str, exist_ok: bool) -> Result<()
             match sftp.metadata(path).await {
                 Ok(attrs) if attrs.is_dir() => Ok(()),
                 Ok(_) => bail!("Path exists but is not a directory: {path}"),
-                Err(err) => Err(sftp_error(err)),
+                Err(err) => Err(sftp_error(
+                    &KaosPath::from_style(KaosPathStyle::Posix, path),
+                    "stat",
+                    err,
+                )),
             }
         }
-        Err(err) => Err(sftp_error(err)),
+        Err(err) => Err(sftp_error(
+            &KaosPath::from_style(KaosPathStyle::Posix, path),
+            "create directory",
+            err,
+        )),
     }
 }
 
@@ -1329,8 +1382,25 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r#"'"'"'"#))
 }
 
-fn sftp_error(err: SftpError) -> anyhow::Error {
-    anyhow!("SFTP error: {err}")
+fn sftp_error(path: &KaosPath, operation: &'static str, err: SftpError) -> anyhow::Error {
+    KaosFileError::new(
+        path,
+        operation,
+        classify_sftp_error_kind(&err),
+        format!("SFTP error: {err}"),
+    )
+    .into()
+}
+
+fn classify_sftp_error_kind(err: &SftpError) -> KaosFileErrorKind {
+    match err {
+        SftpError::Status(status) => match status.status_code {
+            StatusCode::NoSuchFile => KaosFileErrorKind::NotFound,
+            StatusCode::PermissionDenied => KaosFileErrorKind::PermissionDenied,
+            _ => KaosFileErrorKind::Other,
+        },
+        _ => KaosFileErrorKind::Other,
+    }
 }
 
 fn expand_home(path: impl AsRef<str>) -> PathBuf {
@@ -1405,11 +1475,13 @@ fn build_storage_name(host: &str, port: u16, username: &str) -> String {
 mod tests {
     use super::{
         GlobTraversalPlan, SSH_ENV_VAR_UNSET_EXIT_CODE, build_storage_name,
-        map_channel_request_reply, map_env_var_lookup_result, normalize_glob_pattern,
-        resolve_absolute_posix, validate_env_var_key,
+        classify_sftp_error_kind, map_channel_request_reply, map_env_var_lookup_result,
+        normalize_glob_pattern, resolve_absolute_posix, validate_env_var_key,
     };
-    use crate::{KaosPath, KaosPathStyle};
+    use crate::{KaosFileErrorKind, KaosPath, KaosPathStyle};
     use russh::{ChannelMsg, ChannelOpenFailure};
+    use russh_sftp::client::error::Error as SftpError;
+    use russh_sftp::protocol::{Status, StatusCode};
 
     #[test]
     fn storage_name_is_deterministic() {
@@ -1516,9 +1588,31 @@ mod tests {
     }
 
     #[test]
+    fn classify_sftp_error_kind_recognizes_not_found() {
+        let err = SftpError::Status(Status {
+            id: 1,
+            status_code: StatusCode::NoSuchFile,
+            error_message: "missing".to_string(),
+            language_tag: String::new(),
+        });
+        assert_eq!(classify_sftp_error_kind(&err), KaosFileErrorKind::NotFound);
+    }
+
+    #[test]
     fn map_channel_request_reply_accepts_success() {
-        map_channel_request_reply("execute remote command", Some(ChannelMsg::Success))
+        let result = map_channel_request_reply("execute remote command", Some(ChannelMsg::Success))
             .expect("success");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn map_channel_request_reply_ignores_window_adjusted() {
+        let result = map_channel_request_reply(
+            "execute remote command",
+            Some(ChannelMsg::WindowAdjusted { new_size: 1024 }),
+        )
+        .expect("window adjusted");
+        assert!(result.is_none());
     }
 
     #[test]

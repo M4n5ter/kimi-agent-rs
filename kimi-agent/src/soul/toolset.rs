@@ -1,22 +1,22 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::FutureExt;
+use kaos::{ExecOptions, KaosPath};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, ClientInfo, Implementation,
 };
 use rmcp::service::{PeerRequestOptions, RunningService, ServiceError};
+use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::auth::{AuthClient, AuthorizationManager};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::{RoleClient, ServiceExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
 use kosong::message::ToolCall;
@@ -28,6 +28,8 @@ use kosong::tooling::{CallableTool, Tool, ToolResult, ToolResultFuture, ToolRetu
 use crate::constant::{NAME, VERSION};
 use crate::exception::{InvalidToolError, MCPConfigError, MCPRuntimeError};
 use crate::mcp::{get_mcp_credential_store, has_oauth_tokens};
+use crate::mcp_http_proxy::KaosHttpProxyHandle;
+use crate::mcp_transport::KaosChildProcessTransport;
 use crate::soul::agent::Runtime;
 use crate::soul::get_current_wire_or_none;
 use crate::tools::utils::tool_rejected_error;
@@ -292,6 +294,11 @@ impl KimiToolset {
             if let Some(client) = info.client.take() {
                 let mut service = client.service.lock().await;
                 let _ = service.close().await;
+                drop(service);
+                if let Some(proxy) = client.proxy {
+                    let mut proxy = proxy.lock().await;
+                    let _ = proxy.close().await;
+                }
             }
         }
 
@@ -498,6 +505,7 @@ pub enum McpServerStatus {
 struct McpClientHandle {
     peer: rmcp::Peer<RoleClient>,
     service: Arc<tokio::sync::Mutex<RunningService<RoleClient, ClientInfo>>>,
+    proxy: Option<Arc<tokio::sync::Mutex<KaosHttpProxyHandle>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -535,6 +543,25 @@ pub enum McpServerConfig {
 }
 
 pub type McpToolSpec = rmcp::model::Tool;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpConnectionContext {
+    pub cwd: KaosPath,
+}
+
+impl McpConnectionContext {
+    pub fn from_runtime(runtime: &Runtime) -> Self {
+        Self {
+            cwd: runtime.session.work_dir.clone(),
+        }
+    }
+
+    pub fn current() -> Self {
+        Self {
+            cwd: KaosPath::cwd(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct StdioServerConfig {
@@ -641,37 +668,46 @@ impl std::fmt::Display for McpClientError {
     }
 }
 
-async fn connect_mcp_client(config: &McpServerConfig) -> Result<McpClientHandle, McpClientError> {
-    let service = match config {
+async fn connect_mcp_client(
+    config: &McpServerConfig,
+    context: &McpConnectionContext,
+) -> Result<McpClientHandle, McpClientError> {
+    let (service, proxy) = match config {
         McpServerConfig::Stdio(server) => {
-            let command = Command::new(&server.command).configure(|cmd| {
-                cmd.args(&server.args);
-                if let Some(env) = &server.env {
-                    cmd.envs(env);
-                }
-            });
-            let transport = TokioChildProcess::new(command).map_err(|err| {
-                McpClientError::Other(format!("Failed to spawn MCP server: {err}"))
+            let mut args = vec![server.command.clone()];
+            args.extend(server.args.clone());
+            let env_overrides: BTreeMap<String, String> =
+                server.env.clone().unwrap_or_default().into_iter().collect();
+            let process = kaos::exec_with_options(
+                &args,
+                ExecOptions {
+                    cwd: Some(context.cwd.clone()),
+                    env_overrides,
+                },
+            )
+            .await
+            .map_err(|err| McpClientError::Other(format!("Failed to spawn MCP server: {err}")))?;
+            let transport = KaosChildProcessTransport::new(process).map_err(|err| {
+                McpClientError::Other(format!("Failed to prepare MCP transport: {err}"))
             })?;
-            build_client_info().serve(transport).await.map_err(|err| {
+            let service = build_client_info().serve(transport).await.map_err(|err| {
                 McpClientError::Other(format!("Failed to connect MCP server: {err}"))
-            })?
+            })?;
+            (service, None)
         }
         McpServerConfig::Http(server) => {
             normalize_http_transport(&server.transport).map_err(McpClientError::Other)?;
             let headers = build_default_headers(&server.headers).map_err(McpClientError::Other)?;
-            let client = reqwest::Client::builder()
-                .default_headers(headers)
-                .build()
-                .map_err(|err| {
-                    McpClientError::Other(format!("Failed to build HTTP client: {err}"))
-                })?;
+            let (client, proxy) = build_http_client(headers).await?;
 
             if server.auth.as_deref() == Some("oauth") {
                 let mut manager = AuthorizationManager::new(&server.url)
                     .await
                     .map_err(|err| McpClientError::Other(format!("OAuth init failed: {err}")))?;
-                manager.set_credential_store(get_mcp_credential_store(&server.url));
+                manager
+                    .with_client(client.clone())
+                    .map_err(|err| McpClientError::Other(format!("OAuth init failed: {err}")))?;
+                manager.set_credential_store(get_mcp_credential_store(&server.url).await);
                 let has_tokens = manager
                     .initialize_from_store()
                     .await
@@ -686,17 +722,19 @@ async fn connect_mcp_client(config: &McpServerConfig) -> Result<McpClientHandle,
                     auth_client,
                     StreamableHttpClientTransportConfig::with_uri(server.url.clone()),
                 );
-                build_client_info().serve(transport).await.map_err(|err| {
+                let service = build_client_info().serve(transport).await.map_err(|err| {
                     McpClientError::Other(format!("Failed to connect MCP server: {err}"))
-                })?
+                })?;
+                (service, proxy)
             } else {
                 let transport = StreamableHttpClientTransport::with_client(
                     client,
                     StreamableHttpClientTransportConfig::with_uri(server.url.clone()),
                 );
-                build_client_info().serve(transport).await.map_err(|err| {
+                let service = build_client_info().serve(transport).await.map_err(|err| {
                     McpClientError::Other(format!("Failed to connect MCP server: {err}"))
-                })?
+                })?;
+                (service, proxy)
             }
         }
     };
@@ -705,6 +743,7 @@ async fn connect_mcp_client(config: &McpServerConfig) -> Result<McpClientHandle,
     Ok(McpClientHandle {
         peer,
         service: Arc::new(tokio::sync::Mutex::new(service)),
+        proxy,
     })
 }
 
@@ -725,8 +764,9 @@ async fn connect_mcp_server(
         info.status = McpServerStatus::Connecting;
         info.config.clone()
     };
+    let connection_context = McpConnectionContext::from_runtime(runtime);
 
-    let client = match connect_mcp_client(&config).await {
+    let client = match connect_mcp_client(&config, &connection_context).await {
         Ok(client) => client,
         Err(McpClientError::Unauthorized(message)) => {
             let mut guard = toolset.lock().await;
@@ -816,8 +856,11 @@ async fn connect_mcp_server(
     Ok(())
 }
 
-pub async fn list_mcp_tools(config: &McpServerConfig) -> Result<Vec<McpToolSpec>, String> {
-    let client = connect_mcp_client(config)
+pub async fn list_mcp_tools(
+    config: &McpServerConfig,
+    context: &McpConnectionContext,
+) -> Result<Vec<McpToolSpec>, String> {
+    let client = connect_mcp_client(config, context)
         .await
         .map_err(|err| err.to_string())?;
     let tools = client
@@ -827,7 +870,45 @@ pub async fn list_mcp_tools(config: &McpServerConfig) -> Result<Vec<McpToolSpec>
         .map_err(|err| err.to_string())?;
     let mut service = client.service.lock().await;
     let _ = service.close().await;
+    drop(service);
+    if let Some(proxy) = client.proxy {
+        let mut proxy = proxy.lock().await;
+        let _ = proxy.close().await;
+    }
     Ok(tools)
+}
+
+async fn build_http_client(
+    headers: HeaderMap,
+) -> Result<
+    (
+        reqwest::Client,
+        Option<Arc<tokio::sync::Mutex<KaosHttpProxyHandle>>>,
+    ),
+    McpClientError,
+> {
+    let mut builder = reqwest::Client::builder().default_headers(headers);
+
+    if kaos::get_current_kaos().name() == "local" {
+        let client = builder
+            .build()
+            .map_err(|err| McpClientError::Other(format!("Failed to build HTTP client: {err}")))?;
+        return Ok((client, None));
+    }
+
+    let proxy = KaosHttpProxyHandle::bind(kaos::get_current_kaos())
+        .await
+        .map_err(|err| McpClientError::Other(format!("Failed to start HTTP proxy: {err}")))?;
+    let proxy_url = proxy.proxy_url();
+    builder = builder
+        .proxy(reqwest::Proxy::all(&proxy_url).map_err(|err| {
+            McpClientError::Other(format!("Failed to configure HTTP proxy: {err}"))
+        })?)
+        .pool_max_idle_per_host(0);
+    let client = builder
+        .build()
+        .map_err(|err| McpClientError::Other(format!("Failed to build HTTP client: {err}")))?;
+    Ok((client, Some(Arc::new(tokio::sync::Mutex::new(proxy)))))
 }
 
 fn convert_mcp_tool_result(result: CallToolResult) -> ToolReturnValue {

@@ -234,6 +234,17 @@ pub async fn run() -> Result<()> {
     }
 
     init_logging(cli.debug).await?;
+    validate_cli_args(&cli).await?;
+
+    let mcp_runtime_config = if cli
+        .command
+        .as_ref()
+        .is_some_and(|command| matches!(command, Commands::Mcp(_)))
+    {
+        Some(load_effective_config(&cli).await?)
+    } else {
+        None
+    };
 
     if let Some(command) = cli.command {
         return match command {
@@ -241,11 +252,13 @@ pub async fn run() -> Result<()> {
                 info::run_info_command(args);
                 Ok(())
             }
-            Commands::Mcp(args) => mcp::run_mcp_command(args).await,
+            Commands::Mcp(args) => {
+                let config = mcp_runtime_config.expect("mcp config should be preloaded");
+                let _kaos_guard = init_current_kaos(&config).await?;
+                mcp::run_mcp_command(args).await
+            }
         };
     }
-
-    validate_cli_args(&cli).await?;
 
     let config = load_effective_config(&cli).await?;
     let _kaos_guard = init_current_kaos(&config).await?;
@@ -427,10 +440,6 @@ async fn validate_cli_args(cli: &Cli) -> Result<()> {
 
     if let Some(agent_file) = cli.agent_file.as_ref() {
         ensure_file_exists(agent_file, "agent file").await?;
-    }
-
-    for path in cli.mcp_config_file.iter() {
-        ensure_file_exists(path, "MCP config file").await?;
     }
 
     if let Some(max_steps) = cli.max_steps_per_turn

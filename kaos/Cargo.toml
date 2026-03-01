@@ -14,6 +14,7 @@ russh = "0.57"
 russh-sftp = "2.1"
 serde.workspace = true
 sha2 = "0.10"
+thiserror.workspace = true
 tokio.workspace = true
 typed-path = "0.12"
 

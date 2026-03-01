@@ -19,3 +19,5 @@ pub mod wire;
 pub mod app;
 pub mod cli;
 pub mod mcp;
+pub mod mcp_http_proxy;
+pub mod mcp_transport;

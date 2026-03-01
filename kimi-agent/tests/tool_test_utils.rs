@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use kaos::{
-    CurrentKaosToken, ExecOptions, Kaos, KaosPath, LocalKaos, get_current_kaos, reset_current_kaos,
-    set_current_kaos,
+    AsyncReadWrite, CurrentKaosToken, ExecOptions, Kaos, KaosPath, LocalKaos, get_current_kaos,
+    reset_current_kaos, set_current_kaos,
 };
 use kimi_agent::config::{
     ModelCapability, MoonshotFetchConfig, MoonshotSearchConfig, get_default_config,
@@ -251,9 +251,13 @@ impl Kaos for TestKaos {
     async fn exec(
         &self,
         args: &[String],
-        _options: ExecOptions,
+        options: ExecOptions,
     ) -> anyhow::Result<Box<dyn kaos::KaosProcess>> {
-        self.inner.exec(args, ExecOptions::default()).await
+        self.inner.exec(args, options).await
+    }
+
+    async fn connect_tcp(&self, host: &str, port: u16) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        self.inner.connect_tcp(host, port).await
     }
 }
 

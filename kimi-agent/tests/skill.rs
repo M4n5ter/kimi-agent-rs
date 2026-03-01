@@ -5,8 +5,8 @@ use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
 
 use kaos::{
-    CurrentKaosToken, ExecOptions, Kaos, KaosPath, KaosProcess, LineStream, LocalKaos,
-    StrOrKaosPath, reset_current_kaos, set_current_kaos, with_current_kaos_scope,
+    AsyncReadWrite, CurrentKaosToken, ExecOptions, Kaos, KaosPath, KaosProcess, LineStream,
+    LocalKaos, StrOrKaosPath, reset_current_kaos, set_current_kaos, with_current_kaos_scope,
 };
 use kimi_agent::config::get_default_config;
 use kimi_agent::metadata::WorkDirMeta;
@@ -219,9 +219,13 @@ impl Kaos for ScopedKaos {
     async fn exec(
         &self,
         args: &[String],
-        _options: ExecOptions,
+        options: ExecOptions,
     ) -> anyhow::Result<Box<dyn KaosProcess>> {
-        self.inner.exec(args, ExecOptions::default()).await
+        self.inner.exec(args, options).await
+    }
+
+    async fn connect_tcp(&self, host: &str, port: u16) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        self.inner.connect_tcp(host, port).await
     }
 }
 

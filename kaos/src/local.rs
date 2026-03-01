@@ -3,11 +3,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 
 use crate::{
-    AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosPath, KaosPlatform, KaosProcess,
-    LineStream, StatResult, StrOrKaosPath, line_stream::line_stream_from_async_read,
+    AsyncReadWrite, AsyncReadable, AsyncWritable, ExecOptions, Kaos, KaosFileError,
+    KaosFileErrorKind, KaosPath, KaosPlatform, KaosProcess, LineStream, StatResult, StrOrKaosPath,
+    line_stream::line_stream_from_async_read,
 };
 
 #[cfg(unix)]
@@ -238,9 +240,13 @@ impl Kaos for LocalKaos {
     async fn stat(&self, path: &KaosPath, follow_symlinks: bool) -> Result<StatResult> {
         let local_path = path.unsafe_to_local_path();
         let metadata = if follow_symlinks {
-            fs::metadata(&local_path).await?
+            fs::metadata(&local_path)
+                .await
+                .map_err(|err| local_fs_error(path, "stat", err))?
         } else {
-            fs::symlink_metadata(&local_path).await?
+            fs::symlink_metadata(&local_path)
+                .await
+                .map_err(|err| local_fs_error(path, "stat", err))?
         };
 
         let st_size = metadata.len();
@@ -313,8 +319,14 @@ impl Kaos for LocalKaos {
     async fn iterdir(&self, path: &KaosPath) -> Result<Vec<KaosPath>> {
         let local_path = path.unsafe_to_local_path();
         let mut entries = Vec::new();
-        let mut dir = fs::read_dir(&local_path).await?;
-        while let Some(entry) = dir.next_entry().await? {
+        let mut dir = fs::read_dir(&local_path)
+            .await
+            .map_err(|err| local_fs_error(path, "read directory", err))?;
+        while let Some(entry) = dir
+            .next_entry()
+            .await
+            .map_err(|err| local_fs_error(path, "read directory", err))?
+        {
             entries.push(KaosPath::from(entry.path()));
         }
         Ok(entries)
@@ -346,7 +358,9 @@ impl Kaos for LocalKaos {
     }
 
     async fn read_bytes(&self, path: &KaosPath, limit: Option<usize>) -> Result<Vec<u8>> {
-        let mut data = fs::read(path.unsafe_to_local_path()).await?;
+        let mut data = fs::read(path.unsafe_to_local_path())
+            .await
+            .map_err(|err| local_fs_error(path, "read bytes", err))?;
         if let Some(n) = limit {
             data.truncate(n);
         }
@@ -354,11 +368,13 @@ impl Kaos for LocalKaos {
     }
 
     async fn read_text(&self, path: &KaosPath) -> Result<String> {
-        Ok(fs::read_to_string(path.unsafe_to_local_path()).await?)
+        fs::read_to_string(path.unsafe_to_local_path())
+            .await
+            .map_err(|err| local_fs_error(path, "read text", err))
     }
 
     async fn read_lines(&self, path: &KaosPath) -> Result<Vec<String>> {
-        let text = fs::read_to_string(path.unsafe_to_local_path()).await?;
+        let text = self.read_text(path).await?;
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         Ok(normalized
             .split_inclusive('\n')
@@ -367,12 +383,16 @@ impl Kaos for LocalKaos {
     }
 
     async fn read_lines_stream(&self, path: &KaosPath) -> Result<LineStream> {
-        let file = fs::File::open(path.unsafe_to_local_path()).await?;
+        let file = fs::File::open(path.unsafe_to_local_path())
+            .await
+            .map_err(|err| local_fs_error(path, "open text stream", err))?;
         Ok(line_stream_from_async_read(file))
     }
 
     async fn write_bytes(&self, path: &KaosPath, data: &[u8]) -> Result<usize> {
-        fs::write(path.unsafe_to_local_path(), data).await?;
+        fs::write(path.unsafe_to_local_path(), data)
+            .await
+            .map_err(|err| local_fs_error(path, "write bytes", err))?;
         Ok(data.len())
     }
 
@@ -383,10 +403,15 @@ impl Kaos for LocalKaos {
                 .create(true)
                 .append(true)
                 .open(&local_path)
-                .await?;
-            file.write_all(data.as_bytes()).await?;
+                .await
+                .map_err(|err| local_fs_error(path, "open append stream", err))?;
+            file.write_all(data.as_bytes())
+                .await
+                .map_err(|err| local_fs_error(path, "append text", err))?;
         } else {
-            fs::write(&local_path, data).await?;
+            fs::write(&local_path, data)
+                .await
+                .map_err(|err| local_fs_error(path, "write text", err))?;
         }
         Ok(data.len())
     }
@@ -397,16 +422,23 @@ impl Kaos for LocalKaos {
         {
             use std::os::unix::fs::PermissionsExt;
             let permissions = std::fs::Permissions::from_mode(mode);
-            fs::set_permissions(&local_path, permissions).await?;
+            fs::set_permissions(&local_path, permissions)
+                .await
+                .map_err(|err| local_fs_error(path, "chmod", err))?;
         }
 
         #[cfg(not(unix))]
         {
             // Non-Unix platforms do not expose POSIX permission bits; map write bits to readonly.
-            let mut perms = fs::metadata(&local_path).await?.permissions();
+            let mut perms = fs::metadata(&local_path)
+                .await
+                .map_err(|err| local_fs_error(path, "stat", err))?
+                .permissions();
             let readonly = (mode & 0o222) == 0;
             perms.set_readonly(readonly);
-            fs::set_permissions(&local_path, perms).await?;
+            fs::set_permissions(&local_path, perms)
+                .await
+                .map_err(|err| local_fs_error(path, "chmod", err))?;
         }
 
         Ok(())
@@ -418,12 +450,12 @@ impl Kaos for LocalKaos {
             if let Err(err) = fs::create_dir_all(&local_path).await
                 && !exist_ok
             {
-                return Err(err.into());
+                return Err(local_fs_error(path, "create directory", err));
             }
         } else if let Err(err) = fs::create_dir(&local_path).await
             && !exist_ok
         {
-            return Err(err.into());
+            return Err(local_fs_error(path, "create directory", err));
         }
         Ok(())
     }
@@ -442,11 +474,15 @@ impl Kaos for LocalKaos {
         if args.is_empty() {
             return Err(anyhow!("missing command"));
         }
+        let ExecOptions { cwd, env_overrides } = options;
         let mut command = Command::new(&args[0]);
         if args.len() > 1 {
             command.args(&args[1..]);
         }
-        command.envs(options.env_overrides.iter());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd.unsafe_to_local_path());
+        }
+        command.envs(env_overrides.iter());
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
@@ -469,6 +505,11 @@ impl Kaos for LocalKaos {
             null_stderr: StdIoReader::new(tokio::io::empty()),
             exit_status: None,
         }))
+    }
+
+    async fn connect_tcp(&self, host: &str, port: u16) -> Result<Box<dyn AsyncReadWrite>> {
+        let stream = TcpStream::connect((host, port)).await?;
+        Ok(Box::new(stream))
     }
 }
 
@@ -520,6 +561,16 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
+fn local_fs_error(path: &KaosPath, operation: &'static str, err: std::io::Error) -> anyhow::Error {
+    let kind = match err.kind() {
+        std::io::ErrorKind::NotFound => KaosFileErrorKind::NotFound,
+        std::io::ErrorKind::PermissionDenied => KaosFileErrorKind::PermissionDenied,
+        std::io::ErrorKind::AlreadyExists => KaosFileErrorKind::AlreadyExists,
+        _ => KaosFileErrorKind::Other,
+    };
+    KaosFileError::new(path, operation, kind, err.to_string()).into()
+}
+
 fn detect_target_libc() -> Option<&'static str> {
     if cfg!(target_os = "linux") {
         if cfg!(target_env = "musl") {
@@ -558,7 +609,7 @@ fn system_time_to_f64(time: SystemTime) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::LocalKaos;
-    use crate::{Kaos, KaosPath};
+    use crate::{Kaos, KaosPath, is_not_found_error};
     use tokio::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -643,5 +694,20 @@ mod tests {
         let kaos = LocalKaos::new();
 
         assert_eq!(kaos.app_state_dir("kimi"), KaosPath::from(share_dir));
+    }
+
+    #[tokio::test]
+    async fn missing_local_file_reports_not_found_error_kind() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path =
+            KaosPath::from(std::env::temp_dir().join(format!("kaos-missing-file-{unique}.txt")));
+        let err = LocalKaos::new()
+            .read_text(&path)
+            .await
+            .expect_err("missing file should error");
+        assert!(is_not_found_error(&err));
     }
 }

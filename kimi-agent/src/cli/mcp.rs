@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use rmcp::transport::auth::{AuthorizationManager, AuthorizationSession, CredentialStore};
+use kaos::KaosPath;
+use rmcp::transport::auth::{
+    AuthorizationManager, CredentialStore, InMemoryStateStore, OAuthTokenResponse, StateStore,
+    StoredCredentials,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -15,8 +21,8 @@ use crate::mcp::{
     ensure_mcp_servers, get_global_mcp_config_file, get_mcp_credential_store, has_oauth_tokens,
     load_mcp_config_file, load_mcp_config_string, save_mcp_config,
 };
-use crate::share::ensure_share_dir;
-use crate::soul::toolset::{list_mcp_tools, parse_mcp_config};
+use crate::mcp_http_proxy::KaosHttpProxyHandle;
+use crate::soul::toolset::{McpConnectionContext, list_mcp_tools, parse_mcp_config};
 
 #[derive(Args, Debug)]
 #[command(about = "Manage MCP server configurations.")]
@@ -189,10 +195,11 @@ async fn mcp_add(args: McpAddArgs) -> Result<()> {
     }
 
     save_mcp_config(&config).await?;
+    let config_file = get_global_mcp_config_file().await;
     println!(
         "Added MCP server '{}' to {}.",
         args.name,
-        get_global_mcp_config_file().display()
+        config_file.to_string_lossy()
     );
     Ok(())
 }
@@ -205,20 +212,21 @@ async fn mcp_remove(args: McpRemoveArgs) -> Result<()> {
     }
     servers.remove(&args.name);
     save_mcp_config(&config).await?;
+    let config_file = get_global_mcp_config_file().await;
     println!(
         "Removed MCP server '{}' from {}.",
         args.name,
-        get_global_mcp_config_file().display()
+        config_file.to_string_lossy()
     );
     Ok(())
 }
 
 async fn mcp_list() -> Result<()> {
-    let config_file = get_global_mcp_config_file();
+    let config_file = get_global_mcp_config_file().await;
     let mut config = load_mcp_config_for_edit().await?;
     let servers = ensure_mcp_servers(&mut config)?;
 
-    println!("MCP config file: {}", config_file.display());
+    println!("MCP config file: {}", config_file.to_string_lossy());
     if servers.is_empty() {
         println!("No MCP servers configured.");
         return Ok(());
@@ -240,7 +248,7 @@ async fn mcp_list() -> Result<()> {
 async fn mcp_auth(args: McpAuthArgs) -> Result<()> {
     let mut config = load_mcp_config_for_edit().await?;
     let servers = ensure_mcp_servers(&mut config)?;
-    let server = servers.get(&args.name);
+    let server = servers.get(&args.name).cloned();
     let Some(server) = server else {
         anyhow::bail!("MCP server '{}' not found.", args.name);
     };
@@ -257,7 +265,9 @@ async fn mcp_auth(args: McpAuthArgs) -> Result<()> {
     let url = server
         .get("url")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("MCP server '{}' is missing url.", args.name))?;
+        .ok_or_else(|| anyhow::anyhow!("MCP server '{}' is missing url.", args.name))?
+        .to_string();
+    let config_for_test = config.clone();
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -267,41 +277,66 @@ async fn mcp_auth(args: McpAuthArgs) -> Result<()> {
         .context("Failed to read callback address")?;
     let redirect_uri = format!("http://{addr}/callback");
 
-    let mut manager = AuthorizationManager::new(url).await?;
-    manager.set_credential_store(get_mcp_credential_store(url));
+    let credential_store = get_mcp_credential_store(&url).await;
+    let state_store = InMemoryStateStore::new();
+    let (http_client, mut proxy) = build_oauth_http_client().await?;
+    let mut manager = AuthorizationManager::new(&url).await?;
+    manager.with_client(http_client.clone())?;
+    manager.set_credential_store(credential_store.clone());
+    manager.set_state_store(state_store.clone());
     let metadata = manager.discover_metadata().await?;
-    manager.set_metadata(metadata);
+    manager.set_metadata(metadata.clone());
 
-    let session =
-        AuthorizationSession::new(manager, &[], &redirect_uri, Some("Kimi Code CLI"), None).await?;
-    let auth_url = session.get_authorization_url().to_string();
+    let result = async {
+        let client_config = manager
+            .register_client("Kimi Code CLI", &redirect_uri)
+            .await?;
+        let auth_url = manager.get_authorization_url(&[]).await?;
 
-    println!("Authorizing with '{}'...", args.name);
-    println!("A browser window will open for authorization.");
-    if let Err(err) = webbrowser::open(&auth_url) {
-        eprintln!("Failed to open browser: {err}\nOpen this URL:\n{auth_url}");
-    }
+        println!("Authorizing with '{}'...", args.name);
+        println!("A browser window will open for authorization.");
+        if let Err(err) = open_browser(&auth_url) {
+            eprintln!("Failed to open browser: {err}\nOpen this URL:\n{auth_url}");
+        }
 
-    let callback = timeout(Duration::from_secs(300), wait_for_oauth_callback(listener))
-        .await
-        .context("OAuth authorization timed out")??;
-    session
-        .handle_callback(&callback.code, &callback.state)
+        let callback = timeout(Duration::from_secs(300), wait_for_oauth_callback(listener))
+            .await
+            .context("OAuth authorization timed out")??;
+        complete_oauth_authorization(OAuthAuthorizationExchange {
+            http_client: &http_client,
+            resource_url: &url,
+            token_endpoint: &metadata.token_endpoint,
+            redirect_uri: &redirect_uri,
+            state_store: &state_store,
+            credential_store: &credential_store,
+            client_id: &client_config.client_id,
+            client_secret: client_config.client_secret.as_deref(),
+            code: &callback.code,
+            csrf_token: &callback.state,
+        })
         .await
         .map_err(|err| anyhow::anyhow!("Authorization failed: {err}"))?;
 
-    println!("Successfully authorized with '{}'.", args.name);
+        println!("Successfully authorized with '{}'.", args.name);
 
-    let parsed =
-        parse_mcp_config(&config).map_err(|err| anyhow::anyhow!("Invalid MCP config: {err}"))?;
-    let server_config = parsed
-        .get(&args.name)
-        .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found.", args.name))?;
-    let tools = list_mcp_tools(server_config)
-        .await
-        .map_err(|err| anyhow::anyhow!("Failed to list MCP tools: {err}"))?;
-    println!("Available tools: {}", tools.len());
-    Ok(())
+        let parsed = parse_mcp_config(&config_for_test)
+            .map_err(|err| anyhow::anyhow!("Invalid MCP config: {err}"))?;
+        let server_config = parsed
+            .get(&args.name)
+            .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found.", args.name))?;
+        let tools = list_mcp_tools(server_config, &McpConnectionContext::current())
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to list MCP tools: {err}"))?;
+        println!("Available tools: {}", tools.len());
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Some(proxy) = proxy.as_mut() {
+        let _ = proxy.close().await;
+    }
+
+    result
 }
 
 async fn mcp_reset_auth(args: McpResetAuthArgs) -> Result<()> {
@@ -318,7 +353,7 @@ async fn mcp_reset_auth(args: McpResetAuthArgs) -> Result<()> {
         .get("url")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("MCP server '{}' is missing url.", args.name))?;
-    get_mcp_credential_store(url).clear().await?;
+    get_mcp_credential_store(url).await.clear().await?;
     println!("OAuth tokens cleared for '{}'.", args.name);
     Ok(())
 }
@@ -337,7 +372,7 @@ async fn mcp_test(args: McpTestArgs) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("MCP server '{}' not found.", args.name))?;
 
     println!("Testing connection to '{}'...", args.name);
-    let tools = list_mcp_tools(server_config)
+    let tools = list_mcp_tools(server_config, &McpConnectionContext::current())
         .await
         .map_err(|err| anyhow::anyhow!("✗ Connection failed: {err}"))?;
 
@@ -410,23 +445,26 @@ fn describe_mcp_server(name: &str, server: &Value, auth_required: bool) -> Strin
 
 pub async fn load_mcp_configs(files: &[PathBuf], raw: &[String]) -> Result<Vec<Value>> {
     let mut configs = Vec::new();
-    let mut file_configs = files.to_vec();
+    let mut file_configs = files
+        .iter()
+        .map(AsKaosPath::as_kaos_path)
+        .collect::<Vec<_>>();
 
     if file_configs.is_empty() && raw.is_empty() {
-        let default_path = get_global_mcp_config_file();
-        if tokio::fs::metadata(&default_path).await.is_ok() {
+        let default_path = get_global_mcp_config_file().await;
+        if default_path.exists(true).await {
             file_configs.push(default_path);
         }
     }
 
     for path in file_configs {
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("Failed to read MCP config file: {}", path.display()))?;
+        let text = path.read_text().await.with_context(|| {
+            format!("Failed to read MCP config file: {}", path.to_string_lossy())
+        })?;
         let mut value = load_mcp_config_string(&text).map_err(|err| {
             anyhow::anyhow!(
                 "Invalid JSON in MCP config file '{}': {err}",
-                path.display()
+                path.to_string_lossy()
             )
         })?;
         ensure_mcp_servers(&mut value)?;
@@ -448,19 +486,153 @@ pub async fn load_mcp_configs(files: &[PathBuf], raw: &[String]) -> Result<Vec<V
 }
 
 async fn load_mcp_config_for_edit() -> Result<Value> {
-    let _ = ensure_share_dir().await;
-    let path = get_global_mcp_config_file();
-    if tokio::fs::metadata(&path).await.is_err() {
+    let path = get_global_mcp_config_file().await;
+    if !path.exists(true).await {
         return Ok(json!({"mcpServers": {}}));
     }
     let mut value = load_mcp_config_file(&path).await.map_err(|err| {
         anyhow::anyhow!(
             "Invalid JSON in MCP config file '{}': {err}",
-            path.display()
+            path.to_string_lossy()
         )
     })?;
     ensure_mcp_servers(&mut value)?;
     Ok(value)
+}
+
+trait AsKaosPath {
+    fn as_kaos_path(&self) -> KaosPath;
+}
+
+impl AsKaosPath for PathBuf {
+    fn as_kaos_path(&self) -> KaosPath {
+        KaosPath::new(self.to_string_lossy())
+    }
+}
+
+async fn build_oauth_http_client() -> Result<(reqwest::Client, Option<KaosHttpProxyHandle>)> {
+    let mut builder = reqwest::Client::builder();
+    if kaos::get_current_kaos().name() == "local" {
+        return Ok((builder.build()?, None));
+    }
+
+    let proxy = KaosHttpProxyHandle::bind(kaos::get_current_kaos()).await?;
+    let proxy_url = proxy.proxy_url();
+    builder = builder
+        .proxy(reqwest::Proxy::all(&proxy_url)?)
+        .pool_max_idle_per_host(0);
+    Ok((builder.build()?, Some(proxy)))
+}
+
+fn open_browser(url: &str) -> Result<()> {
+    if let Ok(browser) = std::env::var("BROWSER")
+        && !browser.trim().is_empty()
+    {
+        let status = Command::new(browser.trim())
+            .arg(url)
+            .status()
+            .context("run browser command from BROWSER env")?;
+        if !status.success() {
+            anyhow::bail!("browser command exited with status {:?}", status.code());
+        }
+        return Ok(());
+    }
+
+    webbrowser::open(url)
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!(err))
+}
+
+struct OAuthAuthorizationExchange<'a, S, C> {
+    http_client: &'a reqwest::Client,
+    resource_url: &'a str,
+    token_endpoint: &'a str,
+    redirect_uri: &'a str,
+    state_store: &'a S,
+    credential_store: &'a C,
+    client_id: &'a str,
+    client_secret: Option<&'a str>,
+    code: &'a str,
+    csrf_token: &'a str,
+}
+
+async fn complete_oauth_authorization<S: StateStore, C: CredentialStore>(
+    exchange: OAuthAuthorizationExchange<'_, S, C>,
+) -> Result<()> {
+    let stored_state = exchange
+        .state_store
+        .load(exchange.csrf_token)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Authorization state not found"))?;
+    exchange.state_store.delete(exchange.csrf_token).await?;
+
+    let mut form = vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("code", exchange.code.to_string()),
+        ("redirect_uri", exchange.redirect_uri.to_string()),
+        ("client_id", exchange.client_id.to_string()),
+        ("code_verifier", stored_state.pkce_verifier),
+        ("resource", exchange.resource_url.to_string()),
+    ];
+    if let Some(secret) = exchange.client_secret.filter(|secret| !secret.is_empty()) {
+        form.push(("client_secret", secret.to_string()));
+    }
+
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form.iter().map(|(key, value)| (*key, value.as_str())))
+        .finish();
+
+    let response = exchange
+        .http_client
+        .post(exchange.token_endpoint)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(body)
+        .send()
+        .await
+        .context("send OAuth token request")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("OAuth token exchange failed with HTTP {status}: {body}");
+    }
+
+    let token_response: OAuthTokenResponse = response
+        .json::<OAuthTokenResponse>()
+        .await
+        .context("parse OAuth token response")?;
+    let granted_scopes = serde_json::to_value(&token_response)
+        .context("serialize OAuth token response for scope extraction")?
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(|scope| {
+            scope
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    exchange
+        .credential_store
+        .save(StoredCredentials {
+            client_id: exchange.client_id.to_string(),
+            token_response: Some(token_response),
+            granted_scopes,
+            token_received_at: Some(now_epoch_secs()),
+        })
+        .await?;
+
+    Ok(())
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn parse_key_value_pairs(
@@ -496,9 +668,23 @@ struct OAuthCallback {
 // Minimal localhost callback receiver for OAuth code + state.
 async fn wait_for_oauth_callback(listener: TcpListener) -> Result<OAuthCallback> {
     let (mut socket, _addr) = listener.accept().await?;
-    let mut buffer = vec![0u8; 4096];
-    let read = socket.read(&mut buffer).await?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
+    let mut buffer = Vec::with_capacity(4096);
+    loop {
+        let mut chunk = [0u8; 1024];
+        let read = socket.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if buffer.len() >= 16 * 1024 {
+            anyhow::bail!("OAuth callback request headers exceeded 16 KiB");
+        }
+    }
+
+    let request = String::from_utf8_lossy(&buffer);
     let request_line = request.lines().next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
@@ -544,7 +730,7 @@ async fn wait_for_oauth_callback(listener: TcpListener) -> Result<OAuthCallback>
     };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
-Content-Length: {}\r\n\r\n{body}",
+Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
     let _ = socket.write_all(response.as_bytes()).await;

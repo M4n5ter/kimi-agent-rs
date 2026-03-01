@@ -20,6 +20,8 @@ use std::pin::Pin;
 
 use anyhow::Result;
 use futures::stream::Stream;
+use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// A path-like argument accepted by Kaos operations.
 pub enum StrOrKaosPath<'a> {
@@ -52,6 +54,52 @@ pub trait AsyncWritable: Send + Sync {
     async fn close(&mut self) -> Result<()>;
 }
 
+/// Object-safe wrapper for duplex byte streams returned by Kaos backends.
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum KaosFileErrorKind {
+    #[error("not found")]
+    NotFound,
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("already exists")]
+    AlreadyExists,
+    #[error("i/o failure")]
+    Other,
+}
+
+#[derive(Debug, Error)]
+#[error("{operation} {} failed: {kind}: {message}", .path.to_string_lossy())]
+pub struct KaosFileError {
+    path: KaosPath,
+    operation: &'static str,
+    kind: KaosFileErrorKind,
+    message: String,
+}
+
+impl KaosFileError {
+    pub fn new(
+        path: &KaosPath,
+        operation: &'static str,
+        kind: KaosFileErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.clone(),
+            operation,
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn kind(&self) -> KaosFileErrorKind {
+        self.kind
+    }
+}
+
 /// Summary of output dropped by a process transport layer under backpressure.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProcessOutputOverflow {
@@ -64,6 +112,7 @@ pub struct ProcessOutputOverflow {
 /// Process execution options for Kaos backends.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecOptions {
+    pub cwd: Option<KaosPath>,
     pub env_overrides: BTreeMap<String, String>,
 }
 
@@ -145,6 +194,7 @@ pub trait Kaos: Send + Sync {
     async fn mkdir(&self, path: &KaosPath, parents: bool, exist_ok: bool) -> Result<()>;
     async fn env_var(&self, key: &str) -> Result<Option<String>>;
     async fn exec(&self, args: &[String], options: ExecOptions) -> Result<Box<dyn KaosProcess>>;
+    async fn connect_tcp(&self, host: &str, port: u16) -> Result<Box<dyn AsyncReadWrite>>;
 }
 
 /// Stat result compatible with Python fields.
@@ -163,6 +213,16 @@ pub struct StatResult {
 }
 
 pub type LineStream = Pin<Box<dyn Stream<Item = Result<String>> + Send>>;
+
+pub fn file_error_kind(err: &anyhow::Error) -> Option<KaosFileErrorKind> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<KaosFileError>())
+        .map(KaosFileError::kind)
+}
+
+pub fn is_not_found_error(err: &anyhow::Error) -> bool {
+    matches!(file_error_kind(err), Some(KaosFileErrorKind::NotFound))
+}
 
 /// Helper to map string/KaosPath to KaosPath.
 pub fn normalize_path_arg(arg: &StrOrKaosPath<'_>) -> KaosPath {
@@ -249,4 +309,8 @@ pub async fn exec_with_options(
     options: ExecOptions,
 ) -> Result<Box<dyn KaosProcess>> {
     get_current_kaos().exec(args, options).await
+}
+
+pub async fn connect_tcp(host: &str, port: u16) -> Result<Box<dyn AsyncReadWrite>> {
+    get_current_kaos().connect_tcp(host, port).await
 }
