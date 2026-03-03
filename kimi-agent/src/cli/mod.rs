@@ -10,11 +10,11 @@ use crate::agentspec::{default_agent_file, okabe_agent_file};
 use crate::app::{ConfigInput, CreateOptions, KimiCLI};
 use crate::config::{Config, KaosConfig, load_config, load_config_from_string};
 use crate::constant::VERSION;
-use crate::session::Session;
+use crate::session::{Session, cleanup_failed_startup};
 use crate::session_id::normalize_session_id;
 use crate::storage::Storage;
 use crate::utils::init_logging;
-use tracing::info;
+use tracing::{info, warn};
 
 pub mod info;
 pub mod mcp;
@@ -297,8 +297,8 @@ pub async fn run() -> Result<()> {
                 cli.continue_session,
             )
             .await?;
-            let instance = KimiCLI::create(
-                resolved_session.session,
+            let instance = match KimiCLI::create(
+                resolved_session.session.clone(),
                 CreateOptions {
                     config: Some(ConfigInput::Inline(Box::new(config))),
                     storage: Some(storage.clone()),
@@ -313,7 +313,25 @@ pub async fn run() -> Result<()> {
                     max_ralph_iterations: cli.max_ralph_iterations,
                 },
             )
-            .await?;
+            .await
+            {
+                Ok(instance) => instance,
+                Err(err) => {
+                    if let Err(cleanup_err) = cleanup_failed_startup(
+                        &resolved_session.session,
+                        resolved_session.created_new_session,
+                    )
+                    .await
+                    {
+                        warn!(
+                            session_id = %resolved_session.session.id,
+                            "Failed to discard newly created stdio session after startup failure: {}",
+                            cleanup_err
+                        );
+                    }
+                    return Err(err);
+                }
+            };
             instance
                 .run_wire_stdio(resolved_session.created_new_session)
                 .await?;

@@ -635,7 +635,7 @@ async fn test_wire_ws_allows_parallel_sessions() {
 }
 
 #[tokio::test]
-async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_rolls_back_session() {
+async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_discards_new_session() {
     let _lock = ENV_LOCK.lock().await;
     let home_dir = TempDir::new().expect("home dir");
     let work_dir = TempDir::new().expect("work dir");
@@ -670,10 +670,11 @@ async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_rolls_back_ses
     let work_path = KaosPath::from(work_dir.path().to_path_buf());
     let session = Session::find(storage, kaos, work_path, failed_session_id)
         .await
-        .expect("find failed session")
-        .expect("failed session should be retained");
-    assert_eq!(session.state.as_str(), "failed");
-    assert!(session.is_empty().await.expect("failed session empty"));
+        .expect("find failed session");
+    assert!(
+        session.is_none(),
+        "startup-failed session should be discarded"
+    );
 
     server_task.abort();
     let join_err = server_task

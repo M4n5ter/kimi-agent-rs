@@ -24,7 +24,7 @@ use kosong::tooling::tool_error;
 use crate::app::{ConfigInput, CreateOptions, KimiCLI};
 use crate::config::Config;
 use crate::constant::{NAME, VERSION};
-use crate::session::{Session, post_run as post_run_session};
+use crate::session::{Session, cleanup_failed_startup, post_run as post_run_session};
 use crate::session_id::normalize_session_id;
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::{
@@ -895,13 +895,12 @@ impl WsServerState {
             Ok(cli) => cli,
             Err(err) => {
                 if let Some(rollback_session) = rollback_session
-                    && let Err(post_run_err) =
-                        post_run_session(&rollback_session, SessionState::Failed).await
+                    && let Err(cleanup_err) = cleanup_failed_startup(&rollback_session, true).await
                 {
                     warn!(
                         session_id = %session_id,
-                        "Failed to rollback newly created session after runtime init failure: {}",
-                        post_run_err
+                        "Failed to discard newly created session after runtime init failure: {}",
+                        cleanup_err
                     );
                 }
                 return Err(err);

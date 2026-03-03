@@ -80,9 +80,12 @@ fn kimi_agent_bin() -> PathBuf {
 }
 
 async fn run_stdio_wire(session_id: &str, work_dir: &Path) -> std::process::Output {
+    run_stdio_wire_with_args(&["--session", session_id], work_dir).await
+}
+
+async fn run_stdio_wire_with_args(args: &[&str], work_dir: &Path) -> std::process::Output {
     let mut child = Command::new(kimi_agent_bin())
-        .arg("--session")
-        .arg(session_id)
+        .args(args)
         .current_dir(work_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -129,6 +132,56 @@ async fn test_wire_stdio_exit_without_prompt_discards_new_session() {
     assert!(
         persisted.is_none(),
         "unused stdio session should be discarded"
+    );
+}
+
+#[tokio::test]
+async fn test_wire_stdio_startup_failure_discards_new_session() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let _env = set_home_env(home_dir.path());
+    let work_dir = TempDir::new().expect("work dir");
+    let agent_file = work_dir.path().join("broken-agent.yaml");
+    std::fs::write(
+        &agent_file,
+        r#"version: 1
+agent:
+  name: "Broken Agent"
+  system_prompt_path: ./missing-system.md
+  tools: ["kimi_cli.tools.think:Think"]
+"#,
+    )
+    .expect("write broken agent");
+
+    let output = run_stdio_wire_with_args(
+        &[
+            "--session",
+            "failed-startup-session",
+            "--agent-file",
+            agent_file.to_str().expect("agent file path"),
+        ],
+        work_dir.path(),
+    )
+    .await;
+    assert!(
+        !output.status.success(),
+        "kimi-agent unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let storage = open_test_storage(home_dir.path()).await;
+    let persisted = Session::find(
+        storage,
+        KaosConfig::Local,
+        KaosPath::from(work_dir.path().to_path_buf()),
+        "failed-startup-session",
+    )
+    .await
+    .expect("find session");
+    assert!(
+        persisted.is_none(),
+        "startup-failed stdio session should be discarded"
     );
 }
 

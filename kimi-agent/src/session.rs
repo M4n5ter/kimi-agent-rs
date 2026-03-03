@@ -151,3 +151,11 @@ pub async fn post_run(session: &Session, state: SessionState) -> Result<()> {
         })
         .await
 }
+
+pub async fn cleanup_failed_startup(session: &Session, created_new_session: bool) -> Result<()> {
+    if created_new_session {
+        session.delete().await
+    } else {
+        Ok(())
+    }
+}
