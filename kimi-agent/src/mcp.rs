@@ -134,10 +134,17 @@ pub async fn has_oauth_tokens(
         return Ok(true);
     }
 
-    if let Some(path) = legacy_mcp_auth_contains(server_url).await.map_err(|err| {
-        AuthError::InternalError(format!("Failed to probe legacy MCP auth file: {err}"))
-    })? {
-        eprintln!("{}", legacy_mcp_auth_warning(&path, &current_arg0()));
+    match legacy_mcp_auth_contains(server_url).await {
+        Ok(Some(path)) => {
+            eprintln!("{}", legacy_mcp_auth_warning(&path, &current_arg0()));
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!(
+                "Warning: failed to probe ignored legacy MCP auth file: {err}. SQLite storage is authoritative now. Re-run `{} mcp auth <server>` if authorization is required.",
+                current_arg0(),
+            );
+        }
     }
 
     Ok(false)
@@ -145,7 +152,13 @@ pub async fn has_oauth_tokens(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use anyhow::Result;
+    use kaos::{
+        AsyncReadWrite, ExecOptions, Kaos, KaosPath, KaosPlatform, KaosProcess, LineStream,
+        LocalKaos, StrOrKaosPath, reset_current_kaos, set_current_kaos, with_current_kaos_scope,
+    };
     use rmcp::transport::auth::{CredentialStore, OAuthTokenResponse, StoredCredentials};
     use serde_json::json;
     use tempfile::TempDir;
@@ -171,6 +184,116 @@ mod tests {
                 host_key_policy: kaos::SshHostKeyPolicy::AcceptNew,
                 connect_timeout_seconds: 15,
             },
+        }
+    }
+
+    struct FixedHomeKaos {
+        inner: LocalKaos,
+        home: KaosPath,
+    }
+
+    impl FixedHomeKaos {
+        fn new(home: KaosPath) -> Self {
+            Self {
+                inner: LocalKaos::new(),
+                home,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Kaos for FixedHomeKaos {
+        fn name(&self) -> &str {
+            "fixed-home"
+        }
+
+        fn storage_name(&self) -> String {
+            "root@example.com:22".to_string()
+        }
+
+        fn platform(&self) -> KaosPlatform {
+            self.inner.platform()
+        }
+
+        fn normpath(&self, path: &StrOrKaosPath<'_>) -> KaosPath {
+            self.inner.normpath(path)
+        }
+
+        fn home(&self) -> KaosPath {
+            self.home.clone()
+        }
+
+        fn cwd(&self) -> KaosPath {
+            self.inner.cwd()
+        }
+
+        async fn chdir(&self, path: &KaosPath) -> Result<()> {
+            self.inner.chdir(path).await
+        }
+
+        async fn stat(&self, path: &KaosPath, follow_symlinks: bool) -> Result<kaos::StatResult> {
+            self.inner.stat(path, follow_symlinks).await
+        }
+
+        async fn iterdir(&self, path: &KaosPath) -> Result<Vec<KaosPath>> {
+            self.inner.iterdir(path).await
+        }
+
+        async fn glob(
+            &self,
+            path: &KaosPath,
+            pattern: &str,
+            case_sensitive: bool,
+        ) -> Result<Vec<KaosPath>> {
+            self.inner.glob(path, pattern, case_sensitive).await
+        }
+
+        async fn read_bytes(&self, path: &KaosPath, limit: Option<usize>) -> Result<Vec<u8>> {
+            self.inner.read_bytes(path, limit).await
+        }
+
+        async fn read_text(&self, path: &KaosPath) -> Result<String> {
+            self.inner.read_text(path).await
+        }
+
+        async fn read_lines(&self, path: &KaosPath) -> Result<Vec<String>> {
+            self.inner.read_lines(path).await
+        }
+
+        async fn read_lines_stream(&self, path: &KaosPath) -> Result<LineStream> {
+            self.inner.read_lines_stream(path).await
+        }
+
+        async fn write_bytes(&self, path: &KaosPath, data: &[u8]) -> Result<usize> {
+            self.inner.write_bytes(path, data).await
+        }
+
+        async fn write_text(&self, path: &KaosPath, data: &str, append: bool) -> Result<usize> {
+            self.inner.write_text(path, data, append).await
+        }
+
+        async fn chmod(&self, path: &KaosPath, mode: u32) -> Result<()> {
+            self.inner.chmod(path, mode).await
+        }
+
+        async fn mkdir(&self, path: &KaosPath, parents: bool, exist_ok: bool) -> Result<()> {
+            self.inner.mkdir(path, parents, exist_ok).await
+        }
+
+        async fn env_var(&self, _key: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+
+        async fn exec(
+            &self,
+            args: &[String],
+            options: ExecOptions,
+        ) -> Result<Box<dyn KaosProcess>> {
+            self.inner.exec(args, options).await
+        }
+
+        async fn connect_tcp(&self, host: &str, port: u16) -> Result<Box<dyn AsyncReadWrite>> {
+            self.inner.connect_tcp(host, port).await
         }
     }
 
@@ -271,5 +394,33 @@ mod tests {
         assert!(remote["mcpServers"].get("ssh-demo").is_some());
         assert!(remote["mcpServers"].get("local-demo").is_none());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_legacy_auth_file_does_not_break_oauth_token_checks() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let storage = open_test_storage(&temp_dir).await;
+        let auth_path = temp_dir
+            .path()
+            .join(".kimi")
+            .join("credentials")
+            .join("mcp_auth.json");
+        std::fs::create_dir_all(auth_path.parent().expect("auth parent")).expect("create auth dir");
+        std::fs::write(&auth_path, "{invalid json").expect("write malformed auth file");
+
+        let kaos = Arc::new(FixedHomeKaos::new(KaosPath::from(
+            temp_dir.path().to_path_buf(),
+        )));
+        with_current_kaos_scope(async move {
+            let token = set_current_kaos(kaos);
+            let has_tokens =
+                has_oauth_tokens(&storage, &KaosConfig::Local, "https://example.com/mcp")
+                    .await
+                    .expect("legacy auth probe should not fail");
+            reset_current_kaos(token);
+
+            assert!(!has_tokens);
+        })
+        .await;
     }
 }
