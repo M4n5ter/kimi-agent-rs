@@ -169,8 +169,6 @@ fn make_soul(runtime: Runtime, llm: LLM, toolset: KimiToolset) -> KimiSoul {
         system_prompt: "Test system prompt.".to_string(),
         tool_paths: Vec::new(),
         mcp_configs: Vec::new(),
-        fixed_subagents: std::collections::HashMap::new(),
-        fixed_subagent_descs: std::collections::HashMap::new(),
     });
     let agent = Agent {
         name: "Test Agent".to_string(),

@@ -50,10 +50,8 @@ impl CallableTool2 for CreateSubagent {
     }
 
     async fn call_typed(&self, params: Self::Params) -> ToolReturnValue {
-        let mut market = self.runtime.labor_market.lock().await;
-        if self.definition.fixed_subagents.contains_key(&params.name)
-            || market.all_dynamic_subagents().contains_key(&params.name)
-        {
+        let mut registry = self.runtime.subagent_registry.lock().await;
+        if registry.contains(&params.name) {
             return tool_error(
                 "",
                 format!("Subagent with name '{}' already exists.", params.name),
@@ -64,13 +62,9 @@ impl CallableTool2 for CreateSubagent {
         let subagent = self
             .definition
             .derive_dynamic(params.name.clone(), params.system_prompt);
-        market.add_dynamic_subagent(params.name.clone(), subagent);
+        registry.add_dynamic_subagent(params.name.clone(), subagent);
 
-        let mut names: Vec<String> = self.definition.fixed_subagents.keys().cloned().collect();
-        names.extend(market.all_dynamic_subagents().keys().cloned());
-        names.sort();
-        names.dedup();
-        let output = format!("Available subagents: {}", names.join(", "));
+        let output = format!("Available subagents: {}", registry.all_names().join(", "));
 
         tool_ok(
             output,

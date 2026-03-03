@@ -41,7 +41,12 @@ fn assert_schema_eq(actual: serde_json::Value, expected: serde_json::Value) {
 #[test]
 fn test_task_params_schema() {
     let fixture = RuntimeFixture::new();
-    let tool = TaskTool::new(&fixture.runtime, agent_test_utils::test_agent_definition());
+    let tool = TaskTool::new(
+        &fixture.runtime,
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            kimi_agent::soul::toolset::KimiToolset::new(),
+        )),
+    );
     let base = tool.base();
     assert_schema_eq(
         base.parameters,

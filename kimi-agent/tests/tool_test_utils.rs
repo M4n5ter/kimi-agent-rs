@@ -13,7 +13,7 @@ use kimi_agent::config::{
 };
 use kimi_agent::llm::LLM;
 use kimi_agent::session::Session;
-use kimi_agent::soul::agent::{BuiltinSystemPromptArgs, LaborMarket, Runtime};
+use kimi_agent::soul::agent::{BuiltinSystemPromptArgs, Runtime, SubagentRegistry};
 use kimi_agent::soul::approval::Approval;
 use kimi_agent::soul::denwarenji::DenwaRenji;
 use kimi_agent::storage::Storage;
@@ -150,7 +150,7 @@ impl RuntimeFixture {
             },
             denwa_renji: Arc::new(tokio::sync::Mutex::new(DenwaRenji::new())),
             approval: Arc::new(Approval::new(true)),
-            labor_market: Arc::new(tokio::sync::Mutex::new(LaborMarket::new())),
+            subagent_registry: Arc::new(tokio::sync::Mutex::new(SubagentRegistry::new())),
             environment,
             skills: Default::default(),
         };

@@ -218,3 +218,122 @@ agent:
         Err(err) => assert!(err.to_string().contains("Invalid tools")),
     }
 }
+
+#[tokio::test]
+async fn test_load_agent_registers_fixed_subagents_globally() {
+    let fixture = RuntimeFixture::new();
+
+    let dir = TempDir::new().expect("temp dir");
+    write_file(&dir.path().join("root.md"), "Root");
+    write_file(&dir.path().join("planner.md"), "Planner");
+    write_file(&dir.path().join("coder.md"), "Coder");
+
+    write_file(
+        &dir.path().join("planner.yaml"),
+        r#"version: 1
+agent:
+  name: "Planner"
+  system_prompt_path: ./planner.md
+  tools: ["kimi_cli.tools.think:Think"]
+"#,
+    );
+    write_file(
+        &dir.path().join("coder.yaml"),
+        r#"version: 1
+agent:
+  name: "Coder"
+  system_prompt_path: ./coder.md
+  tools: ["kimi_cli.tools.think:Think"]
+"#,
+    );
+    write_file(
+        &dir.path().join("agent.yaml"),
+        r#"version: 1
+agent:
+  name: "Root"
+  system_prompt_path: ./root.md
+  tools: ["kimi_cli.tools.multiagent:Task", "kimi_cli.tools.think:Think"]
+  subagents:
+    planner:
+      description: "Planner fixed subagent"
+      path: ./planner.yaml
+    coder:
+      description: "Coder fixed subagent"
+      path: ./coder.yaml
+"#,
+    );
+
+    let _agent = load_agent(&dir.path().join("agent.yaml"), fixture.runtime.clone(), &[])
+        .await
+        .expect("load agent");
+    let registry = fixture.runtime.subagent_registry.lock().await;
+    assert!(registry.contains("planner"));
+    assert!(registry.contains("coder"));
+}
+
+#[tokio::test]
+async fn test_load_agent_rejects_duplicate_fixed_subagent_names_across_tree() {
+    let fixture = RuntimeFixture::new();
+
+    let dir = TempDir::new().expect("temp dir");
+    write_file(&dir.path().join("root.md"), "Root");
+    write_file(&dir.path().join("planner.md"), "Planner");
+    write_file(&dir.path().join("coder.md"), "Coder");
+    write_file(&dir.path().join("nested-coder.md"), "Nested coder");
+
+    write_file(
+        &dir.path().join("nested-coder.yaml"),
+        r#"version: 1
+agent:
+  name: "Nested Coder"
+  system_prompt_path: ./nested-coder.md
+  tools: ["kimi_cli.tools.think:Think"]
+"#,
+    );
+    write_file(
+        &dir.path().join("planner.yaml"),
+        r#"version: 1
+agent:
+  name: "Planner"
+  system_prompt_path: ./planner.md
+  tools: ["kimi_cli.tools.think:Think"]
+  subagents:
+    coder:
+      description: "Nested coder"
+      path: ./nested-coder.yaml
+"#,
+    );
+    write_file(
+        &dir.path().join("coder.yaml"),
+        r#"version: 1
+agent:
+  name: "Coder"
+  system_prompt_path: ./coder.md
+  tools: ["kimi_cli.tools.think:Think"]
+"#,
+    );
+    write_file(
+        &dir.path().join("agent.yaml"),
+        r#"version: 1
+agent:
+  name: "Root"
+  system_prompt_path: ./root.md
+  tools: ["kimi_cli.tools.multiagent:Task", "kimi_cli.tools.think:Think"]
+  subagents:
+    planner:
+      description: "Planner fixed subagent"
+      path: ./planner.yaml
+    coder:
+      description: "Coder fixed subagent"
+      path: ./coder.yaml
+"#,
+    );
+
+    match load_agent(&dir.path().join("agent.yaml"), fixture.runtime.clone(), &[]).await {
+        Ok(_) => panic!("expected duplicate fixed subagent error"),
+        Err(err) => assert!(
+            err.to_string()
+                .contains("Duplicate fixed subagent name: coder")
+        ),
+    }
+}

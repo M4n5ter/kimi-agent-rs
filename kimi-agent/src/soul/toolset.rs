@@ -60,7 +60,7 @@ pub fn get_current_tool_call_or_none() -> Option<ToolCall> {
 
 pub struct KimiToolset {
     tools: HashMap<String, Arc<dyn CallableTool>>,
-    external_tools: HashSet<String>,
+    external_tools: HashMap<String, ExternalToolSpec>,
     mcp_servers: HashMap<String, McpServerInfo>,
     mcp_loading_tasks: Vec<tokio::task::JoinHandle<Result<(), MCPRuntimeError>>>,
     mcp_tool_owners: HashMap<String, String>,
@@ -70,7 +70,7 @@ impl KimiToolset {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
-            external_tools: HashSet::new(),
+            external_tools: HashMap::new(),
             mcp_servers: HashMap::new(),
             mcp_loading_tasks: Vec::new(),
             mcp_tool_owners: HashMap::new(),
@@ -91,7 +91,7 @@ impl KimiToolset {
     }
 
     pub fn has_builtin_tool(&self, name: &str) -> bool {
-        self.tools.contains_key(name) && !self.external_tools.contains(name)
+        self.tools.contains_key(name) && !self.external_tools.contains_key(name)
     }
 
     pub fn register_external_tool(
@@ -100,15 +100,29 @@ impl KimiToolset {
         description: &str,
         parameters: Value,
     ) -> Result<(), String> {
-        if self.tools.contains_key(name) && !self.external_tools.contains(name) {
+        if self.tools.contains_key(name) && !self.external_tools.contains_key(name) {
             return Err("tool name conflicts with existing tool".to_string());
         }
         if let Err(err) = jsonschema::validator_for(&parameters) {
             return Err(err.to_string());
         }
-        let tool = WireExternalTool::new(name, description, parameters);
+        let tool_spec = ExternalToolSpec::new(name, description, parameters);
+        let tool = WireExternalTool::new(&tool_spec);
         self.add(Arc::new(tool));
-        self.external_tools.insert(name.to_string());
+        self.external_tools.insert(name.to_string(), tool_spec);
+        Ok(())
+    }
+
+    pub fn snapshot_overlay(&self) -> ToolOverlay {
+        let mut external_tools = self.external_tools.values().cloned().collect::<Vec<_>>();
+        external_tools.sort_by(|a, b| a.name.cmp(&b.name));
+        ToolOverlay { external_tools }
+    }
+
+    pub fn apply_overlay(&mut self, overlay: &ToolOverlay) -> Result<(), String> {
+        for tool in &overlay.external_tools {
+            self.register_external_tool(&tool.name, &tool.description, tool.parameters.clone())?;
+        }
         Ok(())
     }
 
@@ -438,19 +452,41 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ToolOverlay {
+    pub external_tools: Vec<ExternalToolSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl ExternalToolSpec {
+    fn new(name: &str, description: &str, parameters: Value) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters,
+        }
+    }
+}
+
 pub struct WireExternalTool {
     base: Tool,
 }
 
 impl WireExternalTool {
-    pub fn new(name: &str, description: &str, parameters: Value) -> Self {
-        let description = if description.trim().is_empty() {
+    pub fn new(spec: &ExternalToolSpec) -> Self {
+        let description = if spec.description.trim().is_empty() {
             "No description provided."
         } else {
-            description
+            spec.description.as_str()
         };
         Self {
-            base: Tool::new(name, description, parameters),
+            base: Tool::new(&spec.name, description, spec.parameters.clone()),
         }
     }
 }

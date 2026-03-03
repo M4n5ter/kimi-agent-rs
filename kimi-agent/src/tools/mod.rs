@@ -71,7 +71,7 @@ pub fn load_tool(
         }
         "kimi_cli.tools.multiagent:Task" => Ok(Some(Arc::new(multiagent::TaskTool::new(
             deps.runtime,
-            Arc::clone(&deps.agent_definition),
+            Arc::clone(&deps.toolset),
         )))),
         "kimi_cli.tools.multiagent:CreateSubagent" => Ok(Some(Arc::new(
             multiagent::CreateSubagent::new(deps.runtime, Arc::clone(&deps.agent_definition)),

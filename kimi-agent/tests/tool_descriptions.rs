@@ -11,10 +11,16 @@ use kimi_agent::tools::web::{FetchURL, SearchWeb};
 use kosong::tooling::CallableTool2;
 use tool_test_utils::{RuntimeFixture, normalize_newlines};
 
-#[test]
-fn test_task_description() {
+#[tokio::test]
+async fn test_task_description() {
     let fixture = RuntimeFixture::new();
-    let tool = TaskTool::new(&fixture.runtime, agent_test_utils::test_agent_definition());
+    agent_test_utils::install_test_fixed_subagents(&fixture.runtime).await;
+    let tool = TaskTool::new(
+        &fixture.runtime,
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            kimi_agent::soul::toolset::KimiToolset::new(),
+        )),
+    );
     assert_eq!(
         normalize_newlines(tool.description()),
         "\

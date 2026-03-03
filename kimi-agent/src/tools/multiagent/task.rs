@@ -10,7 +10,7 @@ use crate::session::post_run;
 use crate::soul::agent::{AgentDefinition, Runtime};
 use crate::soul::context::Context;
 use crate::soul::kimisoul::KimiSoul;
-use crate::soul::toolset::get_current_tool_call_or_none;
+use crate::soul::toolset::{KimiToolset, get_current_tool_call_or_none};
 use crate::soul::{MaxStepsReached, get_current_wire_or_none, run_soul};
 use crate::storage::{SessionOrigin, SessionState};
 use crate::tools::utils::load_desc;
@@ -36,20 +36,18 @@ pub struct TaskParams {
 
 pub struct TaskTool {
     description: String,
-    definition: Arc<AgentDefinition>,
+    toolset: Arc<tokio::sync::Mutex<KimiToolset>>,
     runtime: Runtime,
 }
 
 impl TaskTool {
-    pub fn new(runtime: &Runtime, definition: Arc<AgentDefinition>) -> Self {
+    pub fn new(runtime: &Runtime, toolset: Arc<tokio::sync::Mutex<KimiToolset>>) -> Self {
         let subagents_md = {
-            let mut names: Vec<(String, String)> = definition
-                .fixed_subagent_descs
-                .iter()
-                .map(|(name, desc)| (name.clone(), desc.clone()))
-                .collect();
-            names.sort_by(|a, b| a.0.cmp(&b.0));
-            names
+            runtime
+                .subagent_registry
+                .try_lock()
+                .map(|registry| registry.fixed_subagent_descriptions())
+                .unwrap_or_default()
                 .into_iter()
                 .map(|(name, desc)| format!("- `{}`: {}", name, desc))
                 .collect::<Vec<_>>()
@@ -58,7 +56,7 @@ impl TaskTool {
         let desc = load_desc(TASK_DESC, &[("SUBAGENTS_MD", subagents_md)]);
         Self {
             description: desc,
-            definition,
+            toolset,
             runtime: runtime.clone(),
         }
     }
@@ -113,7 +111,11 @@ impl TaskTool {
             }
         };
         let child_runtime = self.runtime.rebind_session(child_session.clone());
-        let agent = match definition.instantiate(child_runtime).await {
+        let overlay = self.toolset.lock().await.snapshot_overlay();
+        let agent = match definition
+            .instantiate_with_overlay(child_runtime, &overlay)
+            .await
+        {
             Ok(agent) => agent,
             Err(err) => {
                 let _ = child_session.delete().await;
@@ -299,16 +301,9 @@ impl CallableTool2 for TaskTool {
 
     async fn call_typed(&self, params: Self::Params) -> ToolReturnValue {
         let agent = {
-            let mut subagents = self.definition.fixed_subagents.clone();
-            subagents.extend(
-                self.runtime
-                    .labor_market
-                    .lock()
-                    .await
-                    .all_dynamic_subagents(),
-            );
-            match subagents.get(&params.subagent_name) {
-                Some(agent) => Arc::clone(agent),
+            let registry = self.runtime.subagent_registry.lock().await;
+            match registry.get(&params.subagent_name) {
+                Some(agent) => Arc::clone(&agent.definition),
                 None => {
                     return tool_error(
                         "",

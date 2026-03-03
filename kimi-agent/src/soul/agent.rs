@@ -15,7 +15,7 @@ use crate::session::Session;
 use crate::skill::{Skill, discover_skills_from_roots, index_skills, resolve_skills_roots};
 use crate::soul::approval::Approval;
 use crate::soul::denwarenji::DenwaRenji;
-use crate::soul::toolset::KimiToolset;
+use crate::soul::toolset::{KimiToolset, ToolOverlay};
 use crate::storage::Storage;
 use crate::utils::{Environment, list_directory};
 use serde_json::Value;
@@ -74,7 +74,7 @@ pub struct Runtime {
     pub builtin_args: BuiltinSystemPromptArgs,
     pub denwa_renji: Arc<tokio::sync::Mutex<DenwaRenji>>,
     pub approval: Arc<Approval>,
-    pub labor_market: Arc<tokio::sync::Mutex<LaborMarket>>,
+    pub subagent_registry: Arc<tokio::sync::Mutex<SubagentRegistry>>,
     pub environment: Environment,
     pub skills: HashMap<String, Skill>,
 }
@@ -130,7 +130,7 @@ impl Runtime {
             },
             denwa_renji: Arc::new(tokio::sync::Mutex::new(DenwaRenji::new())),
             approval: Arc::new(Approval::new(yolo)),
-            labor_market: Arc::new(tokio::sync::Mutex::new(LaborMarket::new())),
+            subagent_registry: Arc::new(tokio::sync::Mutex::new(SubagentRegistry::new())),
             environment,
             skills: skills_by_name,
         }
@@ -145,7 +145,7 @@ impl Runtime {
             builtin_args: self.builtin_args.clone(),
             denwa_renji: Arc::new(tokio::sync::Mutex::new(DenwaRenji::new())),
             approval: Arc::new(self.approval.share()),
-            labor_market: Arc::new(tokio::sync::Mutex::new(LaborMarket::new())),
+            subagent_registry: Arc::clone(&self.subagent_registry),
             environment: self.environment.clone(),
             skills: self.skills.clone(),
         }
@@ -160,7 +160,7 @@ impl Runtime {
             builtin_args: self.builtin_args.clone(),
             denwa_renji: Arc::new(tokio::sync::Mutex::new(DenwaRenji::new())),
             approval: Arc::new(self.approval.share()),
-            labor_market: Arc::clone(&self.labor_market),
+            subagent_registry: Arc::clone(&self.subagent_registry),
             environment: self.environment.clone(),
             skills: self.skills.clone(),
         }
@@ -180,12 +180,19 @@ pub struct AgentDefinition {
     pub system_prompt: String,
     pub tool_paths: Vec<String>,
     pub mcp_configs: Vec<Value>,
-    pub fixed_subagents: HashMap<String, Arc<AgentDefinition>>,
-    pub fixed_subagent_descs: HashMap<String, String>,
 }
 
 impl AgentDefinition {
     pub async fn instantiate(self: &Arc<Self>, runtime: Runtime) -> Result<Agent, anyhow::Error> {
+        self.instantiate_with_overlay(runtime, &ToolOverlay::default())
+            .await
+    }
+
+    pub async fn instantiate_with_overlay(
+        self: &Arc<Self>,
+        runtime: Runtime,
+        overlay: &ToolOverlay,
+    ) -> Result<Agent, anyhow::Error> {
         let toolset = Arc::new(tokio::sync::Mutex::new(KimiToolset::new()));
         {
             let mut guard = toolset.lock().await;
@@ -203,6 +210,7 @@ impl AgentDefinition {
                     .load_mcp_tools(&self.mcp_configs, &runtime, Arc::clone(&toolset))
                     .await?;
             }
+            guard.apply_overlay(overlay).map_err(anyhow::Error::msg)?;
         }
 
         Ok(Agent {
@@ -220,8 +228,6 @@ impl AgentDefinition {
             system_prompt,
             tool_paths: self.tool_paths.clone(),
             mcp_configs: self.mcp_configs.clone(),
-            fixed_subagents: self.fixed_subagents.clone(),
-            fixed_subagent_descs: self.fixed_subagent_descs.clone(),
         })
     }
 }
@@ -235,34 +241,131 @@ pub struct Agent {
     pub runtime: Runtime,
 }
 
-#[derive(Default)]
-pub struct LaborMarket {
-    dynamic_subagents: HashMap<String, Arc<AgentDefinition>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisteredSubagentKind {
+    Fixed,
+    Dynamic,
 }
 
-impl LaborMarket {
+#[derive(Clone)]
+pub struct RegisteredSubagent {
+    pub definition: Arc<AgentDefinition>,
+    pub description: String,
+    pub kind: RegisteredSubagentKind,
+}
+
+impl RegisteredSubagent {
+    fn fixed(definition: Arc<AgentDefinition>, description: String) -> Self {
+        Self {
+            definition,
+            description,
+            kind: RegisteredSubagentKind::Fixed,
+        }
+    }
+
+    fn dynamic(definition: Arc<AgentDefinition>) -> Self {
+        Self {
+            definition,
+            description: String::new(),
+            kind: RegisteredSubagentKind::Dynamic,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct SubagentRegistry {
+    fixed_subagents: HashMap<String, RegisteredSubagent>,
+    dynamic_subagents: HashMap<String, RegisteredSubagent>,
+}
+
+impl SubagentRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn add_dynamic_subagent(&mut self, name: String, agent: Arc<AgentDefinition>) {
-        self.dynamic_subagents.insert(name, agent);
+    pub fn replace_fixed_subagents(
+        &mut self,
+        fixed_subagents: HashMap<String, RegisteredSubagent>,
+    ) -> Result<(), String> {
+        if let Some(name) = fixed_subagents
+            .keys()
+            .find(|name| self.dynamic_subagents.contains_key(*name))
+        {
+            return Err(format!("Duplicate subagent name: {name}"));
+        }
+        self.fixed_subagents = fixed_subagents;
+        Ok(())
     }
 
-    pub fn dynamic_subagents(&self) -> &HashMap<String, Arc<AgentDefinition>> {
-        &self.dynamic_subagents
+    pub fn add_fixed_subagent(
+        &mut self,
+        name: String,
+        definition: Arc<AgentDefinition>,
+        description: String,
+    ) -> Result<(), String> {
+        if self.contains(&name) {
+            return Err(format!("Duplicate subagent name: {name}"));
+        }
+        self.fixed_subagents
+            .insert(name, RegisteredSubagent::fixed(definition, description));
+        Ok(())
+    }
+
+    pub fn add_dynamic_subagent(&mut self, name: String, agent: Arc<AgentDefinition>) {
+        self.dynamic_subagents
+            .insert(name, RegisteredSubagent::dynamic(agent));
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.fixed_subagents.contains_key(name) || self.dynamic_subagents.contains_key(name)
+    }
+
+    pub fn get(&self, name: &str) -> Option<&RegisteredSubagent> {
+        self.fixed_subagents
+            .get(name)
+            .or_else(|| self.dynamic_subagents.get(name))
     }
 
     pub fn all_dynamic_subagents(&self) -> HashMap<String, Arc<AgentDefinition>> {
-        self.dynamic_subagents.clone()
+        self.dynamic_subagents
+            .iter()
+            .map(|(name, subagent)| (name.clone(), Arc::clone(&subagent.definition)))
+            .collect()
     }
+
+    pub fn all_names(&self) -> Vec<String> {
+        let mut names = self
+            .fixed_subagents
+            .keys()
+            .chain(self.dynamic_subagents.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    pub fn fixed_subagent_descriptions(&self) -> Vec<(String, String)> {
+        let mut descriptions = self
+            .fixed_subagents
+            .iter()
+            .map(|(name, subagent)| (name.clone(), subagent.description.clone()))
+            .collect::<Vec<_>>();
+        descriptions.sort_by(|a, b| a.0.cmp(&b.0));
+        descriptions
+    }
+}
+
+struct LoadedAgentDefinition {
+    definition: Arc<AgentDefinition>,
+    fixed_subagents: HashMap<String, RegisteredSubagent>,
 }
 
 fn load_agent_definition<'a>(
     agent_file: &'a Path,
     runtime: Runtime,
     mcp_configs: &'a [serde_json::Value],
-) -> futures::future::BoxFuture<'a, Result<Arc<AgentDefinition>, anyhow::Error>> {
+) -> futures::future::BoxFuture<'a, Result<LoadedAgentDefinition, anyhow::Error>> {
     Box::pin(async move {
         info!("Loading agent: {}", agent_file.display());
         let agent_spec = load_agent_spec(agent_file).await?;
@@ -274,17 +377,25 @@ fn load_agent_definition<'a>(
         .await?;
 
         let mut fixed_subagents = HashMap::new();
-        let mut fixed_subagent_descs = HashMap::new();
         for (subagent_name, subagent_spec) in agent_spec.subagents.iter() {
             debug!("Loading subagent: {}", subagent_name);
-            let subagent = load_agent_definition(
+            let loaded_subagent = load_agent_definition(
                 &subagent_spec.path,
                 runtime.copy_for_fixed_subagent(),
                 mcp_configs,
             )
             .await?;
-            fixed_subagents.insert(subagent_name.clone(), subagent);
-            fixed_subagent_descs.insert(subagent_name.clone(), subagent_spec.description.clone());
+            register_fixed_subagent(
+                &mut fixed_subagents,
+                subagent_name,
+                RegisteredSubagent::fixed(
+                    Arc::clone(&loaded_subagent.definition),
+                    subagent_spec.description.clone(),
+                ),
+            )?;
+            for (nested_name, nested_subagent) in loaded_subagent.fixed_subagents {
+                register_fixed_subagent(&mut fixed_subagents, &nested_name, nested_subagent)?;
+            }
         }
 
         let mut tools = agent_spec.tools.clone();
@@ -293,27 +404,29 @@ fn load_agent_definition<'a>(
             tools.retain(|tool| !agent_spec.exclude_tools.contains(tool));
         }
 
-        Ok(Arc::new(AgentDefinition {
-            name: agent_spec.name,
-            system_prompt,
-            tool_paths: tools,
-            mcp_configs: mcp_configs.to_vec(),
+        Ok(LoadedAgentDefinition {
+            definition: Arc::new(AgentDefinition {
+                name: agent_spec.name,
+                system_prompt,
+                tool_paths: tools,
+                mcp_configs: mcp_configs.to_vec(),
+            }),
             fixed_subagents,
-            fixed_subagent_descs,
-        }))
+        })
     })
 }
 
 fn validate_fixed_subagents<'a>(
-    definition: &'a Arc<AgentDefinition>,
+    fixed_subagents: &'a HashMap<String, RegisteredSubagent>,
     runtime: Runtime,
 ) -> futures::future::BoxFuture<'a, Result<(), anyhow::Error>> {
     Box::pin(async move {
-        for subagent in definition.fixed_subagents.values() {
-            let validation_runtime = runtime.copy_for_fixed_subagent();
-            let agent = subagent.instantiate(validation_runtime.clone()).await?;
+        for subagent in fixed_subagents.values() {
+            let agent = subagent
+                .definition
+                .instantiate(runtime.copy_for_fixed_subagent())
+                .await?;
             agent.toolset.lock().await.cleanup().await;
-            validate_fixed_subagents(subagent, validation_runtime).await?;
         }
         Ok(())
     })
@@ -325,10 +438,28 @@ pub fn load_agent<'a>(
     mcp_configs: &'a [serde_json::Value],
 ) -> futures::future::BoxFuture<'a, Result<Agent, anyhow::Error>> {
     Box::pin(async move {
-        let definition = load_agent_definition(agent_file, runtime.clone(), mcp_configs).await?;
-        validate_fixed_subagents(&definition, runtime.copy_for_fixed_subagent()).await?;
-        definition.instantiate(runtime).await
+        let loaded = load_agent_definition(agent_file, runtime.clone(), mcp_configs).await?;
+        validate_fixed_subagents(&loaded.fixed_subagents, runtime.copy_for_fixed_subagent())
+            .await?;
+        runtime
+            .subagent_registry
+            .lock()
+            .await
+            .replace_fixed_subagents(loaded.fixed_subagents)
+            .map_err(anyhow::Error::msg)?;
+        loaded.definition.instantiate(runtime).await
     })
+}
+
+fn register_fixed_subagent(
+    fixed_subagents: &mut HashMap<String, RegisteredSubagent>,
+    name: &str,
+    subagent: RegisteredSubagent,
+) -> Result<(), anyhow::Error> {
+    if fixed_subagents.insert(name.to_string(), subagent).is_some() {
+        anyhow::bail!("Duplicate fixed subagent name: {name}");
+    }
+    Ok(())
 }
 
 async fn load_system_prompt(
