@@ -75,6 +75,7 @@ fn configure_connection(conn: &Connection, busy_timeout: Duration) -> Result<()>
     conn.execute_batch(
         "
         PRAGMA foreign_keys = ON;
+        PRAGMA synchronous = NORMAL;
         PRAGMA temp_store = MEMORY;
         ",
     )?;
@@ -85,7 +86,6 @@ fn initialize_database(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
         ",
     )?;
     Ok(())
