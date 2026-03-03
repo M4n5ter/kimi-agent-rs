@@ -304,6 +304,21 @@ fn load_agent_definition<'a>(
     })
 }
 
+fn validate_fixed_subagents<'a>(
+    definition: &'a Arc<AgentDefinition>,
+    runtime: Runtime,
+) -> futures::future::BoxFuture<'a, Result<(), anyhow::Error>> {
+    Box::pin(async move {
+        for subagent in definition.fixed_subagents.values() {
+            let validation_runtime = runtime.copy_for_fixed_subagent();
+            let agent = subagent.instantiate(validation_runtime.clone()).await?;
+            agent.toolset.lock().await.cleanup().await;
+            validate_fixed_subagents(subagent, validation_runtime).await?;
+        }
+        Ok(())
+    })
+}
+
 pub fn load_agent<'a>(
     agent_file: &'a Path,
     runtime: Runtime,
@@ -311,6 +326,7 @@ pub fn load_agent<'a>(
 ) -> futures::future::BoxFuture<'a, Result<Agent, anyhow::Error>> {
     Box::pin(async move {
         let definition = load_agent_definition(agent_file, runtime.clone(), mcp_configs).await?;
+        validate_fixed_subagents(&definition, runtime.copy_for_fixed_subagent()).await?;
         definition.instantiate(runtime).await
     })
 }

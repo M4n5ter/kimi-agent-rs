@@ -175,3 +175,46 @@ agent:
         Err(err) => assert!(err.to_string().contains("Invalid tools")),
     }
 }
+
+#[tokio::test]
+async fn test_load_agent_invalid_fixed_subagent_tools() {
+    let fixture = RuntimeFixture::new();
+
+    let dir = TempDir::new().expect("temp dir");
+    let system_md = dir.path().join("system.md");
+    write_file(&system_md, "You are a test agent");
+
+    let broken_system_md = dir.path().join("broken-system.md");
+    write_file(&broken_system_md, "You are a broken subagent");
+
+    let broken_agent_yaml = dir.path().join("broken-agent.yaml");
+    write_file(
+        &broken_agent_yaml,
+        r#"version: 1
+agent:
+  name: "Broken Subagent"
+  system_prompt_path: ./broken-system.md
+  tools: ["kimi_cli.tools.nonexistent:Tool"]
+"#,
+    );
+
+    let agent_yaml = dir.path().join("agent.yaml");
+    write_file(
+        &agent_yaml,
+        r#"version: 1
+agent:
+  name: "Root Agent"
+  system_prompt_path: ./system.md
+  tools: ["kimi_cli.tools.think:Think"]
+  subagents:
+    broken:
+      description: "Broken fixed subagent"
+      path: ./broken-agent.yaml
+"#,
+    );
+
+    match load_agent(&agent_yaml, fixture.runtime.clone(), &[]).await {
+        Ok(_) => panic!("expected error"),
+        Err(err) => assert!(err.to_string().contains("Invalid tools")),
+    }
+}

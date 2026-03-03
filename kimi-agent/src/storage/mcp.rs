@@ -73,6 +73,52 @@ impl Storage {
         .await
     }
 
+    pub async fn replace_mcp_servers(
+        &self,
+        kaos: &KaosConfig,
+        servers: &[(String, Value)],
+    ) -> Result<()> {
+        let scope = self.ensure_kaos_scope(kaos).await?;
+        let scope_id = scope.id;
+        let now = now_epoch_secs();
+        let servers = servers
+            .iter()
+            .map(|(name, config)| {
+                let transport_kind = infer_mcp_transport_kind(config).to_string();
+                let config_json =
+                    serde_json::to_string(config).context("serialize MCP server config")?;
+                Ok((name.clone(), transport_kind, config_json))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.with_connection(move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM mcp_servers WHERE kaos_scope_id = ?1",
+                params![scope_id],
+            )?;
+            for (name, transport_kind, config_json) in servers {
+                tx.execute(
+                    "
+                    INSERT INTO mcp_servers (
+                        kaos_scope_id,
+                        name,
+                        transport_kind,
+                        config_json,
+                        created_at,
+                        updated_at
+                    )
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                    ",
+                    params![scope_id, name, transport_kind, config_json, now],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn delete_mcp_server(&self, kaos: &KaosConfig, name: &str) -> Result<bool> {
         let scope = self.ensure_kaos_scope(kaos).await?;
         let scope_id = scope.id;

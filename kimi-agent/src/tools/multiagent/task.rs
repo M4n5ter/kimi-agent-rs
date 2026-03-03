@@ -125,54 +125,144 @@ impl TaskTool {
             }
         };
 
-        let make_ui_loop = |super_wire: std::sync::Arc<Wire>, task_tool_call_id: String| {
-            move |wire: std::sync::Arc<Wire>| {
-                let super_wire = std::sync::Arc::clone(&super_wire);
-                let task_tool_call_id = task_tool_call_id.clone();
-                async move {
-                    let ui = wire.ui_side(true);
-                    loop {
-                        let msg = ui.receive().await?;
-                        match msg {
-                            WireMessage::ApprovalRequest(_)
-                            | WireMessage::ApprovalResponse(_)
-                            | WireMessage::ToolCallRequest(_) => {
-                                super_wire.soul_side().send(msg);
-                            }
-                            other => {
-                                if let Ok(event) =
-                                    SubagentEvent::new(task_tool_call_id.clone(), other)
-                                {
-                                    super_wire
-                                        .soul_side()
-                                        .send(WireMessage::SubagentEvent(event));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
         let context = Context::new(
             agent.runtime.storage.clone(),
             child_session.db_id(),
             child_session.id.clone(),
         );
         let soul = std::sync::Arc::new(KimiSoul::new(agent, context));
-        let soul_run = std::sync::Arc::clone(&soul);
-        let ui_loop = make_ui_loop(
-            std::sync::Arc::clone(&super_wire),
-            task_tool_call_id.clone(),
-        );
+        let (state, response) = self
+            .execute_subagent_soul(
+                std::sync::Arc::clone(&soul),
+                std::sync::Arc::clone(&super_wire),
+                task_tool_call_id,
+                child_session.db_id(),
+                prompt,
+            )
+            .await;
+        soul.shutdown().await;
+        let _ = post_run(&child_session, state).await;
+        response
+    }
+
+    async fn execute_subagent_soul(
+        &self,
+        soul: Arc<KimiSoul>,
+        super_wire: Arc<Wire>,
+        task_tool_call_id: String,
+        child_session_db_id: i64,
+        prompt: String,
+    ) -> (SessionState, ToolReturnValue) {
+        let result = self
+            .run_subagent_turn(
+                Arc::clone(&soul),
+                Arc::clone(&super_wire),
+                task_tool_call_id.clone(),
+                child_session_db_id,
+                prompt,
+            )
+            .await;
+        if let Err(err) = result {
+            let response = if let Some(MaxStepsReached { n_steps }) =
+                err.downcast_ref::<MaxStepsReached>()
+            {
+                tool_error(
+                    "",
+                    format!(
+                        "Max steps {n_steps} reached when running subagent. Please try splitting the task into smaller subtasks."
+                    ),
+                    "Max steps reached",
+                )
+            } else {
+                tool_error(
+                    "",
+                    format!("Failed to run subagent: {err}"),
+                    "Failed to run subagent",
+                )
+            };
+            return (SessionState::Failed, response);
+        }
+
+        let mut final_text = self.final_subagent_text(&soul).await;
+        if final_text.is_empty() {
+            return (
+                SessionState::Failed,
+                tool_error(
+                    "",
+                    "The subagent seemed not to run properly. Maybe you have to do the task yourself.",
+                    "Failed to run subagent",
+                ),
+            );
+        }
+
+        if final_text.len() < 200 && MAX_CONTINUE_ATTEMPTS > 0 {
+            let _ = self
+                .run_subagent_turn(
+                    Arc::clone(&soul),
+                    super_wire,
+                    task_tool_call_id,
+                    child_session_db_id,
+                    CONTINUE_PROMPT.to_string(),
+                )
+                .await;
+            final_text = self.final_subagent_text(&soul).await;
+        }
+
+        if final_text.is_empty() {
+            return (
+                SessionState::Failed,
+                tool_error(
+                    "",
+                    "The subagent seemed not to run properly. Maybe you have to do the task yourself.",
+                    "Failed to run subagent",
+                ),
+            );
+        }
+
+        (SessionState::Completed, tool_ok(final_text, "", ""))
+    }
+
+    async fn run_subagent_turn(
+        &self,
+        soul: Arc<KimiSoul>,
+        super_wire: Arc<Wire>,
+        task_tool_call_id: String,
+        child_session_db_id: i64,
+        prompt: String,
+    ) -> anyhow::Result<()> {
+        let ui_loop = move |wire: Arc<Wire>| {
+            let super_wire = Arc::clone(&super_wire);
+            let task_tool_call_id = task_tool_call_id.clone();
+            async move {
+                let ui = wire.ui_side(true);
+                loop {
+                    let msg = ui.receive().await?;
+                    match msg {
+                        WireMessage::ApprovalRequest(_)
+                        | WireMessage::ApprovalResponse(_)
+                        | WireMessage::ToolCallRequest(_) => {
+                            super_wire.soul_side().send(msg);
+                        }
+                        other => {
+                            if let Ok(event) = SubagentEvent::new(task_tool_call_id.clone(), other)
+                            {
+                                super_wire
+                                    .soul_side()
+                                    .send(WireMessage::SubagentEvent(event));
+                            }
+                        }
+                    }
+                }
+            }
+        };
         let wire_target = Some(WireRecordTarget::new(
             self.runtime.storage.clone(),
-            child_session.db_id(),
+            child_session_db_id,
         ));
-        let result = match tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let handle = tokio::runtime::Handle::current();
             handle.block_on(run_soul(
-                soul_run.as_ref(),
+                soul.as_ref(),
                 crate::wire::UserInput::from(prompt),
                 ui_loop,
                 CancellationToken::new(),
@@ -180,92 +270,18 @@ impl TaskTool {
             ))
         })
         .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                let _ = post_run(&child_session, SessionState::Failed).await;
-                return tool_error(
-                    "",
-                    format!("Failed to run subagent: {err}"),
-                    "Failed to run subagent",
-                );
-            }
-        };
+        .map_err(|err| anyhow::anyhow!("Failed to run subagent: {err}"))?
+    }
 
-        if let Err(err) = result {
-            let _ = post_run(&child_session, SessionState::Failed).await;
-            if let Some(MaxStepsReached { n_steps }) = err.downcast_ref::<MaxStepsReached>() {
-                return tool_error(
-                    "",
-                    format!(
-                        "Max steps {n_steps} reached when running subagent. Please try splitting the task into smaller subtasks."
-                    ),
-                    "Max steps reached",
-                );
-            }
-            return tool_error(
-                "",
-                format!("Failed to run subagent: {err}"),
-                "Failed to run subagent",
-            );
-        }
-
-        let history = soul.context().lock().await.history().to_vec();
-        let mut final_message = history.last().cloned();
-        let mut final_text = final_message
-            .as_ref()
+    async fn final_subagent_text(&self, soul: &Arc<KimiSoul>) -> String {
+        soul.context()
+            .lock()
+            .await
+            .history()
+            .last()
             .filter(|msg| msg.role == Role::Assistant)
             .map(|msg| msg.extract_text("\n"))
-            .unwrap_or_default();
-
-        if final_text.is_empty() {
-            let _ = post_run(&child_session, SessionState::Failed).await;
-            return tool_error(
-                "",
-                "The subagent seemed not to run properly. Maybe you have to do the task yourself.",
-                "Failed to run subagent",
-            );
-        }
-
-        if final_text.len() < 200 && MAX_CONTINUE_ATTEMPTS > 0 {
-            let soul_run = std::sync::Arc::clone(&soul);
-            let ui_loop = make_ui_loop(
-                std::sync::Arc::clone(&super_wire),
-                task_tool_call_id.clone(),
-            );
-            let storage = self.runtime.storage.clone();
-            let child_session_db_id = child_session.db_id();
-            let _ = tokio::task::spawn_blocking(move || {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(run_soul(
-                    soul_run.as_ref(),
-                    crate::wire::UserInput::from(CONTINUE_PROMPT),
-                    ui_loop,
-                    CancellationToken::new(),
-                    Some(WireRecordTarget::new(storage, child_session_db_id)),
-                ))
-            })
-            .await;
-            let history = soul.context().lock().await.history().to_vec();
-            final_message = history.last().cloned();
-            final_text = final_message
-                .as_ref()
-                .filter(|msg| msg.role == Role::Assistant)
-                .map(|msg| msg.extract_text("\n"))
-                .unwrap_or_default();
-        }
-
-        if final_text.is_empty() {
-            let _ = post_run(&child_session, SessionState::Failed).await;
-            return tool_error(
-                "",
-                "The subagent seemed not to run properly. Maybe you have to do the task yourself.",
-                "Failed to run subagent",
-            );
-        }
-
-        let _ = post_run(&child_session, SessionState::Completed).await;
-        tool_ok(final_text, "", "")
+            .unwrap_or_default()
     }
 }
 

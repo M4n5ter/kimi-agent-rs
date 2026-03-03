@@ -5,6 +5,7 @@ use tempfile::TempDir;
 
 use super::{CreateSession, FinishSession, SessionOrigin, SessionState, Storage};
 use crate::config::{KaosConfig, StorageConfig};
+use serde_json::json;
 
 #[tokio::test]
 async fn open_initializes_schema_and_workspace_records() {
@@ -114,4 +115,49 @@ async fn continue_session_uses_last_active_root_session() {
         .expect("continue session")
         .expect("root session");
     assert_eq!(resumed.id, root.id);
+}
+
+#[tokio::test]
+async fn replace_mcp_servers_rewrites_scope_atomically() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let config = StorageConfig {
+        database_path: temp_dir.path().join("state.db").display().to_string(),
+        busy_timeout_ms: 1_000,
+    };
+    let storage = Storage::open(&config).await.expect("open storage");
+
+    storage
+        .replace_mcp_servers(
+            &KaosConfig::Local,
+            &[(
+                "first".to_string(),
+                json!({
+                    "command": "uvx",
+                    "args": ["mcp-server-first"],
+                }),
+            )],
+        )
+        .await
+        .expect("save first config");
+
+    storage
+        .replace_mcp_servers(
+            &KaosConfig::Local,
+            &[(
+                "second".to_string(),
+                json!({
+                    "url": "http://127.0.0.1:3000/mcp",
+                }),
+            )],
+        )
+        .await
+        .expect("replace config");
+
+    let records = storage
+        .load_mcp_servers(&KaosConfig::Local)
+        .await
+        .expect("load mcp servers");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].name, "second");
+    assert_eq!(records[0].transport_kind, "http");
 }

@@ -59,35 +59,10 @@ pub async fn save_persisted_mcp_config(
         .iter()
         .map(|(name, config)| (name.clone(), config.clone()))
         .collect::<Vec<_>>();
-    let existing = storage
-        .load_mcp_servers(kaos)
+    storage
+        .replace_mcp_servers(kaos, &desired)
         .await
-        .map_err(|err| MCPConfigError::new(format!("Failed to load MCP config: {err}")))?;
-
-    for record in existing {
-        if !servers.contains_key(&record.name) {
-            storage
-                .delete_mcp_server(kaos, &record.name)
-                .await
-                .map_err(|err| {
-                    MCPConfigError::new(format!(
-                        "Failed to delete MCP server '{}': {err}",
-                        record.name
-                    ))
-                })?;
-        }
-    }
-
-    for (name, config) in desired {
-        storage
-            .upsert_mcp_server(kaos, &name, &config)
-            .await
-            .map_err(|err| {
-                MCPConfigError::new(format!("Failed to save MCP server '{name}': {err}"))
-            })?;
-    }
-
-    Ok(())
+        .map_err(|err| MCPConfigError::new(format!("Failed to save MCP config: {err}")))
 }
 
 #[derive(Debug, Clone)]
