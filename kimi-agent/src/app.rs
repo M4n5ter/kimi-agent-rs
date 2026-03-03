@@ -230,8 +230,8 @@ impl KimiCLI {
         Ok(messages)
     }
 
-    pub async fn run_wire_stdio(&self) -> anyhow::Result<()> {
-        let server = WireServer::new(Arc::clone(&self.soul));
+    pub async fn run_wire_stdio(&self, created_new_session: bool) -> anyhow::Result<()> {
+        let server = WireServer::new(Arc::clone(&self.soul), created_new_session);
         server.serve().await
     }
 

@@ -10,14 +10,19 @@ use crate::agentspec::{default_agent_file, okabe_agent_file};
 use crate::app::{ConfigInput, CreateOptions, KimiCLI};
 use crate::config::{Config, KaosConfig, load_config, load_config_from_string};
 use crate::constant::VERSION;
-use crate::session::{Session, post_run};
+use crate::session::Session;
 use crate::session_id::normalize_session_id;
-use crate::storage::{SessionState, Storage};
+use crate::storage::Storage;
 use crate::utils::init_logging;
 use tracing::info;
 
 pub mod info;
 pub mod mcp;
+
+struct ResolvedSession {
+    session: Session,
+    created_new_session: bool,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -284,7 +289,7 @@ pub async fn run() -> Result<()> {
 
     match cli.wire_transport {
         WireTransport::Stdio => {
-            let default_session = resolve_session(
+            let resolved_session = resolve_session(
                 &storage,
                 &config.kaos,
                 &work_dir,
@@ -293,7 +298,7 @@ pub async fn run() -> Result<()> {
             )
             .await?;
             let instance = KimiCLI::create(
-                default_session,
+                resolved_session.session,
                 CreateOptions {
                     config: Some(ConfigInput::Inline(Box::new(config))),
                     storage: Some(storage.clone()),
@@ -309,16 +314,9 @@ pub async fn run() -> Result<()> {
                 },
             )
             .await?;
-
-            let session = instance.session().clone();
-            let result = instance.run_wire_stdio().await;
-            let state = if result.is_ok() {
-                SessionState::Completed
-            } else {
-                SessionState::Failed
-            };
-            post_run(&session, state).await?;
-            result?;
+            instance
+                .run_wire_stdio(resolved_session.created_new_session)
+                .await?;
         }
         WireTransport::Ws => {
             let listen_addr = parse_wire_listen_addr(&cli.wire_listen)?;
@@ -549,7 +547,7 @@ async fn resolve_session(
     work_dir: &KaosPath,
     session_id: Option<&String>,
     continue_session: bool,
-) -> Result<Session> {
+) -> Result<ResolvedSession> {
     if let Some(session_id) = session_id {
         let normalized = normalize_session_id(session_id)
             .map_err(|err| anyhow::anyhow!("Invalid --session value: {err}"))?;
@@ -557,7 +555,10 @@ async fn resolve_session(
             Session::find(storage.clone(), kaos.clone(), work_dir.clone(), &normalized).await?;
         if let Some(session) = found {
             info!("Switching to session: {}", session.id);
-            return Ok(session);
+            return Ok(ResolvedSession {
+                session,
+                created_new_session: false,
+            });
         }
         info!("Session {} not found, creating new session", normalized);
         let session = Session::create(
@@ -568,7 +569,10 @@ async fn resolve_session(
         )
         .await?;
         info!("Switching to session: {}", session.id);
-        return Ok(session);
+        return Ok(ResolvedSession {
+            session,
+            created_new_session: true,
+        });
     }
 
     if continue_session {
@@ -576,14 +580,20 @@ async fn resolve_session(
             Session::continue_(storage.clone(), kaos.clone(), work_dir.clone()).await?
         {
             info!("Continuing previous session: {}", session.id);
-            return Ok(session);
+            return Ok(ResolvedSession {
+                session,
+                created_new_session: false,
+            });
         }
         anyhow::bail!("No previous session found for the working directory.");
     }
 
     let session = Session::create(storage.clone(), kaos.clone(), work_dir.clone(), None).await?;
     info!("Created new session: {}", session.id);
-    Ok(session)
+    Ok(ResolvedSession {
+        session,
+        created_new_session: true,
+    })
 }
 
 async fn resolve_ws_default_session_id(

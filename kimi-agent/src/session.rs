@@ -42,6 +42,10 @@ impl Session {
         self.storage.session_is_empty(self.db_id).await
     }
 
+    pub async fn delete(&self) -> Result<()> {
+        self.storage.delete_session(self.db_id).await
+    }
+
     pub async fn create(
         storage: Storage,
         kaos: KaosConfig,

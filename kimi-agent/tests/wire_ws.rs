@@ -746,7 +746,7 @@ async fn test_wire_ws_close_without_prompt_preserves_existing_session_state() {
 }
 
 #[tokio::test]
-async fn test_wire_ws_close_without_prompt_marks_new_session_empty() {
+async fn test_wire_ws_close_without_prompt_discards_new_session() {
     let _lock = ENV_LOCK.lock().await;
     let home_dir = TempDir::new().expect("home dir");
     let work_dir = TempDir::new().expect("work dir");
@@ -770,10 +770,8 @@ async fn test_wire_ws_close_without_prompt_marks_new_session_empty() {
 
     let persisted = Session::find(storage, kaos, work_path, "new-session")
         .await
-        .expect("find session")
-        .expect("new session");
-    assert_eq!(persisted.state.as_str(), "empty");
-    assert!(persisted.is_empty().await.expect("session empty"));
+        .expect("find session");
+    assert!(persisted.is_none(), "unused session should be discarded");
 
     server_task.abort();
     let join_err = server_task

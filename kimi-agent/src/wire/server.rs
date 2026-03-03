@@ -54,13 +54,26 @@ struct ActiveTurn {
 }
 
 #[derive(Clone)]
+struct WireSessionFacts {
+    created_new_session: bool,
+    last_turn_state: Option<SessionState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WireSessionFinalizationAction {
+    Persist(SessionState),
+    DeleteNewUnused,
+    PreserveExisting,
+}
+
+#[derive(Clone)]
 struct WireRpcState {
     soul: Arc<KimiSoul>,
     write_queue: Queue<Value>,
     pending: Arc<tokio::sync::Mutex<HashMap<String, PendingRequest>>>,
     active_turn: Arc<tokio::sync::Mutex<Option<ActiveTurn>>>,
     next_turn_id: Arc<AtomicU64>,
-    created_new_session: bool,
+    session_facts: Arc<tokio::sync::Mutex<WireSessionFacts>>,
 }
 
 impl WireRpcState {
@@ -71,7 +84,10 @@ impl WireRpcState {
             pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_turn: Arc::new(tokio::sync::Mutex::new(None)),
             next_turn_id: Arc::new(AtomicU64::new(1)),
-            created_new_session,
+            session_facts: Arc::new(tokio::sync::Mutex::new(WireSessionFacts {
+                created_new_session,
+                last_turn_state: None,
+            })),
         }
     }
 
@@ -81,10 +97,6 @@ impl WireRpcState {
 
     fn session(&self) -> Session {
         self.soul.runtime().session.clone()
-    }
-
-    fn created_new_session(&self) -> bool {
-        self.created_new_session
     }
 
     async fn handle_json_line(&self, line: &str) {
@@ -286,7 +298,7 @@ impl WireRpcState {
         let turn_cancel_token = cancel_token.clone();
         let active_turn_slot = Arc::clone(&self.active_turn);
         let soul = Arc::clone(&self.soul);
-        let session = self.session();
+        let session_facts = Arc::clone(&self.session_facts);
         let write_queue = self.write_queue.clone();
         let pending = Arc::clone(&self.pending);
         let wire_target = Some(crate::wire::WireRecordTarget::new(
@@ -417,13 +429,7 @@ impl WireRpcState {
                 Err(err) if err.is::<RunCancelled>() => SessionState::Cancelled,
                 Err(_) => SessionState::Failed,
             };
-            if let Err(err) = post_run_session(&session, state).await {
-                warn!(
-                    session_id = %session.id,
-                    "Failed to persist session state after websocket turn: {}",
-                    err
-                );
-            }
+            session_facts.lock().await.last_turn_state = Some(state);
             let mut slot = active_turn_slot.lock().await;
             if slot.as_ref().is_some_and(|turn| turn.id == turn_id) {
                 *slot = None;
@@ -613,6 +619,24 @@ impl WireRpcState {
 
         self.write_queue.shutdown(false);
     }
+
+    async fn finalize_session(&self) -> anyhow::Result<()> {
+        let action = {
+            let facts = self.session_facts.lock().await;
+            wire_session_finalization_action(
+                facts.created_new_session,
+                facts.last_turn_state.clone(),
+            )
+        };
+        let session = self.session();
+        match action {
+            WireSessionFinalizationAction::Persist(state) => {
+                post_run_session(&session, state).await
+            }
+            WireSessionFinalizationAction::DeleteNewUnused => session.delete().await,
+            WireSessionFinalizationAction::PreserveExisting => Ok(()),
+        }
+    }
 }
 
 async fn cancel_and_wait_active_turn(
@@ -630,14 +654,15 @@ async fn cancel_and_wait_active_turn(
     }
 }
 
-async fn finalize_unused_ws_session(
-    session: &Session,
+fn wire_session_finalization_action(
     created_new_session: bool,
-) -> anyhow::Result<()> {
-    if !created_new_session || !session.is_empty().await? {
-        return Ok(());
+    last_turn_state: Option<SessionState>,
+) -> WireSessionFinalizationAction {
+    match last_turn_state {
+        Some(state) => WireSessionFinalizationAction::Persist(state),
+        None if created_new_session => WireSessionFinalizationAction::DeleteNewUnused,
+        None => WireSessionFinalizationAction::PreserveExisting,
     }
-    post_run_session(session, SessionState::Empty).await
 }
 
 pub struct WireServer {
@@ -647,9 +672,9 @@ pub struct WireServer {
 pub type WireOverStdio = WireServer;
 
 impl WireServer {
-    pub fn new(soul: Arc<KimiSoul>) -> Self {
+    pub fn new(soul: Arc<KimiSoul>, created_new_session: bool) -> Self {
         Self {
-            rpc: WireRpcState::new(soul, false),
+            rpc: WireRpcState::new(soul, created_new_session),
         }
     }
 
@@ -689,21 +714,30 @@ impl WireServer {
             }
         });
 
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            let n = reader.read_until(b'\n', &mut buf).await?;
-            if n == 0 {
-                info!("stdin closed, Wire server exiting");
-                break;
+        let result = async {
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                let n = reader.read_until(b'\n', &mut buf).await?;
+                if n == 0 {
+                    info!("stdin closed, Wire server exiting");
+                    break Ok(());
+                }
+                let line = String::from_utf8_lossy(&buf);
+                self.rpc.handle_json_line(&line).await;
             }
-            let line = String::from_utf8_lossy(&buf);
-            self.rpc.handle_json_line(&line).await;
         }
+        .await;
 
         self.rpc.shutdown().await;
+        if let Err(err) = self.rpc.finalize_session().await {
+            warn!(
+                "Failed to finalize session metadata after stdio shutdown: {}",
+                err
+            );
+        }
         let _ = write_task.await;
-        Ok(())
+        result
     }
 }
 
@@ -929,12 +963,8 @@ async fn ws_upgrade_handler(
         );
         tokio::spawn(async move {
             if let Some(rpc) = rpc_slot_for_failed_upgrade.lock().await.take() {
-                let session = rpc.session();
-                let created_new_session = rpc.created_new_session();
                 rpc.shutdown().await;
-                if let Err(post_run_err) =
-                    finalize_unused_ws_session(&session, created_new_session).await
-                {
+                if let Err(post_run_err) = rpc.finalize_session().await {
                     warn!(
                         session_id = %session_id_for_failed_upgrade,
                         "Failed to finalize session metadata after failed websocket upgrade: {}",
@@ -1018,10 +1048,8 @@ async fn handle_ws_socket(
         }
     }
 
-    let session = rpc.session();
-    let created_new_session = rpc.created_new_session();
     rpc.shutdown().await;
-    if let Err(err) = finalize_unused_ws_session(&session, created_new_session).await {
+    if let Err(err) = rpc.finalize_session().await {
         warn!(
             session_id = %session_id,
             "Failed to finalize session metadata after websocket close: {}",
@@ -1111,7 +1139,12 @@ mod tests {
 
     use tokio_util::sync::CancellationToken;
 
-    use super::{ActiveTurn, cancel_and_wait_active_turn, normalize_ws_path};
+    use crate::storage::SessionState;
+
+    use super::{
+        ActiveTurn, WireSessionFinalizationAction, cancel_and_wait_active_turn, normalize_ws_path,
+        wire_session_finalization_action,
+    };
 
     #[test]
     fn normalize_ws_path_accepts_valid_path() {
@@ -1125,6 +1158,34 @@ mod tests {
         assert!(normalize_ws_path("wire").is_err());
         assert!(normalize_ws_path("/wire?x=1").is_err());
         assert!(normalize_ws_path("/wire#frag").is_err());
+    }
+
+    #[test]
+    fn wire_session_finalization_action_persists_last_turn_state() {
+        assert_eq!(
+            wire_session_finalization_action(true, Some(SessionState::Completed)),
+            WireSessionFinalizationAction::Persist(SessionState::Completed)
+        );
+        assert_eq!(
+            wire_session_finalization_action(false, Some(SessionState::Cancelled)),
+            WireSessionFinalizationAction::Persist(SessionState::Cancelled)
+        );
+    }
+
+    #[test]
+    fn wire_session_finalization_action_discards_unused_new_sessions() {
+        assert_eq!(
+            wire_session_finalization_action(true, None),
+            WireSessionFinalizationAction::DeleteNewUnused
+        );
+    }
+
+    #[test]
+    fn wire_session_finalization_action_preserves_unused_existing_sessions() {
+        assert_eq!(
+            wire_session_finalization_action(false, None),
+            WireSessionFinalizationAction::PreserveExisting
+        );
     }
 
     #[tokio::test]

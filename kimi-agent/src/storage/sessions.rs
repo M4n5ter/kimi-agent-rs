@@ -245,6 +245,14 @@ impl Storage {
         })
         .await
     }
+
+    pub async fn delete_session(&self, session_db_id: i64) -> Result<()> {
+        self.with_connection(move |conn| {
+            conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_db_id])?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 pub(super) fn load_session(
