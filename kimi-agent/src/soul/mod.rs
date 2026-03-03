@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::config::ModelCapability;
+use crate::storage::SessionState;
 use crate::utils::{QueueShutDown, SlashCommandInfo};
 use crate::wire::{UserInput, Wire, WireMessage, WireRecordTarget};
 
@@ -71,6 +72,15 @@ impl MaxStepsReached {
 #[derive(Debug, Error)]
 #[error("run cancelled")]
 pub struct RunCancelled;
+
+pub fn session_state_from_run_result(result: &anyhow::Result<()>) -> SessionState {
+    match result {
+        Ok(()) => SessionState::Completed,
+        Err(err) if err.is::<MaxStepsReached>() => SessionState::MaxStepsReached,
+        Err(err) if err.is::<RunCancelled>() => SessionState::Cancelled,
+        Err(_) => SessionState::Failed,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct StatusSnapshot {

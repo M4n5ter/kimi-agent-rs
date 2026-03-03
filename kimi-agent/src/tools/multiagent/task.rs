@@ -11,7 +11,9 @@ use crate::soul::agent::{AgentDefinition, Runtime};
 use crate::soul::context::Context;
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::toolset::{KimiToolset, get_current_tool_call_or_none};
-use crate::soul::{MaxStepsReached, get_current_wire_or_none, run_soul};
+use crate::soul::{
+    MaxStepsReached, get_current_wire_or_none, run_soul, session_state_from_run_result,
+};
 use crate::storage::{SessionOrigin, SessionState};
 use crate::tools::utils::load_desc;
 use crate::wire::{SubagentEvent, Wire, WireMessage, WireRecordTarget};
@@ -110,7 +112,21 @@ impl TaskTool {
                 );
             }
         };
-        let child_runtime = self.runtime.rebind_session(child_session.clone());
+        let child_runtime = match self
+            .runtime
+            .create_child_runtime(child_session.clone())
+            .await
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                let _ = child_session.delete().await;
+                return tool_error(
+                    "",
+                    format!("Failed to initialize subagent runtime: {err}"),
+                    "Failed to run subagent",
+                );
+            }
+        };
         let overlay = self.toolset.lock().await.snapshot_overlay();
         let agent = match definition
             .instantiate_with_overlay(child_runtime, &overlay)
@@ -164,6 +180,7 @@ impl TaskTool {
                 prompt,
             )
             .await;
+        let state = session_state_from_run_result(&result);
         if let Err(err) = result {
             let response = if let Some(MaxStepsReached { n_steps }) =
                 err.downcast_ref::<MaxStepsReached>()
@@ -182,7 +199,7 @@ impl TaskTool {
                     "Failed to run subagent",
                 )
             };
-            return (SessionState::Failed, response);
+            return (state, response);
         }
 
         let mut final_text = self.final_subagent_text(&soul).await;

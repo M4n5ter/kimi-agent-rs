@@ -1,12 +1,17 @@
 mod agent_test_utils;
 mod tool_test_utils;
 
+use kaos::KaosPath;
+use kimi_agent::config::{LLMModel, LLMProvider, ProviderType, StorageConfig, get_default_config};
 use kimi_agent::session::Session;
 use kimi_agent::soul::agent::AgentDefinition;
 use kimi_agent::tools::multiagent::{CreateSubagent, CreateSubagentParams, TaskParams, TaskTool};
+use kosong::chat_provider::kimi::Kimi;
 use kosong::tooling::CallableTool2;
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tempfile::TempDir;
 
 use tool_test_utils::RuntimeFixture;
 
@@ -124,7 +129,11 @@ async fn test_created_subagent_instantiates_with_child_session_runtime() {
     )
     .await
     .expect("create child session");
-    let child_runtime = fixture.runtime.rebind_session(child_session.clone());
+    let child_runtime = fixture
+        .runtime
+        .create_child_runtime(child_session.clone())
+        .await
+        .expect("create child runtime");
 
     let root_agent = root_definition
         .instantiate(fixture.runtime.clone())
@@ -215,7 +224,11 @@ async fn test_dynamic_subagent_inherits_parent_external_tools_overlay() {
     )
     .await
     .expect("create child session");
-    let child_runtime = fixture.runtime.rebind_session(child_session.clone());
+    let child_runtime = fixture
+        .runtime
+        .create_child_runtime(child_session.clone())
+        .await
+        .expect("create child runtime");
     let overlay = root_agent.toolset.lock().await.snapshot_overlay();
     let child_agent = dynamic_definition
         .instantiate_with_overlay(child_runtime, &overlay)
@@ -261,4 +274,172 @@ async fn test_task_resolves_global_fixed_subagent_from_registry() {
 
     assert!(result.is_error);
     assert_eq!(result.brief(), "Wire unavailable");
+}
+
+#[tokio::test]
+async fn test_child_runtime_recreates_kimi_prompt_cache_key() {
+    let storage_dir = TempDir::new().expect("storage dir");
+    let work_dir = TempDir::new().expect("work dir");
+
+    let mut config = get_default_config();
+    config.storage = StorageConfig {
+        database_path: storage_dir.path().join("state.db").display().to_string(),
+        busy_timeout_ms: 1_000,
+    };
+    config.default_model = "kimi-test".to_string();
+    config.models.insert(
+        "kimi-test".to_string(),
+        LLMModel {
+            provider: "kimi-provider".to_string(),
+            model: "kimi-base".to_string(),
+            max_context_size: 4096,
+            capabilities: None,
+        },
+    );
+    config.providers.insert(
+        "kimi-provider".to_string(),
+        LLMProvider {
+            provider_type: ProviderType::Kimi,
+            base_url: "https://api.test/v1".to_string(),
+            api_key: "test-key".to_string(),
+            env: None,
+            custom_headers: None,
+        },
+    );
+
+    let storage = kimi_agent::storage::Storage::open(&config.storage)
+        .await
+        .expect("open storage");
+    let root_session = Session::create(
+        storage.clone(),
+        config.kaos.clone(),
+        KaosPath::from(PathBuf::from(work_dir.path())),
+        Some("root".to_string()),
+    )
+    .await
+    .expect("create root session");
+    let runtime = kimi_agent::soul::agent::Runtime::create(
+        config,
+        storage.clone(),
+        kimi_agent::llm::create_llm(
+            &LLMProvider {
+                provider_type: ProviderType::Kimi,
+                base_url: "https://api.test/v1".to_string(),
+                api_key: "test-key".to_string(),
+                env: None,
+                custom_headers: None,
+            },
+            &LLMModel {
+                provider: "kimi-provider".to_string(),
+                model: "kimi-base".to_string(),
+                max_context_size: 4096,
+                capabilities: None,
+            },
+            Some(false),
+            Some(&root_session.id),
+        )
+        .await
+        .expect("create root llm")
+        .map(Arc::new),
+        root_session.clone(),
+        true,
+        None,
+    )
+    .await;
+
+    let child_session = Session::create(
+        storage,
+        runtime.config.kaos.clone(),
+        root_session.work_dir.clone(),
+        Some("child".to_string()),
+    )
+    .await
+    .expect("create child session");
+    let child_runtime = runtime
+        .create_child_runtime(child_session.clone())
+        .await
+        .expect("create child runtime");
+
+    let root_kimi = runtime
+        .llm
+        .as_ref()
+        .expect("root llm")
+        .chat_provider
+        .as_any()
+        .downcast_ref::<Kimi>()
+        .expect("kimi provider");
+    let child_kimi = child_runtime
+        .llm
+        .as_ref()
+        .expect("child llm")
+        .chat_provider
+        .as_any()
+        .downcast_ref::<Kimi>()
+        .expect("kimi provider");
+
+    assert_eq!(
+        root_kimi.model_parameters().get("prompt_cache_key"),
+        Some(&json!(root_session.id))
+    );
+    assert_eq!(
+        child_kimi.model_parameters().get("prompt_cache_key"),
+        Some(&json!(child_session.id))
+    );
+}
+
+#[tokio::test]
+async fn test_isolated_runtime_keeps_fixed_registry_only() {
+    let fixture = RuntimeFixture::new();
+    fixture
+        .runtime
+        .subagent_registry
+        .lock()
+        .await
+        .add_fixed_subagent(
+            "coder".to_string(),
+            Arc::new(AgentDefinition {
+                name: "Coder".to_string(),
+                system_prompt: "You are a coder.".to_string(),
+                tool_paths: vec!["kimi_cli.tools.think:Think".to_string()],
+                mcp_configs: Vec::new(),
+            }),
+            "Fixed coder".to_string(),
+        )
+        .expect("install fixed coder");
+    fixture
+        .runtime
+        .subagent_registry
+        .lock()
+        .await
+        .add_dynamic_subagent(
+            "dynamic".to_string(),
+            Arc::new(AgentDefinition {
+                name: "Dynamic".to_string(),
+                system_prompt: "You are dynamic.".to_string(),
+                tool_paths: vec!["kimi_cli.tools.think:Think".to_string()],
+                mcp_configs: Vec::new(),
+            }),
+        );
+
+    let tmp_session = Session::create(
+        fixture.runtime.storage.clone(),
+        fixture.runtime.config.kaos.clone(),
+        fixture.runtime.session.work_dir.clone(),
+        Some("tmp-init".to_string()),
+    )
+    .await
+    .expect("create tmp session");
+    let isolated = fixture
+        .runtime
+        .create_isolated_runtime(tmp_session)
+        .await
+        .expect("create isolated runtime");
+
+    assert!(!Arc::ptr_eq(
+        &fixture.runtime.subagent_registry,
+        &isolated.subagent_registry
+    ));
+    let registry = isolated.subagent_registry.lock().await;
+    assert!(registry.contains("coder"));
+    assert!(!registry.contains("dynamic"));
 }

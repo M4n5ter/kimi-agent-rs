@@ -25,7 +25,7 @@ use crate::soul::{
     message::{check_message, system, tool_result_to_message},
     wire_send,
 };
-use crate::storage::{SessionOrigin, SessionState};
+use crate::storage::SessionOrigin;
 use crate::tools::utils::is_tool_rejected;
 use crate::utils::{SlashCommandInfo, parse_slash_command_call};
 use crate::wire::{
@@ -268,10 +268,16 @@ impl KimiSoul {
             },
         )
         .await?;
-        let mut tmp_agent = self.agent.clone();
-        tmp_agent.runtime.storage = self.runtime.storage.clone();
-        tmp_agent.runtime.config.kaos = self.runtime.config.kaos.clone();
-        tmp_agent.runtime.session = tmp_session.clone();
+        let tmp_runtime = self
+            .runtime
+            .create_isolated_runtime(tmp_session.clone())
+            .await?;
+        let overlay = self.agent.toolset.lock().await.snapshot_overlay();
+        let tmp_agent = self
+            .agent
+            .definition
+            .instantiate_with_overlay(tmp_runtime, &overlay)
+            .await?;
         let tmp_context = Context::new(
             self.runtime.storage.clone(),
             tmp_session.db_id(),
@@ -281,11 +287,8 @@ impl KimiSoul {
         let init_result = tmp_soul
             .run(UserInput::Text(crate::prompts::INIT.to_string()))
             .await;
-        let state = if init_result.is_ok() {
-            SessionState::Completed
-        } else {
-            SessionState::Failed
-        };
+        tmp_soul.shutdown().await;
+        let state = crate::soul::session_state_from_run_result(&init_result);
         let _ = post_run(&tmp_session, state).await;
         init_result?;
 

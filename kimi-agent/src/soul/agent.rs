@@ -4,13 +4,14 @@ use std::sync::Arc;
 
 use chrono::Local;
 use kaos::KaosPath;
+use kosong::chat_provider::ThinkingEffort;
 use regex::Regex;
 use tracing::{debug, info};
 
 use crate::agentspec::load_agent_spec;
 use crate::config::Config;
 use crate::exception::{AgentSpecError, SystemPromptTemplateError};
-use crate::llm::LLM;
+use crate::llm::{LLM, create_llm};
 use crate::session::Session;
 use crate::skill::{Skill, discover_skills_from_roots, index_skills, resolve_skills_roots};
 use crate::soul::approval::Approval;
@@ -67,6 +68,7 @@ pub async fn load_agents_md(work_dir: &KaosPath) -> Option<String> {
 
 #[derive(Clone)]
 pub struct Runtime {
+    pub factory: Arc<RuntimeFactory>,
     pub config: Config,
     pub storage: Storage,
     pub llm: Option<Arc<LLM>>,
@@ -77,6 +79,116 @@ pub struct Runtime {
     pub subagent_registry: Arc<tokio::sync::Mutex<SubagentRegistry>>,
     pub environment: Environment,
     pub skills: HashMap<String, Skill>,
+}
+
+#[derive(Clone)]
+struct LlmBlueprint {
+    provider: crate::config::LLMProvider,
+    model: crate::config::LLMModel,
+    thinking: Option<bool>,
+}
+
+#[derive(Clone)]
+pub struct RuntimeFactory {
+    config: Config,
+    storage: Storage,
+    llm: Option<LlmBlueprint>,
+    approval: Arc<Approval>,
+    environment: Environment,
+    skills_dir: Option<KaosPath>,
+}
+
+impl RuntimeFactory {
+    fn new(
+        config: Config,
+        storage: Storage,
+        llm: Option<Arc<LLM>>,
+        approval: Arc<Approval>,
+        environment: Environment,
+        skills_dir: Option<KaosPath>,
+    ) -> Self {
+        let llm = llm.and_then(|llm| {
+            Some(LlmBlueprint {
+                provider: llm.provider_config.clone()?,
+                model: llm.model_config.clone()?,
+                thinking: llm
+                    .chat_provider
+                    .thinking_effort()
+                    .map(|effort| effort != ThinkingEffort::Off),
+            })
+        });
+        Self {
+            config,
+            storage,
+            llm,
+            approval,
+            environment,
+            skills_dir,
+        }
+    }
+
+    async fn create_runtime(
+        self: &Arc<Self>,
+        session: Session,
+        subagent_registry: Arc<tokio::sync::Mutex<SubagentRegistry>>,
+    ) -> Result<Runtime, anyhow::Error> {
+        let work_dir = session.work_dir.clone();
+        let (ls_output, agents_md) =
+            tokio::join!(list_directory(&work_dir), load_agents_md(&work_dir));
+
+        let skills_roots = resolve_skills_roots(&work_dir, self.skills_dir.clone()).await;
+        let skills = discover_skills_from_roots(&skills_roots).await;
+        let skills_by_name = index_skills(&skills);
+        let skills_formatted = if skills.is_empty() {
+            "No skills found.".to_string()
+        } else {
+            skills
+                .iter()
+                .map(|skill| {
+                    format!(
+                        "- {}\n  - Path: {}\n  - Description: {}",
+                        skill.name,
+                        skill.skill_md_file().to_string_lossy(),
+                        skill.description
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let llm = match &self.llm {
+            Some(blueprint) => create_llm(
+                &blueprint.provider,
+                &blueprint.model,
+                blueprint.thinking,
+                Some(&session.id),
+            )
+            .await
+            .map_err(anyhow::Error::new)?
+            .map(Arc::new),
+            None => None,
+        };
+
+        Ok(Runtime {
+            factory: Arc::clone(self),
+            config: self.config.clone(),
+            storage: self.storage.clone(),
+            llm,
+            session,
+            builtin_args: BuiltinSystemPromptArgs {
+                KIMI_NOW: Local::now().to_rfc3339(),
+                KIMI_WORK_DIR: work_dir,
+                KIMI_WORK_DIR_LS: ls_output,
+                KIMI_AGENTS_MD: agents_md.unwrap_or_default(),
+                KIMI_SKILLS: skills_formatted,
+            },
+            denwa_renji: Arc::new(tokio::sync::Mutex::new(DenwaRenji::new())),
+            approval: Arc::new(self.approval.share()),
+            subagent_registry,
+            environment: self.environment.clone(),
+            skills: skills_by_name,
+        })
+    }
 }
 
 impl Runtime {
@@ -95,7 +207,7 @@ impl Runtime {
             Environment::detect()
         );
 
-        let skills_roots = resolve_skills_roots(&work_dir, skills_dir).await;
+        let skills_roots = resolve_skills_roots(&work_dir, skills_dir.clone()).await;
         let skills = discover_skills_from_roots(&skills_roots).await;
         info!("Discovered {} skill(s)", skills.len());
         let skills_by_name = index_skills(&skills);
@@ -116,10 +228,22 @@ impl Runtime {
                 .join("\n")
         };
 
-        Runtime {
+        let approval = Arc::new(Approval::new(yolo));
+        let root_llm = llm.clone();
+        let factory = Arc::new(RuntimeFactory::new(
             config,
             storage,
             llm,
+            Arc::clone(&approval),
+            environment.clone(),
+            skills_dir,
+        ));
+
+        Runtime {
+            factory: Arc::clone(&factory),
+            config: factory.config.clone(),
+            storage: factory.storage.clone(),
+            llm: root_llm,
             session,
             builtin_args: BuiltinSystemPromptArgs {
                 KIMI_NOW: Local::now().to_rfc3339(),
@@ -129,7 +253,7 @@ impl Runtime {
                 KIMI_SKILLS: skills_formatted,
             },
             denwa_renji: Arc::new(tokio::sync::Mutex::new(DenwaRenji::new())),
-            approval: Arc::new(Approval::new(yolo)),
+            approval,
             subagent_registry: Arc::new(tokio::sync::Mutex::new(SubagentRegistry::new())),
             environment,
             skills: skills_by_name,
@@ -138,6 +262,7 @@ impl Runtime {
 
     pub fn copy_for_fixed_subagent(&self) -> Runtime {
         Runtime {
+            factory: Arc::clone(&self.factory),
             config: self.config.clone(),
             storage: self.storage.clone(),
             llm: self.llm.clone(),
@@ -151,26 +276,24 @@ impl Runtime {
         }
     }
 
-    pub fn copy_for_dynamic_subagent(&self) -> Runtime {
-        Runtime {
-            config: self.config.clone(),
-            storage: self.storage.clone(),
-            llm: self.llm.clone(),
-            session: self.session.clone(),
-            builtin_args: self.builtin_args.clone(),
-            denwa_renji: Arc::new(tokio::sync::Mutex::new(DenwaRenji::new())),
-            approval: Arc::new(self.approval.share()),
-            subagent_registry: Arc::clone(&self.subagent_registry),
-            environment: self.environment.clone(),
-            skills: self.skills.clone(),
-        }
+    pub async fn create_child_runtime(&self, session: Session) -> Result<Runtime, anyhow::Error> {
+        self.factory
+            .create_runtime(session, Arc::clone(&self.subagent_registry))
+            .await
     }
 
-    pub fn rebind_session(&self, session: Session) -> Runtime {
-        let mut runtime = self.copy_for_dynamic_subagent();
-        runtime.session = session.clone();
-        runtime.builtin_args.KIMI_WORK_DIR = session.work_dir.clone();
-        runtime
+    pub async fn create_isolated_runtime(
+        &self,
+        session: Session,
+    ) -> Result<Runtime, anyhow::Error> {
+        let fixed_subagents = self.subagent_registry.lock().await.fixed_snapshot();
+        let mut registry = SubagentRegistry::new();
+        registry
+            .replace_fixed_subagents(fixed_subagents)
+            .map_err(anyhow::Error::msg)?;
+        self.factory
+            .create_runtime(session, Arc::new(tokio::sync::Mutex::new(registry)))
+            .await
     }
 }
 
@@ -353,6 +476,10 @@ impl SubagentRegistry {
             .collect::<Vec<_>>();
         descriptions.sort_by(|a, b| a.0.cmp(&b.0));
         descriptions
+    }
+
+    pub fn fixed_snapshot(&self) -> HashMap<String, RegisteredSubagent> {
+        self.fixed_subagents.clone()
     }
 }
 

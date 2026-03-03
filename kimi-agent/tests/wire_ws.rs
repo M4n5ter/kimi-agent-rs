@@ -746,6 +746,77 @@ async fn test_wire_ws_close_without_prompt_preserves_existing_session_state() {
 }
 
 #[tokio::test]
+async fn test_wire_ws_max_steps_reached_persists_matching_session_state() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let work_dir = TempDir::new().expect("work dir");
+    let _env = configure_scripted_env(&home_dir, &["text: hello"]);
+
+    let mut options = scripted_runtime_options(&work_dir, "default-session");
+    options.max_steps_per_turn = Some(0);
+    let storage = options.storage.clone();
+    let kaos = options.config.kaos.clone();
+    let work_path = options.work_dir.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
+
+    let mut ws = connect_ws_with_retry(&format!("ws://{listen_addr}/wire")).await;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": { "protocol_version": WIRE_PROTOCOL_VERSION }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send initialize");
+    let _ = recv_response_by_id(&mut ws, "init").await;
+
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-max-steps",
+            "method": "prompt",
+            "params": { "user_input": "hello" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send prompt");
+
+    let response = recv_response_by_id(&mut ws, "prompt-max-steps").await;
+    assert_eq!(
+        response
+            .get("result")
+            .and_then(|v| v.get("status"))
+            .and_then(Value::as_str),
+        Some("max_steps_reached")
+    );
+
+    ws.close(None).await.expect("close ws");
+    let persisted = Session::find(storage, kaos, work_path, "default-session")
+        .await
+        .expect("find session")
+        .expect("session");
+    assert_eq!(persisted.state.as_str(), "max_steps_reached");
+
+    server_task.abort();
+    let join_err = server_task
+        .await
+        .expect_err("server task should be aborted for test shutdown");
+    assert!(join_err.is_cancelled(), "unexpected join error: {join_err}");
+}
+
+#[tokio::test]
 async fn test_wire_ws_close_without_prompt_discards_new_session() {
     let _lock = ENV_LOCK.lock().await;
     let home_dir = TempDir::new().expect("home dir");

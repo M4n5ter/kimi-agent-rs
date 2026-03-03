@@ -27,7 +27,10 @@ use crate::constant::{NAME, VERSION};
 use crate::session::{Session, post_run as post_run_session};
 use crate::session_id::normalize_session_id;
 use crate::soul::kimisoul::KimiSoul;
-use crate::soul::{LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul};
+use crate::soul::{
+    LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul,
+    session_state_from_run_result,
+};
 use crate::storage::{SessionState, Storage};
 use crate::utils::{Queue, QueueShutDown};
 use crate::wire::jsonrpc::{
@@ -424,11 +427,7 @@ impl WireRpcState {
                     }
                 }
             }
-            let state = match &run_result {
-                Ok(()) => SessionState::Completed,
-                Err(err) if err.is::<RunCancelled>() => SessionState::Cancelled,
-                Err(_) => SessionState::Failed,
-            };
+            let state = session_state_from_run_result(&run_result);
             session_facts.lock().await.last_turn_state = Some(state);
             let mut slot = active_turn_slot.lock().await;
             if slot.as_ref().is_some_and(|turn| turn.id == turn_id) {
@@ -1169,6 +1168,10 @@ mod tests {
         assert_eq!(
             wire_session_finalization_action(false, Some(SessionState::Cancelled)),
             WireSessionFinalizationAction::Persist(SessionState::Cancelled)
+        );
+        assert_eq!(
+            wire_session_finalization_action(false, Some(SessionState::MaxStepsReached)),
+            WireSessionFinalizationAction::Persist(SessionState::MaxStepsReached)
         );
     }
 

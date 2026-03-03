@@ -13,9 +13,7 @@ use kimi_agent::config::{
 };
 use kimi_agent::llm::LLM;
 use kimi_agent::session::Session;
-use kimi_agent::soul::agent::{BuiltinSystemPromptArgs, Runtime, SubagentRegistry};
-use kimi_agent::soul::approval::Approval;
-use kimi_agent::soul::denwarenji::DenwaRenji;
+use kimi_agent::soul::agent::{BuiltinSystemPromptArgs, Runtime};
 use kimi_agent::storage::Storage;
 use kimi_agent::utils::Environment;
 use kosong::chat_provider::echo::EchoChatProvider;
@@ -136,24 +134,22 @@ impl RuntimeFixture {
             },
         };
 
-        let runtime = Runtime {
+        let mut runtime = block_on_test_future(Runtime::create(
             config,
-            storage: storage.clone(),
-            llm: Some(Arc::new(llm)),
-            session: session.clone(),
-            builtin_args: BuiltinSystemPromptArgs {
-                KIMI_NOW: "1970-01-01T00:00:00+00:00".to_string(),
-                KIMI_WORK_DIR: work_path,
-                KIMI_WORK_DIR_LS: "Test ls content".to_string(),
-                KIMI_AGENTS_MD: "Test agents content".to_string(),
-                KIMI_SKILLS: "No skills found.".to_string(),
-            },
-            denwa_renji: Arc::new(tokio::sync::Mutex::new(DenwaRenji::new())),
-            approval: Arc::new(Approval::new(true)),
-            subagent_registry: Arc::new(tokio::sync::Mutex::new(SubagentRegistry::new())),
-            environment,
-            skills: Default::default(),
+            storage.clone(),
+            Some(Arc::new(llm)),
+            session.clone(),
+            true,
+            None,
+        ));
+        runtime.builtin_args = BuiltinSystemPromptArgs {
+            KIMI_NOW: "1970-01-01T00:00:00+00:00".to_string(),
+            KIMI_WORK_DIR: work_path,
+            KIMI_WORK_DIR_LS: "Test ls content".to_string(),
+            KIMI_AGENTS_MD: "Test agents content".to_string(),
+            KIMI_SKILLS: "No skills found.".to_string(),
         };
+        runtime.environment = environment;
 
         Self {
             runtime,
