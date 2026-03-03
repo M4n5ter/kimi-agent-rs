@@ -1,6 +1,6 @@
+mod agent_test_utils;
 mod tool_test_utils;
 
-use kimi_agent::soul::toolset::KimiToolset;
 use kimi_agent::tools::dmail::SendDMail;
 use kimi_agent::tools::file::{Glob, Grep, ReadFile, ReadMediaFile, StrReplaceFile, WriteFile};
 use kimi_agent::tools::multiagent::{CreateSubagent, TaskTool};
@@ -9,8 +9,6 @@ use kimi_agent::tools::think::Think;
 use kimi_agent::tools::todo::SetTodoList;
 use kimi_agent::tools::web::{FetchURL, SearchWeb};
 use kosong::tooling::CallableTool;
-use std::sync::Arc;
-
 use tool_test_utils::RuntimeFixture;
 
 fn normalize_required(value: &mut serde_json::Value) {
@@ -43,7 +41,7 @@ fn assert_schema_eq(actual: serde_json::Value, expected: serde_json::Value) {
 #[test]
 fn test_task_params_schema() {
     let fixture = RuntimeFixture::new();
-    let tool = TaskTool::new(&fixture.runtime);
+    let tool = TaskTool::new(&fixture.runtime, agent_test_utils::test_agent_definition());
     let base = tool.base();
     assert_schema_eq(
         base.parameters,
@@ -71,10 +69,7 @@ fn test_task_params_schema() {
 #[test]
 fn test_create_subagent_params_schema() {
     let fixture = RuntimeFixture::new();
-    let tool = CreateSubagent::new(
-        Arc::new(tokio::sync::Mutex::new(KimiToolset::new())),
-        &fixture.runtime,
-    );
+    let tool = CreateSubagent::new(&fixture.runtime, agent_test_utils::test_agent_definition());
     let base = tool.base();
     assert_schema_eq(
         base.parameters,

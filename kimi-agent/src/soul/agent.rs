@@ -18,6 +18,7 @@ use crate::soul::denwarenji::DenwaRenji;
 use crate::soul::toolset::KimiToolset;
 use crate::storage::Storage;
 use crate::utils::{Environment, list_directory};
+use serde_json::Value;
 
 #[derive(Clone, Debug)]
 #[allow(non_snake_case)]
@@ -164,21 +165,79 @@ impl Runtime {
             skills: self.skills.clone(),
         }
     }
+
+    pub fn rebind_session(&self, session: Session) -> Runtime {
+        let mut runtime = self.copy_for_dynamic_subagent();
+        runtime.session = session.clone();
+        runtime.builtin_args.KIMI_WORK_DIR = session.work_dir.clone();
+        runtime
+    }
+}
+
+#[derive(Clone)]
+pub struct AgentDefinition {
+    pub name: String,
+    pub system_prompt: String,
+    pub tool_paths: Vec<String>,
+    pub mcp_configs: Vec<Value>,
+    pub fixed_subagents: HashMap<String, Arc<AgentDefinition>>,
+    pub fixed_subagent_descs: HashMap<String, String>,
+}
+
+impl AgentDefinition {
+    pub async fn instantiate(self: &Arc<Self>, runtime: Runtime) -> Result<Agent, anyhow::Error> {
+        let toolset = Arc::new(tokio::sync::Mutex::new(KimiToolset::new()));
+        {
+            let mut guard = toolset.lock().await;
+            guard
+                .load_tools(
+                    &self.tool_paths,
+                    &runtime,
+                    Arc::clone(&toolset),
+                    Arc::clone(self),
+                )
+                .map_err(anyhow::Error::from)?;
+
+            if !self.mcp_configs.is_empty() {
+                guard
+                    .load_mcp_tools(&self.mcp_configs, &runtime, Arc::clone(&toolset))
+                    .await?;
+            }
+        }
+
+        Ok(Agent {
+            name: self.name.clone(),
+            system_prompt: self.system_prompt.clone(),
+            definition: Arc::clone(self),
+            toolset,
+            runtime,
+        })
+    }
+
+    pub fn derive_dynamic(&self, name: String, system_prompt: String) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            system_prompt,
+            tool_paths: self.tool_paths.clone(),
+            mcp_configs: self.mcp_configs.clone(),
+            fixed_subagents: self.fixed_subagents.clone(),
+            fixed_subagent_descs: self.fixed_subagent_descs.clone(),
+        })
+    }
 }
 
 #[derive(Clone)]
 pub struct Agent {
     pub name: String,
     pub system_prompt: String,
+    pub definition: Arc<AgentDefinition>,
     pub toolset: Arc<tokio::sync::Mutex<KimiToolset>>,
     pub runtime: Runtime,
 }
 
 #[derive(Default)]
 pub struct LaborMarket {
-    fixed_subagents: HashMap<String, Agent>,
-    fixed_subagent_descs: HashMap<String, String>,
-    dynamic_subagents: HashMap<String, Agent>,
+    dynamic_subagents: HashMap<String, Arc<AgentDefinition>>,
 }
 
 impl LaborMarket {
@@ -186,39 +245,24 @@ impl LaborMarket {
         Self::default()
     }
 
-    pub fn add_fixed_subagent(&mut self, name: String, agent: Agent, description: String) {
-        self.fixed_subagents.insert(name.clone(), agent);
-        self.fixed_subagent_descs.insert(name, description);
-    }
-
-    pub fn add_dynamic_subagent(&mut self, name: String, agent: Agent) {
+    pub fn add_dynamic_subagent(&mut self, name: String, agent: Arc<AgentDefinition>) {
         self.dynamic_subagents.insert(name, agent);
     }
 
-    pub fn fixed_subagents(&self) -> &HashMap<String, Agent> {
-        &self.fixed_subagents
-    }
-
-    pub fn dynamic_subagents(&self) -> &HashMap<String, Agent> {
+    pub fn dynamic_subagents(&self) -> &HashMap<String, Arc<AgentDefinition>> {
         &self.dynamic_subagents
     }
 
-    pub fn all_subagents(&self) -> HashMap<String, Agent> {
-        let mut combined = self.fixed_subagents.clone();
-        combined.extend(self.dynamic_subagents.clone());
-        combined
-    }
-
-    pub fn fixed_subagent_descs(&self) -> &HashMap<String, String> {
-        &self.fixed_subagent_descs
+    pub fn all_dynamic_subagents(&self) -> HashMap<String, Arc<AgentDefinition>> {
+        self.dynamic_subagents.clone()
     }
 }
 
-pub fn load_agent<'a>(
+fn load_agent_definition<'a>(
     agent_file: &'a Path,
     runtime: Runtime,
     mcp_configs: &'a [serde_json::Value],
-) -> futures::future::BoxFuture<'a, Result<Agent, anyhow::Error>> {
+) -> futures::future::BoxFuture<'a, Result<Arc<AgentDefinition>, anyhow::Error>> {
     Box::pin(async move {
         info!("Loading agent: {}", agent_file.display());
         let agent_spec = load_agent_spec(agent_file).await?;
@@ -229,46 +273,45 @@ pub fn load_agent<'a>(
         )
         .await?;
 
+        let mut fixed_subagents = HashMap::new();
+        let mut fixed_subagent_descs = HashMap::new();
         for (subagent_name, subagent_spec) in agent_spec.subagents.iter() {
             debug!("Loading subagent: {}", subagent_name);
-            let subagent = load_agent(
+            let subagent = load_agent_definition(
                 &subagent_spec.path,
                 runtime.copy_for_fixed_subagent(),
                 mcp_configs,
             )
             .await?;
-            runtime.labor_market.lock().await.add_fixed_subagent(
-                subagent_name.clone(),
-                subagent,
-                subagent_spec.description.clone(),
-            );
+            fixed_subagents.insert(subagent_name.clone(), subagent);
+            fixed_subagent_descs.insert(subagent_name.clone(), subagent_spec.description.clone());
         }
 
-        let toolset = Arc::new(tokio::sync::Mutex::new(KimiToolset::new()));
-        {
-            let mut guard = toolset.lock().await;
-            let mut tools = agent_spec.tools.clone();
-            if !agent_spec.exclude_tools.is_empty() {
-                debug!("Excluding tools: {:?}", agent_spec.exclude_tools);
-                tools.retain(|tool| !agent_spec.exclude_tools.contains(tool));
-            }
-            guard
-                .load_tools(&tools, &runtime, Arc::clone(&toolset))
-                .map_err(anyhow::Error::from)?;
-
-            if !mcp_configs.is_empty() {
-                guard
-                    .load_mcp_tools(mcp_configs, &runtime, Arc::clone(&toolset))
-                    .await?;
-            }
+        let mut tools = agent_spec.tools.clone();
+        if !agent_spec.exclude_tools.is_empty() {
+            debug!("Excluding tools: {:?}", agent_spec.exclude_tools);
+            tools.retain(|tool| !agent_spec.exclude_tools.contains(tool));
         }
 
-        Ok(Agent {
+        Ok(Arc::new(AgentDefinition {
             name: agent_spec.name,
             system_prompt,
-            toolset,
-            runtime,
-        })
+            tool_paths: tools,
+            mcp_configs: mcp_configs.to_vec(),
+            fixed_subagents,
+            fixed_subagent_descs,
+        }))
+    })
+}
+
+pub fn load_agent<'a>(
+    agent_file: &'a Path,
+    runtime: Runtime,
+    mcp_configs: &'a [serde_json::Value],
+) -> futures::future::BoxFuture<'a, Result<Agent, anyhow::Error>> {
+    Box::pin(async move {
+        let definition = load_agent_definition(agent_file, runtime.clone(), mcp_configs).await?;
+        definition.instantiate(runtime).await
     })
 }
 

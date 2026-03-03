@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -810,32 +810,7 @@ impl KimiSoul {
     }
 
     pub async fn shutdown(&self) {
-        let toolsets = {
-            let mut seen = HashSet::new();
-            let market = self.runtime.labor_market.lock().await;
-            let mut toolsets = Vec::new();
-
-            let mut push_toolset =
-                |toolset: &Arc<tokio::sync::Mutex<crate::soul::toolset::KimiToolset>>| {
-                    let ptr = Arc::as_ptr(toolset) as usize;
-                    if seen.insert(ptr) {
-                        toolsets.push(Arc::clone(toolset));
-                    }
-                };
-
-            push_toolset(&self.agent.toolset);
-            for agent in market.fixed_subagents().values() {
-                push_toolset(&agent.toolset);
-            }
-            for agent in market.dynamic_subagents().values() {
-                push_toolset(&agent.toolset);
-            }
-            toolsets
-        };
-
-        for toolset in toolsets {
-            toolset.lock().await.cleanup().await;
-        }
+        self.agent.toolset.lock().await.cleanup().await;
     }
 }
 

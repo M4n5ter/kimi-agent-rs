@@ -164,9 +164,18 @@ fn runtime_with_llm(mut runtime: Runtime, llm: LLM) -> Runtime {
 }
 
 fn make_soul(runtime: Runtime, llm: LLM, toolset: KimiToolset) -> KimiSoul {
+    let definition = std::sync::Arc::new(kimi_agent::soul::agent::AgentDefinition {
+        name: "Test Agent".to_string(),
+        system_prompt: "Test system prompt.".to_string(),
+        tool_paths: Vec::new(),
+        mcp_configs: Vec::new(),
+        fixed_subagents: std::collections::HashMap::new(),
+        fixed_subagent_descs: std::collections::HashMap::new(),
+    });
     let agent = Agent {
         name: "Test Agent".to_string(),
         system_prompt: "Test system prompt.".to_string(),
+        definition,
         toolset: Arc::new(tokio::sync::Mutex::new(toolset)),
         runtime: runtime_with_llm(runtime, llm),
     };

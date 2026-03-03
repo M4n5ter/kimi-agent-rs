@@ -1,3 +1,4 @@
+mod agent_test_utils;
 mod tool_test_utils;
 
 use tempfile::TempDir;
@@ -121,7 +122,12 @@ fn test_load_tools_valid() {
     let mut toolset = KimiToolset::new();
     let deps_toolset = std::sync::Arc::new(tokio::sync::Mutex::new(KimiToolset::new()));
     toolset
-        .load_tools(&tool_paths, &fixture.runtime, deps_toolset)
+        .load_tools(
+            &tool_paths,
+            &fixture.runtime,
+            deps_toolset,
+            agent_test_utils::test_agent_definition(),
+        )
         .expect("load tools");
     assert_eq!(toolset.tools().len(), 2);
 }
@@ -135,7 +141,12 @@ fn test_load_tools_invalid() {
     ];
     let mut toolset = KimiToolset::new();
     let deps_toolset = std::sync::Arc::new(tokio::sync::Mutex::new(KimiToolset::new()));
-    let result = toolset.load_tools(&tool_paths, &fixture.runtime, deps_toolset);
+    let result = toolset.load_tools(
+        &tool_paths,
+        &fixture.runtime,
+        deps_toolset,
+        agent_test_utils::test_agent_definition(),
+    );
     let err = result.expect_err("expected error");
     assert!(err.to_string().contains("kimi_cli.tools.nonexistent:Tool"));
 }

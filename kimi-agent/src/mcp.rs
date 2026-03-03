@@ -3,6 +3,7 @@ use serde_json::{Map, Value, json};
 
 use crate::config::KaosConfig;
 use crate::exception::MCPConfigError;
+use crate::mcp_legacy::{current_arg0, legacy_mcp_auth_contains, legacy_mcp_auth_warning};
 use crate::storage::Storage;
 
 pub async fn load_mcp_config_file(path: &kaos::KaosPath) -> Result<Value, MCPConfigError> {
@@ -149,11 +150,22 @@ pub async fn has_oauth_tokens(
     kaos: &KaosConfig,
     server_url: &str,
 ) -> Result<bool, AuthError> {
-    Ok(get_mcp_credential_store(storage, kaos, server_url)
+    let has_tokens = get_mcp_credential_store(storage, kaos, server_url)
         .load()
         .await?
         .and_then(|creds| creds.token_response)
-        .is_some())
+        .is_some();
+    if has_tokens {
+        return Ok(true);
+    }
+
+    if let Some(path) = legacy_mcp_auth_contains(server_url).await.map_err(|err| {
+        AuthError::InternalError(format!("Failed to probe legacy MCP auth file: {err}"))
+    })? {
+        eprintln!("{}", legacy_mcp_auth_warning(&path, &current_arg0()));
+    }
+
+    Ok(false)
 }
 
 #[cfg(test)]

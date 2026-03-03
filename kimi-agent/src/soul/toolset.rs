@@ -29,8 +29,9 @@ use crate::constant::{NAME, VERSION};
 use crate::exception::{InvalidToolError, MCPConfigError, MCPRuntimeError};
 use crate::mcp::{get_mcp_credential_store, has_oauth_tokens};
 use crate::mcp_http_proxy::KaosHttpProxyHandle;
+use crate::mcp_legacy::current_arg0;
 use crate::mcp_transport::KaosChildProcessTransport;
-use crate::soul::agent::Runtime;
+use crate::soul::agent::{AgentDefinition, Runtime};
 use crate::soul::get_current_wire_or_none;
 use crate::storage::Storage;
 use crate::tools::utils::tool_rejected_error;
@@ -144,8 +145,9 @@ impl KimiToolset {
         tool_paths: &[String],
         runtime: &Runtime,
         toolset: Arc<tokio::sync::Mutex<KimiToolset>>,
+        agent_definition: Arc<AgentDefinition>,
     ) -> Result<(), InvalidToolError> {
-        let deps = ToolDeps::new(runtime, toolset);
+        let deps = ToolDeps::new(runtime, toolset, agent_definition);
         let mut bad_tools = Vec::new();
         let mut good_tools = Vec::new();
         for tool_path in tool_paths {
@@ -227,8 +229,10 @@ impl KimiToolset {
                                 info
                             });
                         warn!(
-                            "Skipping OAuth MCP server '{}': not authorized. Run 'kimi-agent mcp auth {}' first.",
-                            name, name
+                            "Skipping OAuth MCP server '{}': not authorized. Run '{} mcp auth {}' first.",
+                            name,
+                            current_arg0(),
+                            name
                         );
                         continue;
                     }
@@ -785,8 +789,10 @@ async fn connect_mcp_server(
                 info.last_error = Some(message);
             }
             warn!(
-                "Skipping OAuth MCP server '{}': not authorized. Run 'kimi-agent mcp auth {}' first.",
-                server_name, server_name
+                "Skipping OAuth MCP server '{}': not authorized. Run '{} mcp auth {}' first.",
+                server_name,
+                current_arg0(),
+                server_name
             );
             return Ok(());
         }

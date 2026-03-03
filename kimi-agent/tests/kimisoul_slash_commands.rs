@@ -1,3 +1,4 @@
+mod agent_test_utils;
 mod tool_test_utils;
 
 use std::collections::HashMap;
@@ -62,6 +63,7 @@ fn test_flow_skill_registers_skill_and_flow_commands() {
     let agent = Agent {
         name: "Test Agent".to_string(),
         system_prompt: "Test system prompt.".to_string(),
+        definition: agent_test_utils::test_agent_definition(),
         toolset: std::sync::Arc::new(tokio::sync::Mutex::new(KimiToolset::new())),
         runtime,
     };

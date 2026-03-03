@@ -1,12 +1,13 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use kosong::message::Role;
 use kosong::tooling::{CallableTool2, ToolReturnValue, tool_error, tool_ok};
 
 use crate::session::post_run;
-use crate::soul::agent::{Agent, LaborMarket, Runtime};
+use crate::soul::agent::{AgentDefinition, Runtime};
 use crate::soul::context::Context;
 use crate::soul::kimisoul::KimiSoul;
 use crate::soul::toolset::get_current_tool_call_or_none;
@@ -35,22 +36,19 @@ pub struct TaskParams {
 
 pub struct TaskTool {
     description: String,
-    labor_market: std::sync::Arc<tokio::sync::Mutex<LaborMarket>>,
-    session: crate::session::Session,
+    definition: Arc<AgentDefinition>,
+    runtime: Runtime,
 }
 
 impl TaskTool {
-    pub fn new(runtime: &Runtime) -> Self {
+    pub fn new(runtime: &Runtime, definition: Arc<AgentDefinition>) -> Self {
         let subagents_md = {
-            let mut names: Vec<(String, String)> = Vec::new();
-            if let Ok(market) = runtime.labor_market.try_lock() {
-                names = market
-                    .fixed_subagent_descs()
-                    .iter()
-                    .map(|(name, desc)| (name.clone(), desc.clone()))
-                    .collect();
-                names.sort_by(|a, b| a.0.cmp(&b.0));
-            }
+            let mut names: Vec<(String, String)> = definition
+                .fixed_subagent_descs
+                .iter()
+                .map(|(name, desc)| (name.clone(), desc.clone()))
+                .collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
             names
                 .into_iter()
                 .map(|(name, desc)| format!("- `{}`: {}", name, desc))
@@ -60,14 +58,14 @@ impl TaskTool {
         let desc = load_desc(TASK_DESC, &[("SUBAGENTS_MD", subagents_md)]);
         Self {
             description: desc,
-            labor_market: runtime.labor_market.clone(),
-            session: runtime.session.clone(),
+            definition,
+            runtime: runtime.clone(),
         }
     }
 
     async fn run_subagent(
         &self,
-        mut agent: Agent,
+        definition: Arc<AgentDefinition>,
         subagent_name: String,
         prompt: String,
     ) -> ToolReturnValue {
@@ -93,11 +91,11 @@ impl TaskTool {
         };
         let task_tool_call_id = tool_call.id.clone();
         let child_session = match crate::session::Session::create_with_origin(
-            self.session.storage().clone(),
-            self.session.kaos().clone(),
-            self.session.work_dir.clone(),
+            self.runtime.storage.clone(),
+            self.runtime.config.kaos.clone(),
+            self.runtime.session.work_dir.clone(),
             None,
-            Some(self.session.id.clone()),
+            Some(self.runtime.session.id.clone()),
             SessionOrigin::Subagent {
                 parent_tool_call_id: Some(task_tool_call_id.clone()),
                 subagent_name,
@@ -114,9 +112,18 @@ impl TaskTool {
                 );
             }
         };
-        agent.runtime.session = child_session.clone();
-        agent.runtime.storage = self.session.storage().clone();
-        agent.runtime.config.kaos = self.session.kaos().clone();
+        let child_runtime = self.runtime.rebind_session(child_session.clone());
+        let agent = match definition.instantiate(child_runtime).await {
+            Ok(agent) => agent,
+            Err(err) => {
+                let _ = child_session.delete().await;
+                return tool_error(
+                    "",
+                    format!("Failed to initialize subagent: {err}"),
+                    "Failed to run subagent",
+                );
+            }
+        };
 
         let make_ui_loop = |super_wire: std::sync::Arc<Wire>, task_tool_call_id: String| {
             move |wire: std::sync::Arc<Wire>| {
@@ -159,7 +166,7 @@ impl TaskTool {
             task_tool_call_id.clone(),
         );
         let wire_target = Some(WireRecordTarget::new(
-            self.session.storage().clone(),
+            self.runtime.storage.clone(),
             child_session.db_id(),
         ));
         let result = match tokio::task::spawn_blocking(move || {
@@ -226,7 +233,7 @@ impl TaskTool {
                 std::sync::Arc::clone(&super_wire),
                 task_tool_call_id.clone(),
             );
-            let storage = self.session.storage().clone();
+            let storage = self.runtime.storage.clone();
             let child_session_db_id = child_session.db_id();
             let _ = tokio::task::spawn_blocking(move || {
                 let handle = tokio::runtime::Handle::current();
@@ -275,15 +282,24 @@ impl CallableTool2 for TaskTool {
     }
 
     async fn call_typed(&self, params: Self::Params) -> ToolReturnValue {
-        let subagents = self.labor_market.lock().await.all_subagents();
-        let agent = match subagents.get(&params.subagent_name) {
-            Some(agent) => agent.clone(),
-            None => {
-                return tool_error(
-                    "",
-                    format!("Subagent not found: {}", params.subagent_name),
-                    "Subagent not found",
-                );
+        let agent = {
+            let mut subagents = self.definition.fixed_subagents.clone();
+            subagents.extend(
+                self.runtime
+                    .labor_market
+                    .lock()
+                    .await
+                    .all_dynamic_subagents(),
+            );
+            match subagents.get(&params.subagent_name) {
+                Some(agent) => Arc::clone(agent),
+                None => {
+                    return tool_error(
+                        "",
+                        format!("Subagent not found: {}", params.subagent_name),
+                        "Subagent not found",
+                    );
+                }
             }
         };
 

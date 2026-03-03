@@ -13,10 +13,9 @@ use kimi_agent::config::{
 };
 use kimi_agent::llm::LLM;
 use kimi_agent::session::Session;
-use kimi_agent::soul::agent::{Agent, BuiltinSystemPromptArgs, LaborMarket, Runtime};
+use kimi_agent::soul::agent::{BuiltinSystemPromptArgs, LaborMarket, Runtime};
 use kimi_agent::soul::approval::Approval;
 use kimi_agent::soul::denwarenji::DenwaRenji;
-use kimi_agent::soul::toolset::KimiToolset;
 use kimi_agent::storage::Storage;
 use kimi_agent::utils::Environment;
 use kosong::chat_provider::echo::EchoChatProvider;
@@ -155,23 +154,6 @@ impl RuntimeFixture {
             environment,
             skills: Default::default(),
         };
-
-        let agent = Agent {
-            name: "Mocker".to_string(),
-            system_prompt: "You are a mock agent for testing.".to_string(),
-            toolset: Arc::new(tokio::sync::Mutex::new(KimiToolset::new())),
-            runtime: runtime.copy_for_fixed_subagent(),
-        };
-
-        runtime
-            .labor_market
-            .try_lock()
-            .expect("lock labor market")
-            .add_fixed_subagent(
-                "mocker".to_string(),
-                agent,
-                "The mock agent for testing purposes.".to_string(),
-            );
 
         Self {
             runtime,

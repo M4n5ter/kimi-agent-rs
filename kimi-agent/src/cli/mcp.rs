@@ -23,7 +23,7 @@ use crate::mcp::{
     load_persisted_mcp_config, save_persisted_mcp_config,
 };
 use crate::mcp_http_proxy::KaosHttpProxyHandle;
-use crate::share::get_share_dir;
+use crate::mcp_legacy::{current_arg0, legacy_mcp_config_exists, legacy_mcp_config_warning};
 use crate::soul::toolset::{McpConnectionContext, list_mcp_tools, parse_mcp_config};
 use crate::storage::Storage;
 
@@ -125,7 +125,6 @@ pub struct McpTestArgs {
 
 pub async fn run_mcp_command(args: McpArgs, config: &Config) -> Result<()> {
     let storage = Storage::open(&config.storage).await?;
-    warn_if_legacy_mcp_config_exists(&current_arg0()).await?;
     match args.command {
         McpCommand::Add(args) => mcp_add(&storage, config, args).await,
         McpCommand::Remove(args) => mcp_remove(&storage, config, args).await,
@@ -480,8 +479,9 @@ pub async fn load_mcp_configs(
         .collect::<Vec<_>>();
 
     if file_configs.is_empty() && raw.is_empty() {
-        warn_if_legacy_mcp_config_exists(&current_arg0()).await?;
-        configs.push(load_persisted_mcp_config(storage, &runtime_config.kaos).await?);
+        let persisted = load_persisted_mcp_config(storage, &runtime_config.kaos).await?;
+        warn_if_legacy_mcp_config_exists(&current_arg0(), &persisted).await?;
+        configs.push(persisted);
     }
 
     for path in file_configs {
@@ -512,37 +512,26 @@ pub async fn load_mcp_configs(
     Ok(configs)
 }
 
-async fn warn_if_legacy_mcp_config_exists(arg0: &str) -> Result<()> {
-    let legacy_path = get_share_dir().join("mcp.json");
-    if tokio::fs::try_exists(&legacy_path)
-        .await
-        .with_context(|| format!("probe legacy MCP config {}", legacy_path.display()))?
-    {
-        eprintln!(
-            "Warning: legacy MCP config {} is ignored. SQLite storage is authoritative now. Use `{} mcp ...` to manage MCP servers and auth.",
-            legacy_path.display(),
-            arg0,
-        );
+async fn warn_if_legacy_mcp_config_exists(arg0: &str, persisted: &Value) -> Result<()> {
+    let is_empty = persisted
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .is_none_or(|servers| servers.is_empty());
+    if !is_empty {
+        return Ok(());
+    }
+
+    if let Some(path) = legacy_mcp_config_exists().await? {
+        eprintln!("{}", legacy_mcp_config_warning(&path, arg0));
     }
     Ok(())
-}
-
-fn current_arg0() -> String {
-    std::env::args_os()
-        .next()
-        .and_then(|arg0| {
-            let path = PathBuf::from(arg0);
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .filter(|arg0| !arg0.is_empty())
-        .unwrap_or_else(|| "kimi-agent".to_string())
 }
 
 async fn load_mcp_config_for_edit(storage: &Storage, runtime_config: &Config) -> Result<Value> {
     let mut value = load_persisted_mcp_config(storage, &runtime_config.kaos)
         .await
         .map_err(|err| anyhow::anyhow!("Invalid MCP config in SQLite storage: {err}"))?;
+    warn_if_legacy_mcp_config_exists(&current_arg0(), &value).await?;
     ensure_mcp_servers(&mut value)?;
     Ok(value)
 }
