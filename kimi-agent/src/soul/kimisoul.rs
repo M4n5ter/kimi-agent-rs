@@ -869,6 +869,10 @@ impl Soul for KimiSoul {
         let text_input = user_message.extract_text(" ").trim().to_string();
 
         wire_send(WireMessage::TurnBegin(TurnBegin { user_input }));
+        self.runtime
+            .storage
+            .maybe_update_session_title_from_turn_text(self.runtime.session.db_id(), &text_input)
+            .await?;
 
         if let Some(command_call) = parse_slash_command_call(&text_input) {
             self.handle_slash(&command_call.name, &command_call.args)

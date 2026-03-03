@@ -480,7 +480,7 @@ pub async fn load_mcp_configs(
 
     if file_configs.is_empty() && raw.is_empty() {
         let persisted = load_persisted_mcp_config(storage, &runtime_config.kaos).await?;
-        warn_if_legacy_mcp_config_exists(&current_arg0(), &persisted).await?;
+        warn_if_legacy_mcp_config_exists(&current_arg0()).await?;
         configs.push(persisted);
     }
 
@@ -512,15 +512,7 @@ pub async fn load_mcp_configs(
     Ok(configs)
 }
 
-async fn warn_if_legacy_mcp_config_exists(arg0: &str, persisted: &Value) -> Result<()> {
-    let is_empty = persisted
-        .get("mcpServers")
-        .and_then(Value::as_object)
-        .is_none_or(|servers| servers.is_empty());
-    if !is_empty {
-        return Ok(());
-    }
-
+async fn warn_if_legacy_mcp_config_exists(arg0: &str) -> Result<()> {
     if let Some(path) = legacy_mcp_config_exists().await? {
         eprintln!("{}", legacy_mcp_config_warning(&path, arg0));
     }
@@ -531,7 +523,7 @@ async fn load_mcp_config_for_edit(storage: &Storage, runtime_config: &Config) ->
     let mut value = load_persisted_mcp_config(storage, &runtime_config.kaos)
         .await
         .map_err(|err| anyhow::anyhow!("Invalid MCP config in SQLite storage: {err}"))?;
-    warn_if_legacy_mcp_config_exists(&current_arg0(), &value).await?;
+    warn_if_legacy_mcp_config_exists(&current_arg0()).await?;
     ensure_mcp_servers(&mut value)?;
     Ok(value)
 }

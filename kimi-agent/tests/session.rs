@@ -173,6 +173,36 @@ async fn test_find_ignores_synthetic_user_messages_for_title() {
 }
 
 #[tokio::test]
+async fn test_find_uses_first_turn_text_when_context_has_no_user_input() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let _env = set_home_env(home_dir.path());
+    let storage = open_test_storage(home_dir.path()).await;
+
+    let work_dir = TempDir::new().expect("work dir");
+    let work_path = KaosPath::from(work_dir.path().to_path_buf());
+
+    let session = Session::create(
+        storage.clone(),
+        KaosConfig::Local,
+        work_path.clone(),
+        Some("turn-title-session".to_string()),
+    )
+    .await
+    .expect("create session");
+    storage
+        .maybe_update_session_title_from_turn_text(session.db_id(), "/init bootstrap the repo")
+        .await
+        .expect("update title from turn text");
+
+    let found = Session::find(storage, KaosConfig::Local, work_path, &session.id)
+        .await
+        .expect("find session")
+        .expect("session");
+    assert!(found.title.starts_with("/init bootstrap the repo"));
+}
+
+#[tokio::test]
 async fn test_list_sorts_by_updated_and_filters_empty_sessions() {
     let _lock = ENV_LOCK.lock().await;
     let home_dir = TempDir::new().expect("home dir");

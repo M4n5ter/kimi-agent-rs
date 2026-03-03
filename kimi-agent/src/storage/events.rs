@@ -8,6 +8,18 @@ use super::{ContextEventKind, ContextEventRecord, ContextMessageOrigin, Storage,
 use crate::wire::{WireMessage, WireMessageRecord};
 
 impl Storage {
+    pub async fn maybe_update_session_title_from_turn_text(
+        &self,
+        session_db_id: i64,
+        text: &str,
+    ) -> Result<()> {
+        let text = text.to_string();
+        self.with_connection(move |conn| {
+            maybe_update_session_title_from_text(conn, session_db_id, &text)
+        })
+        .await
+    }
+
     pub async fn append_context_messages(
         &self,
         session_db_id: i64,
@@ -439,6 +451,18 @@ fn maybe_update_session_title(
     let Some(title_source) = messages.iter().find_map(session_title_from_message) else {
         return Ok(());
     };
+    maybe_update_session_title_from_text(conn, session_db_id, &title_source)
+}
+
+fn maybe_update_session_title_from_text(
+    conn: &Connection,
+    session_db_id: i64,
+    title_source: &str,
+) -> Result<()> {
+    let title = shorten_text(title_source, 50);
+    if title.is_empty() {
+        return Ok(());
+    }
     let session_id = conn.query_row(
         "SELECT session_id FROM sessions WHERE id = ?1",
         params![session_db_id],
@@ -452,7 +476,7 @@ fn maybe_update_session_title(
         ",
         params![
             session_db_id,
-            format!("{} ({session_id})", shorten_text(&title_source, 50)),
+            format!("{title} ({session_id})"),
             format!("Untitled ({session_id})"),
         ],
     )?;
@@ -464,8 +488,11 @@ fn session_title_from_message(message: &Message) -> Option<String> {
         return None;
     }
     let text = message.extract_text(" ");
-    let title = shorten_text(&text, 50);
-    if title.is_empty() { None } else { Some(title) }
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 fn role_label(role: &Role) -> &'static str {
