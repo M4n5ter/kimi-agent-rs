@@ -1,9 +1,10 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::sync::Arc;
 
 use kosong::tooling::{CallableTool2, ToolReturnValue, tool_error, tool_ok};
 
-use crate::soul::agent::{Agent, Runtime};
+use crate::soul::agent::{AgentDefinition, Runtime};
 use crate::tools::utils::load_desc;
 
 const CREATE_DESC: &str = include_str!("../desc/multiagent/create.md");
@@ -22,18 +23,15 @@ pub struct CreateSubagentParams {
 
 pub struct CreateSubagent {
     description: String,
-    toolset: std::sync::Arc<tokio::sync::Mutex<crate::soul::toolset::KimiToolset>>,
+    definition: Arc<AgentDefinition>,
     runtime: Runtime,
 }
 
 impl CreateSubagent {
-    pub fn new(
-        toolset: std::sync::Arc<tokio::sync::Mutex<crate::soul::toolset::KimiToolset>>,
-        runtime: &Runtime,
-    ) -> Self {
+    pub fn new(runtime: &Runtime, definition: Arc<AgentDefinition>) -> Self {
         Self {
             description: load_desc(CREATE_DESC, &[]),
-            toolset,
+            definition,
             runtime: runtime.clone(),
         }
     }
@@ -52,8 +50,8 @@ impl CallableTool2 for CreateSubagent {
     }
 
     async fn call_typed(&self, params: Self::Params) -> ToolReturnValue {
-        let mut market = self.runtime.labor_market.lock().await;
-        if market.all_subagents().contains_key(&params.name) {
+        let mut registry = self.runtime.subagent_registry.lock().await;
+        if registry.contains(&params.name) {
             return tool_error(
                 "",
                 format!("Subagent with name '{}' already exists.", params.name),
@@ -61,17 +59,12 @@ impl CallableTool2 for CreateSubagent {
             );
         }
 
-        let subagent = Agent {
-            name: params.name.clone(),
-            system_prompt: params.system_prompt,
-            toolset: std::sync::Arc::clone(&self.toolset),
-            runtime: self.runtime.copy_for_dynamic_subagent(),
-        };
-        market.add_dynamic_subagent(params.name.clone(), subagent);
+        let subagent = self
+            .definition
+            .derive_dynamic(params.name.clone(), params.system_prompt);
+        registry.add_dynamic_subagent(params.name.clone(), subagent);
 
-        let mut names: Vec<String> = market.all_subagents().keys().cloned().collect();
-        names.sort();
-        let output = format!("Available subagents: {}", names.join(", "));
+        let output = format!("Available subagents: {}", registry.all_names().join(", "));
 
         tool_ok(
             output,

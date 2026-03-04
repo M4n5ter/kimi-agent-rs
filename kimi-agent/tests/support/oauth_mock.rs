@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use boxlite::BoxCommand;
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 
 use crate::boxlite_e2e::{
@@ -119,15 +120,12 @@ impl HostOauthFixture {
     }
 }
 
-pub fn assert_remote_auth_file_contains_token(text: &str, server_url: &str) -> Result<()> {
+pub fn assert_sqlite_auth_record_contains_token(text: &str) -> Result<()> {
     let data: serde_json::Value =
-        serde_json::from_str(text).context("parse remote mcp auth file")?;
-    let server_entry = data["servers"][server_url]
-        .as_object()
-        .with_context(|| format!("missing OAuth credential entry for {server_url}"))?;
-    let access_token = server_entry["token_response"]["access_token"]
+        serde_json::from_str(text).context("parse SQLite-backed OAuth credential record")?;
+    let access_token = data["token_response"]["access_token"]
         .as_str()
-        .context("missing access token in OAuth credential entry")?;
+        .context("missing access token in OAuth credential record")?;
     if access_token != ACCESS_TOKEN {
         bail!("unexpected OAuth access token: {access_token}");
     }
@@ -135,20 +133,33 @@ pub fn assert_remote_auth_file_contains_token(text: &str, server_url: &str) -> R
 }
 
 impl BoxliteSshFixture {
-    pub fn local_mcp_auth_path(&self) -> PathBuf {
+    pub fn local_legacy_mcp_auth_path(&self) -> PathBuf {
         self.host_home()
             .join(".kimi")
             .join("credentials")
             .join("mcp_auth.json")
     }
 
-    pub async fn read_remote_mcp_auth_file(&self) -> Result<String> {
-        exec_box_checked(
-            &self.litebox,
-            BoxCommand::new("cat").arg(REMOTE_MCP_AUTH_FILE),
-        )
-        .await
-        .context("read remote MCP auth file")
+    pub async fn remote_legacy_mcp_auth_exists(&self) -> Result<bool> {
+        self.remote_file_exists(REMOTE_MCP_AUTH_FILE).await
+    }
+
+    pub fn read_host_mcp_credential(&self, server_url: &str) -> Result<Option<String>> {
+        let server_url = server_url.to_string();
+        self.with_local_state_db(move |conn| {
+            conn.query_row(
+                "
+                SELECT mcp_credentials.credentials_json
+                FROM mcp_credentials
+                JOIN kaos_scopes ON kaos_scopes.id = mcp_credentials.kaos_scope_id
+                WHERE kaos_scopes.kind = 'ssh' AND mcp_credentials.server_url = ?1
+                ",
+                [server_url],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
     }
 
     pub async fn read_guest_oauth_state(&self) -> Result<String> {

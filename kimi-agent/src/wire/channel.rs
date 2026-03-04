@@ -6,10 +6,26 @@ use tracing::{debug, error, info};
 
 use kosong::message::{ContentPart, ToolCall, ToolCallPart};
 
+use crate::storage::Storage;
 use crate::utils::{BroadcastQueue, Queue, QueueShutDown};
-use crate::wire::{WireFile, WireMessage};
+use crate::wire::WireMessage;
 
 pub type WireMessageQueue = BroadcastQueue<WireMessage>;
+
+#[derive(Clone)]
+pub struct WireRecordTarget {
+    storage: Storage,
+    session_db_id: i64,
+}
+
+impl WireRecordTarget {
+    pub fn new(storage: Storage, session_db_id: i64) -> Self {
+        Self {
+            storage,
+            session_db_id,
+        }
+    }
+}
 
 pub struct Wire {
     raw_queue: Arc<WireMessageQueue>,
@@ -21,13 +37,14 @@ pub struct Wire {
 }
 
 impl Wire {
-    pub fn new(file_backend: Option<WireFile>) -> Self {
+    pub fn new(record_target: Option<WireRecordTarget>) -> Self {
         let raw_queue = Arc::new(WireMessageQueue::new());
         let merged_queue = Arc::new(WireMessageQueue::new());
         let raw_default = Mutex::new(Some(raw_queue.subscribe()));
         let merged_default = Mutex::new(Some(merged_queue.subscribe()));
         let soul_side = WireSoulSide::new(raw_queue.clone(), merged_queue.clone());
-        let recorder = file_backend.map(|path| WireRecorder::new(path, merged_queue.subscribe()));
+        let recorder =
+            record_target.map(|target| WireRecorder::new(target, merged_queue.subscribe()));
         Self {
             raw_queue,
             merged_queue,
@@ -235,10 +252,14 @@ struct WireRecorder {
 }
 
 impl WireRecorder {
-    fn new(wire_file: WireFile, queue: Queue<WireMessage>) -> Self {
+    fn new(target: WireRecordTarget, queue: Queue<WireMessage>) -> Self {
         let task = tokio::spawn(async move {
             while let Ok(msg) = queue.get().await {
-                if let Err(err) = wire_file.append_message(&msg, Some(now_timestamp())).await {
+                if let Err(err) = target
+                    .storage
+                    .append_wire_message(target.session_db_id, &msg, now_timestamp())
+                    .await
+                {
                     error!("Failed to append wire message: {}", err);
                 }
             }

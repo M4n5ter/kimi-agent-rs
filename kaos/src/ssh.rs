@@ -77,6 +77,11 @@ enum ProcessStreamKind {
 }
 
 impl SshKaosOptions {
+    pub fn logical_storage_name(&self) -> String {
+        let username = self.username.clone().unwrap_or_else(default_ssh_username);
+        build_storage_name(&self.host, self.port, &username)
+    }
+
     fn known_hosts_path(&self) -> PathBuf {
         let configured = self
             .known_hosts_path

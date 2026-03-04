@@ -22,8 +22,8 @@ pub enum WireError {
     Serde(String),
 }
 
-pub use channel::{Wire, WireMessageQueue, WireSoulSide, WireUISide};
-pub use file::{WireFile, WireFileMetadata, WireMessageRecord};
+pub use channel::{Wire, WireMessageQueue, WireRecordTarget, WireSoulSide, WireUISide};
+pub use file::WireMessageRecord;
 pub use serde::{deserialize_wire_message, serialize_wire_message};
 pub use types::{
     ApprovalRequest, ApprovalResponse, ApprovalResponseKind, CompactionBegin, CompactionEnd,

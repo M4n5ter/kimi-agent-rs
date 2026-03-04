@@ -10,13 +10,19 @@ use crate::agentspec::{default_agent_file, okabe_agent_file};
 use crate::app::{ConfigInput, CreateOptions, KimiCLI};
 use crate::config::{Config, KaosConfig, load_config, load_config_from_string};
 use crate::constant::VERSION;
-use crate::session::{Session, post_run};
+use crate::session::{Session, cleanup_failed_startup};
 use crate::session_id::normalize_session_id;
+use crate::storage::Storage;
 use crate::utils::init_logging;
-use tracing::info;
+use tracing::{info, warn};
 
 pub mod info;
 pub mod mcp;
+
+struct ResolvedSession {
+    session: Session,
+    created_new_session: bool,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -255,7 +261,7 @@ pub async fn run() -> Result<()> {
             Commands::Mcp(args) => {
                 let config = mcp_runtime_config.expect("mcp config should be preloaded");
                 let _kaos_guard = init_current_kaos(&config).await?;
-                mcp::run_mcp_command(args).await
+                mcp::run_mcp_command(args, &config).await
             }
         };
     }
@@ -263,8 +269,10 @@ pub async fn run() -> Result<()> {
     let config = load_effective_config(&cli).await?;
     let _kaos_guard = init_current_kaos(&config).await?;
     validate_runtime_paths(&cli).await?;
+    let storage = Storage::open(&config.storage).await?;
 
-    let mcp_configs = mcp::load_mcp_configs(&cli.mcp_config_file, &cli.mcp_config).await?;
+    let mcp_configs =
+        mcp::load_mcp_configs(&storage, &config, &cli.mcp_config_file, &cli.mcp_config).await?;
 
     let skills_dir = cli
         .skills_dir
@@ -281,12 +289,19 @@ pub async fn run() -> Result<()> {
 
     match cli.wire_transport {
         WireTransport::Stdio => {
-            let default_session =
-                resolve_session(&work_dir, cli.session_id.as_ref(), cli.continue_session).await?;
-            let instance = KimiCLI::create(
-                default_session,
+            let resolved_session = resolve_session(
+                &storage,
+                &config.kaos,
+                &work_dir,
+                cli.session_id.as_ref(),
+                cli.continue_session,
+            )
+            .await?;
+            let instance = match KimiCLI::create(
+                resolved_session.session.clone(),
                 CreateOptions {
                     config: Some(ConfigInput::Inline(Box::new(config))),
+                    storage: Some(storage.clone()),
                     model_name: cli.model_name.clone(),
                     thinking,
                     yolo: cli.yolo,
@@ -298,15 +313,34 @@ pub async fn run() -> Result<()> {
                     max_ralph_iterations: cli.max_ralph_iterations,
                 },
             )
-            .await?;
-
-            let session = instance.session().clone();
-            instance.run_wire_stdio().await?;
-            post_run(&session).await?;
+            .await
+            {
+                Ok(instance) => instance,
+                Err(err) => {
+                    if let Err(cleanup_err) = cleanup_failed_startup(
+                        &resolved_session.session,
+                        resolved_session.created_new_session,
+                    )
+                    .await
+                    {
+                        warn!(
+                            session_id = %resolved_session.session.id,
+                            "Failed to discard newly created stdio session after startup failure: {}",
+                            cleanup_err
+                        );
+                    }
+                    return Err(err);
+                }
+            };
+            instance
+                .run_wire_stdio(resolved_session.created_new_session)
+                .await?;
         }
         WireTransport::Ws => {
             let listen_addr = parse_wire_listen_addr(&cli.wire_listen)?;
             let default_session_id = resolve_ws_default_session_id(
+                &storage,
+                &config.kaos,
                 &work_dir,
                 cli.session_id.as_ref(),
                 cli.continue_session,
@@ -314,6 +348,7 @@ pub async fn run() -> Result<()> {
             .await?;
             let server = crate::wire::server::WireWsServer::new(
                 crate::wire::server::WsSessionRuntimeOptions {
+                    storage,
                     work_dir,
                     default_session_id,
                     config,
@@ -525,38 +560,63 @@ fn validate_wire_path(path: &str) -> Result<()> {
 }
 
 async fn resolve_session(
+    storage: &Storage,
+    kaos: &KaosConfig,
     work_dir: &KaosPath,
     session_id: Option<&String>,
     continue_session: bool,
-) -> Result<Session> {
+) -> Result<ResolvedSession> {
     if let Some(session_id) = session_id {
         let normalized = normalize_session_id(session_id)
             .map_err(|err| anyhow::anyhow!("Invalid --session value: {err}"))?;
-        let found = Session::find(work_dir.clone(), &normalized).await;
+        let found =
+            Session::find(storage.clone(), kaos.clone(), work_dir.clone(), &normalized).await?;
         if let Some(session) = found {
             info!("Switching to session: {}", session.id);
-            return Ok(session);
+            return Ok(ResolvedSession {
+                session,
+                created_new_session: false,
+            });
         }
         info!("Session {} not found, creating new session", normalized);
-        let session = Session::create(work_dir.clone(), Some(normalized), None).await;
+        let session = Session::create(
+            storage.clone(),
+            kaos.clone(),
+            work_dir.clone(),
+            Some(normalized),
+        )
+        .await?;
         info!("Switching to session: {}", session.id);
-        return Ok(session);
+        return Ok(ResolvedSession {
+            session,
+            created_new_session: true,
+        });
     }
 
     if continue_session {
-        if let Some(session) = Session::continue_(work_dir.clone()).await {
+        if let Some(session) =
+            Session::continue_(storage.clone(), kaos.clone(), work_dir.clone()).await?
+        {
             info!("Continuing previous session: {}", session.id);
-            return Ok(session);
+            return Ok(ResolvedSession {
+                session,
+                created_new_session: false,
+            });
         }
         anyhow::bail!("No previous session found for the working directory.");
     }
 
-    let session = Session::create(work_dir.clone(), None, None).await;
+    let session = Session::create(storage.clone(), kaos.clone(), work_dir.clone(), None).await?;
     info!("Created new session: {}", session.id);
-    Ok(session)
+    Ok(ResolvedSession {
+        session,
+        created_new_session: true,
+    })
 }
 
 async fn resolve_ws_default_session_id(
+    storage: &Storage,
+    kaos: &KaosConfig,
     work_dir: &KaosPath,
     session_id: Option<&String>,
     continue_session: bool,
@@ -567,7 +627,9 @@ async fn resolve_ws_default_session_id(
     }
 
     if continue_session {
-        if let Some(session) = Session::continue_(work_dir.clone()).await {
+        if let Some(session) =
+            Session::continue_(storage.clone(), kaos.clone(), work_dir.clone()).await?
+        {
             return normalize_session_id(&session.id).map_err(|err| {
                 anyhow::anyhow!("Invalid session ID in previous session metadata: {err}")
             });
@@ -585,14 +647,30 @@ mod tests {
     use kaos::KaosPath;
 
     use super::resolve_ws_default_session_id;
+    use crate::config::{KaosConfig, StorageConfig};
+    use crate::storage::Storage;
 
     #[tokio::test]
     async fn ws_default_session_id_rejects_invalid_custom_session() {
         let work_dir = TempDir::new().expect("work dir");
         let work_path = KaosPath::from(work_dir.path().to_path_buf());
+        let storage_root = TempDir::new().expect("storage root");
+        let storage = Storage::open(&StorageConfig {
+            database_path: storage_root.path().join("state.db").display().to_string(),
+            busy_timeout_ms: 1_000,
+        })
+        .await
+        .expect("open storage");
         let invalid_session = "bad:id".to_string();
 
-        let result = resolve_ws_default_session_id(&work_path, Some(&invalid_session), false).await;
+        let result = resolve_ws_default_session_id(
+            &storage,
+            &KaosConfig::Local,
+            &work_path,
+            Some(&invalid_session),
+            false,
+        )
+        .await;
         assert!(result.is_err());
     }
 }

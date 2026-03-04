@@ -1,9 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
-use tempfile::tempdir;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -13,6 +12,7 @@ use kosong::message::{ContentPart, Message, Role, StreamedMessagePart, TextPart}
 use kosong::{StepResult, step as kosong_step};
 
 use crate::config::ModelCapability;
+use crate::session::{Session, post_run};
 use crate::skill::flow::{Flow, FlowEdge, FlowLabel, FlowNode, FlowNodeKind, parse_choice};
 use crate::skill::{Skill, SkillType, read_skill_text};
 use crate::soul::agent::{Agent, Runtime};
@@ -25,6 +25,7 @@ use crate::soul::{
     message::{check_message, system, tool_result_to_message},
     wire_send,
 };
+use crate::storage::SessionOrigin;
 use crate::tools::utils::is_tool_rejected;
 use crate::utils::{SlashCommandInfo, parse_slash_command_call};
 use crate::wire::{
@@ -256,13 +257,40 @@ impl KimiSoul {
     }
 
     async fn slash_init(&self) -> anyhow::Result<()> {
-        let temp_dir = tempdir()?;
-        let tmp_path = temp_dir.path().join("context.jsonl");
-        let tmp_context = Context::new(tmp_path);
-        let tmp_soul = KimiSoul::new(self.agent.clone(), tmp_context);
-        tmp_soul
-            .run(UserInput::Text(crate::prompts::INIT.to_string()))
+        let tmp_session = Session::create_with_origin(
+            self.runtime.storage.clone(),
+            self.runtime.config.kaos.clone(),
+            self.runtime.session.work_dir.clone(),
+            None,
+            Some(self.runtime.session.id.clone()),
+            SessionOrigin::System {
+                reason: "slash_init".to_string(),
+            },
+        )
+        .await?;
+        let tmp_runtime = self
+            .runtime
+            .create_isolated_runtime(tmp_session.clone())
             .await?;
+        let overlay = self.agent.toolset.lock().await.snapshot_overlay();
+        let tmp_agent = self
+            .agent
+            .definition
+            .instantiate_with_overlay(tmp_runtime, &overlay)
+            .await?;
+        let tmp_context = Context::new(
+            self.runtime.storage.clone(),
+            tmp_session.db_id(),
+            tmp_session.id.clone(),
+        );
+        let tmp_soul = KimiSoul::new(tmp_agent, tmp_context);
+        let init_result = tmp_soul
+            .run(UserInput::Text(crate::prompts::INIT.to_string()))
+            .await;
+        tmp_soul.shutdown().await;
+        let state = crate::soul::session_state_from_run_result(&init_result);
+        let _ = post_run(&tmp_session, state).await;
+        init_result?;
 
         let agents_md =
             crate::soul::agent::load_agents_md(&self.runtime.builtin_args.KIMI_WORK_DIR)
@@ -274,7 +302,7 @@ impl KimiSoul {
         ));
         let mut context = self.context.lock().await;
         context
-            .append_messages(Message::new(Role::User, vec![system_message]))
+            .append_synthetic_messages(Message::new(Role::User, vec![system_message]))
             .await?;
         Ok(())
     }
@@ -457,7 +485,7 @@ impl KimiSoul {
         self.checkpoint().await?;
         {
             let mut context = self.context.lock().await;
-            context.append_messages(user_message).await?;
+            context.append_user_messages(user_message).await?;
         }
         debug!("Appended user message to context");
         self.agent_loop().await
@@ -552,7 +580,9 @@ impl KimiSoul {
                 self.checkpoint().await?;
                 {
                     let mut context = self.context.lock().await;
-                    context.append_messages(back_to_future.messages).await?;
+                    context
+                        .append_synthetic_messages(back_to_future.messages)
+                        .await?;
                 }
             }
         }
@@ -731,7 +761,9 @@ impl KimiSoul {
         }
 
         let mut context = self.context.lock().await;
-        context.append_messages(result.message.clone()).await?;
+        context
+            .append_synthetic_messages(result.message.clone())
+            .await?;
         if let Some(usage) = &result.usage {
             context.update_token_count(usage.total()).await?;
         }
@@ -739,7 +771,7 @@ impl KimiSoul {
             "Appending tool messages to context: {}",
             tool_messages.len()
         );
-        context.append_messages(tool_messages).await?;
+        context.append_synthetic_messages(tool_messages).await?;
         Ok(())
     }
 
@@ -774,39 +806,14 @@ impl KimiSoul {
             context
                 .checkpoint(self.checkpoint_with_user_message)
                 .await?;
-            context.append_messages(compacted).await?;
+            context.append_synthetic_messages(compacted).await?;
         }
         wire_send(WireMessage::CompactionEnd(CompactionEnd {}));
         Ok(())
     }
 
     pub async fn shutdown(&self) {
-        let toolsets = {
-            let mut seen = HashSet::new();
-            let market = self.runtime.labor_market.lock().await;
-            let mut toolsets = Vec::new();
-
-            let mut push_toolset =
-                |toolset: &Arc<tokio::sync::Mutex<crate::soul::toolset::KimiToolset>>| {
-                    let ptr = Arc::as_ptr(toolset) as usize;
-                    if seen.insert(ptr) {
-                        toolsets.push(Arc::clone(toolset));
-                    }
-                };
-
-            push_toolset(&self.agent.toolset);
-            for agent in market.fixed_subagents().values() {
-                push_toolset(&agent.toolset);
-            }
-            for agent in market.dynamic_subagents().values() {
-                push_toolset(&agent.toolset);
-            }
-            toolsets
-        };
-
-        for toolset in toolsets {
-            toolset.lock().await.cleanup().await;
-        }
+        self.agent.toolset.lock().await.cleanup().await;
     }
 }
 
@@ -865,6 +872,10 @@ impl Soul for KimiSoul {
         let text_input = user_message.extract_text(" ").trim().to_string();
 
         wire_send(WireMessage::TurnBegin(TurnBegin { user_input }));
+        self.runtime
+            .storage
+            .maybe_update_session_title_from_turn_text(self.runtime.session.db_id(), &text_input)
+            .await?;
 
         if let Some(command_call) = parse_slash_command_call(&text_input) {
             self.handle_slash(&command_call.name, &command_call.args)

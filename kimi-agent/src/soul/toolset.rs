@@ -29,9 +29,11 @@ use crate::constant::{NAME, VERSION};
 use crate::exception::{InvalidToolError, MCPConfigError, MCPRuntimeError};
 use crate::mcp::{get_mcp_credential_store, has_oauth_tokens};
 use crate::mcp_http_proxy::KaosHttpProxyHandle;
+use crate::mcp_legacy::current_arg0;
 use crate::mcp_transport::KaosChildProcessTransport;
-use crate::soul::agent::Runtime;
+use crate::soul::agent::{AgentDefinition, Runtime};
 use crate::soul::get_current_wire_or_none;
+use crate::storage::Storage;
 use crate::tools::utils::tool_rejected_error;
 use crate::tools::{ToolDeps, load_tool};
 use crate::wire::ToolCallRequest;
@@ -58,7 +60,7 @@ pub fn get_current_tool_call_or_none() -> Option<ToolCall> {
 
 pub struct KimiToolset {
     tools: HashMap<String, Arc<dyn CallableTool>>,
-    external_tools: HashSet<String>,
+    external_tools: HashMap<String, ExternalToolSpec>,
     mcp_servers: HashMap<String, McpServerInfo>,
     mcp_loading_tasks: Vec<tokio::task::JoinHandle<Result<(), MCPRuntimeError>>>,
     mcp_tool_owners: HashMap<String, String>,
@@ -68,7 +70,7 @@ impl KimiToolset {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
-            external_tools: HashSet::new(),
+            external_tools: HashMap::new(),
             mcp_servers: HashMap::new(),
             mcp_loading_tasks: Vec::new(),
             mcp_tool_owners: HashMap::new(),
@@ -89,7 +91,7 @@ impl KimiToolset {
     }
 
     pub fn has_builtin_tool(&self, name: &str) -> bool {
-        self.tools.contains_key(name) && !self.external_tools.contains(name)
+        self.tools.contains_key(name) && !self.external_tools.contains_key(name)
     }
 
     pub fn register_external_tool(
@@ -98,15 +100,29 @@ impl KimiToolset {
         description: &str,
         parameters: Value,
     ) -> Result<(), String> {
-        if self.tools.contains_key(name) && !self.external_tools.contains(name) {
+        if self.tools.contains_key(name) && !self.external_tools.contains_key(name) {
             return Err("tool name conflicts with existing tool".to_string());
         }
         if let Err(err) = jsonschema::validator_for(&parameters) {
             return Err(err.to_string());
         }
-        let tool = WireExternalTool::new(name, description, parameters);
+        let tool_spec = ExternalToolSpec::new(name, description, parameters);
+        let tool = WireExternalTool::new(&tool_spec);
         self.add(Arc::new(tool));
-        self.external_tools.insert(name.to_string());
+        self.external_tools.insert(name.to_string(), tool_spec);
+        Ok(())
+    }
+
+    pub fn snapshot_overlay(&self) -> ToolOverlay {
+        let mut external_tools = self.external_tools.values().cloned().collect::<Vec<_>>();
+        external_tools.sort_by(|a, b| a.name.cmp(&b.name));
+        ToolOverlay { external_tools }
+    }
+
+    pub fn apply_overlay(&mut self, overlay: &ToolOverlay) -> Result<(), String> {
+        for tool in &overlay.external_tools {
+            self.register_external_tool(&tool.name, &tool.description, tool.parameters.clone())?;
+        }
         Ok(())
     }
 
@@ -143,8 +159,9 @@ impl KimiToolset {
         tool_paths: &[String],
         runtime: &Runtime,
         toolset: Arc<tokio::sync::Mutex<KimiToolset>>,
+        agent_definition: Arc<AgentDefinition>,
     ) -> Result<(), InvalidToolError> {
-        let deps = ToolDeps::new(runtime, toolset);
+        let deps = ToolDeps::new(runtime, toolset, agent_definition);
         let mut bad_tools = Vec::new();
         let mut good_tools = Vec::new();
         for tool_path in tool_paths {
@@ -204,9 +221,12 @@ impl KimiToolset {
                 if let McpServerConfig::Http(http) = &server
                     && http.auth.as_deref() == Some("oauth")
                 {
-                    let authorized = has_oauth_tokens(&http.url)
-                        .await
-                        .map_err(|err| anyhow::anyhow!("Failed to read MCP auth tokens: {err}"))?;
+                    let authorized =
+                        has_oauth_tokens(&runtime.storage, &runtime.config.kaos, &http.url)
+                            .await
+                            .map_err(|err| {
+                                anyhow::anyhow!("Failed to read MCP auth tokens: {err}")
+                            })?;
                     if !authorized {
                         self.mcp_servers
                             .entry(name.clone())
@@ -223,8 +243,10 @@ impl KimiToolset {
                                 info
                             });
                         warn!(
-                            "Skipping OAuth MCP server '{}': not authorized. Run 'kimi-agent mcp auth {}' first.",
-                            name, name
+                            "Skipping OAuth MCP server '{}': not authorized. Run '{} mcp auth {}' first.",
+                            name,
+                            current_arg0(),
+                            name
                         );
                         continue;
                     }
@@ -430,19 +452,41 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ToolOverlay {
+    pub external_tools: Vec<ExternalToolSpec>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExternalToolSpec {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl ExternalToolSpec {
+    fn new(name: &str, description: &str, parameters: Value) -> Self {
+        Self {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters,
+        }
+    }
+}
+
 pub struct WireExternalTool {
     base: Tool,
 }
 
 impl WireExternalTool {
-    pub fn new(name: &str, description: &str, parameters: Value) -> Self {
-        let description = if description.trim().is_empty() {
+    pub fn new(spec: &ExternalToolSpec) -> Self {
+        let description = if spec.description.trim().is_empty() {
             "No description provided."
         } else {
-            description
+            spec.description.as_str()
         };
         Self {
-            base: Tool::new(name, description, parameters),
+            base: Tool::new(&spec.name, description, spec.parameters.clone()),
         }
     }
 }
@@ -544,22 +588,24 @@ pub enum McpServerConfig {
 
 pub type McpToolSpec = rmcp::model::Tool;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct McpConnectionContext {
     pub cwd: KaosPath,
+    pub storage: Storage,
+    pub kaos: crate::config::KaosConfig,
 }
 
 impl McpConnectionContext {
     pub fn from_runtime(runtime: &Runtime) -> Self {
         Self {
             cwd: runtime.session.work_dir.clone(),
+            storage: runtime.storage.clone(),
+            kaos: runtime.config.kaos.clone(),
         }
     }
 
-    pub fn current() -> Self {
-        Self {
-            cwd: KaosPath::cwd(),
-        }
+    pub fn new(cwd: KaosPath, storage: Storage, kaos: crate::config::KaosConfig) -> Self {
+        Self { cwd, storage, kaos }
     }
 }
 
@@ -707,7 +753,11 @@ async fn connect_mcp_client(
                 manager
                     .with_client(client.clone())
                     .map_err(|err| McpClientError::Other(format!("OAuth init failed: {err}")))?;
-                manager.set_credential_store(get_mcp_credential_store(&server.url).await);
+                manager.set_credential_store(get_mcp_credential_store(
+                    &context.storage,
+                    &context.kaos,
+                    &server.url,
+                ));
                 let has_tokens = manager
                     .initialize_from_store()
                     .await
@@ -775,8 +825,10 @@ async fn connect_mcp_server(
                 info.last_error = Some(message);
             }
             warn!(
-                "Skipping OAuth MCP server '{}': not authorized. Run 'kimi-agent mcp auth {}' first.",
-                server_name, server_name
+                "Skipping OAuth MCP server '{}': not authorized. Run '{} mcp auth {}' first.",
+                server_name,
+                current_arg0(),
+                server_name
             );
             return Ok(());
         }

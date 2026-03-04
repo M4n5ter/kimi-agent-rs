@@ -9,8 +9,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::config::ModelCapability;
+use crate::storage::SessionState;
 use crate::utils::{QueueShutDown, SlashCommandInfo};
-use crate::wire::{UserInput, Wire, WireFile, WireMessage};
+use crate::wire::{UserInput, Wire, WireMessage, WireRecordTarget};
 
 pub mod agent;
 pub mod approval;
@@ -72,6 +73,15 @@ impl MaxStepsReached {
 #[error("run cancelled")]
 pub struct RunCancelled;
 
+pub fn session_state_from_run_result(result: &anyhow::Result<()>) -> SessionState {
+    match result {
+        Ok(()) => SessionState::Completed,
+        Err(err) if err.is::<MaxStepsReached>() => SessionState::MaxStepsReached,
+        Err(err) if err.is::<RunCancelled>() => SessionState::Cancelled,
+        Err(_) => SessionState::Failed,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StatusSnapshot {
     pub context_usage: f64,
@@ -97,14 +107,14 @@ pub async fn run_soul<S, F, Fut>(
     user_input: UserInput,
     ui_loop_fn: F,
     cancel_token: CancellationToken,
-    wire_file: Option<WireFile>,
+    wire_target: Option<WireRecordTarget>,
 ) -> anyhow::Result<()>
 where
     S: Soul + ?Sized,
     F: Fn(Arc<Wire>) -> Fut + Send + Sync,
     Fut: Future<Output = UILoopResult> + Send + 'static,
 {
-    let wire = Arc::new(Wire::new(wire_file));
+    let wire = Arc::new(Wire::new(wire_target));
 
     debug!(
         "Starting UI loop with function: {:?}",

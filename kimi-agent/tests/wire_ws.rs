@@ -13,10 +13,56 @@ use kaos::KaosPath;
 use kimi_agent::config::{Config, LLMModel, LLMProvider, ProviderType, get_default_config};
 use kimi_agent::constant::{NAME, VERSION};
 use kimi_agent::session::Session;
+use kimi_agent::storage::{ContextMessageOrigin, FinishSession, SessionState, Storage};
 use kimi_agent::wire::protocol::WIRE_PROTOCOL_VERSION;
 use kimi_agent::wire::server::{WireWsServer, WsSessionRuntimeOptions};
+use kosong::message::{Message as SoulMessage, Role, TextPart};
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+fn block_on_test_future<F>(future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(future))
+            }
+            tokio::runtime::RuntimeFlavor::CurrentThread => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("build test runtime")
+                            .block_on(future)
+                    })
+                    .join()
+                    .expect("join scoped test runtime")
+            }),
+            _ => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("build test runtime")
+                            .block_on(future)
+                    })
+                    .join()
+                    .expect("join scoped test runtime")
+            }),
+        }
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime")
+            .block_on(future)
+    }
+}
 
 struct EnvGuard {
     key: &'static str,
@@ -162,10 +208,13 @@ fn scripted_runtime_options(
     work_dir: &TempDir,
     default_session_id: &str,
 ) -> WsSessionRuntimeOptions {
+    let config = scripted_config();
+    let storage = block_on_test_future(Storage::open(&config.storage)).expect("open storage");
     WsSessionRuntimeOptions {
+        storage,
         work_dir: KaosPath::from(work_dir.path().to_path_buf()),
         default_session_id: default_session_id.to_string(),
-        config: scripted_config(),
+        config,
         model_name: None,
         thinking: Some(false),
         yolo: true,
@@ -176,6 +225,10 @@ fn scripted_runtime_options(
         max_retries_per_step: None,
         max_ralph_iterations: None,
     }
+}
+
+fn user_text_message(text: &str) -> SoulMessage {
+    SoulMessage::new(Role::User, vec![TextPart::new(text).into()])
 }
 
 #[tokio::test]
@@ -269,7 +322,8 @@ async fn test_wire_ws_initialize_and_prompt() {
             .get("result")
             .and_then(|v| v.get("status"))
             .and_then(Value::as_str),
-        Some("finished")
+        Some("finished"),
+        "unexpected prompt response: {prompt_resp}"
     );
 
     ws.close(None).await.expect("close ws");
@@ -559,14 +613,16 @@ async fn test_wire_ws_allows_parallel_sessions() {
             .get("result")
             .and_then(|v| v.get("status"))
             .and_then(Value::as_str),
-        Some("finished")
+        Some("finished"),
+        "unexpected prompt-a response: {resp_a}"
     );
     assert_eq!(
         resp_b
             .get("result")
             .and_then(|v| v.get("status"))
             .and_then(Value::as_str),
-        Some("finished")
+        Some("finished"),
+        "unexpected prompt-b response: {resp_b}"
     );
 
     ws_a.close(None).await.expect("close ws a");
@@ -579,7 +635,7 @@ async fn test_wire_ws_allows_parallel_sessions() {
 }
 
 #[tokio::test]
-async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_rolls_back_session() {
+async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_discards_new_session() {
     let _lock = ENV_LOCK.lock().await;
     let home_dir = TempDir::new().expect("home dir");
     let work_dir = TempDir::new().expect("work dir");
@@ -587,6 +643,8 @@ async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_rolls_back_ses
 
     let mut options = scripted_runtime_options(&work_dir, "default-session");
     options.agent_file = Some(home_dir.path().join("missing-agent.yaml"));
+    let storage = options.storage.clone();
+    let kaos = options.config.kaos.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
@@ -610,11 +668,182 @@ async fn test_wire_ws_rejects_upgrade_when_runtime_init_fails_and_rolls_back_ses
     }
 
     let work_path = KaosPath::from(work_dir.path().to_path_buf());
-    let session = Session::find(work_path, failed_session_id).await;
+    let session = Session::find(storage, kaos, work_path, failed_session_id)
+        .await
+        .expect("find failed session");
     assert!(
         session.is_none(),
-        "expected failed websocket runtime init to roll back new session"
+        "startup-failed session should be discarded"
     );
+
+    server_task.abort();
+    let join_err = server_task
+        .await
+        .expect_err("server task should be aborted for test shutdown");
+    assert!(join_err.is_cancelled(), "unexpected join error: {join_err}");
+}
+
+#[tokio::test]
+async fn test_wire_ws_close_without_prompt_preserves_existing_session_state() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let work_dir = TempDir::new().expect("work dir");
+    let _env = configure_scripted_env(&home_dir, &["text: hello"]);
+
+    let options = scripted_runtime_options(&work_dir, "default-session");
+    let storage = options.storage.clone();
+    let kaos = options.config.kaos.clone();
+    let work_path = KaosPath::from(work_dir.path().to_path_buf());
+    let session = Session::create(
+        storage.clone(),
+        kaos.clone(),
+        work_path.clone(),
+        Some("existing-session".to_string()),
+    )
+    .await
+    .expect("create existing session");
+    storage
+        .append_context_messages(
+            session.db_id(),
+            &[user_text_message("persisted prompt")],
+            ContextMessageOrigin::UserInput,
+        )
+        .await
+        .expect("append persisted prompt");
+    storage
+        .finish_session(FinishSession {
+            session_db_id: session.db_id(),
+            state: SessionState::Completed,
+            is_empty: false,
+        })
+        .await
+        .expect("finish existing session");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
+
+    let mut ws = connect_ws_with_retry(&format!(
+        "ws://{listen_addr}/wire?session_id=existing-session"
+    ))
+    .await;
+    ws.close(None).await.expect("close ws");
+
+    let persisted = Session::find(storage, kaos, work_path, "existing-session")
+        .await
+        .expect("find session")
+        .expect("existing session");
+    assert_eq!(persisted.state.as_str(), "completed");
+    assert!(!persisted.is_empty().await.expect("session not empty"));
+
+    server_task.abort();
+    let join_err = server_task
+        .await
+        .expect_err("server task should be aborted for test shutdown");
+    assert!(join_err.is_cancelled(), "unexpected join error: {join_err}");
+}
+
+#[tokio::test]
+async fn test_wire_ws_max_steps_reached_persists_matching_session_state() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let work_dir = TempDir::new().expect("work dir");
+    let _env = configure_scripted_env(&home_dir, &["text: hello"]);
+
+    let mut options = scripted_runtime_options(&work_dir, "default-session");
+    options.max_steps_per_turn = Some(0);
+    let storage = options.storage.clone();
+    let kaos = options.config.kaos.clone();
+    let work_path = options.work_dir.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
+
+    let mut ws = connect_ws_with_retry(&format!("ws://{listen_addr}/wire")).await;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": { "protocol_version": WIRE_PROTOCOL_VERSION }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send initialize");
+    let _ = recv_response_by_id(&mut ws, "init").await;
+
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "prompt-max-steps",
+            "method": "prompt",
+            "params": { "user_input": "hello" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .expect("send prompt");
+
+    let response = recv_response_by_id(&mut ws, "prompt-max-steps").await;
+    assert_eq!(
+        response
+            .get("result")
+            .and_then(|v| v.get("status"))
+            .and_then(Value::as_str),
+        Some("max_steps_reached")
+    );
+
+    ws.close(None).await.expect("close ws");
+    let persisted = Session::find(storage, kaos, work_path, "default-session")
+        .await
+        .expect("find session")
+        .expect("session");
+    assert_eq!(persisted.state.as_str(), "max_steps_reached");
+
+    server_task.abort();
+    let join_err = server_task
+        .await
+        .expect_err("server task should be aborted for test shutdown");
+    assert!(join_err.is_cancelled(), "unexpected join error: {join_err}");
+}
+
+#[tokio::test]
+async fn test_wire_ws_close_without_prompt_discards_new_session() {
+    let _lock = ENV_LOCK.lock().await;
+    let home_dir = TempDir::new().expect("home dir");
+    let work_dir = TempDir::new().expect("work dir");
+    let _env = configure_scripted_env(&home_dir, &["text: hello"]);
+
+    let options = scripted_runtime_options(&work_dir, "default-session");
+    let storage = options.storage.clone();
+    let kaos = options.config.kaos.clone();
+    let work_path = KaosPath::from(work_dir.path().to_path_buf());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let listen_addr = listener.local_addr().expect("listener local addr");
+    let server = WireWsServer::new(options, listen_addr, "/wire").expect("wire ws server");
+    let server_task = tokio::spawn(async move { server.serve_with_listener(listener).await });
+
+    let mut ws =
+        connect_ws_with_retry(&format!("ws://{listen_addr}/wire?session_id=new-session")).await;
+    ws.close(None).await.expect("close ws");
+
+    let persisted = Session::find(storage, kaos, work_path, "new-session")
+        .await
+        .expect("find session");
+    assert!(persisted.is_none(), "unused session should be discarded");
 
     server_task.abort();
     let join_err = server_task

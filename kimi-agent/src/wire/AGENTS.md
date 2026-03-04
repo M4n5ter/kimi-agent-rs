@@ -4,7 +4,7 @@
 
 - `types.rs`: wire message structs/enums + `WireMessageEnvelope`.
 - `serde.rs`: JSON (de)serialization helpers.
-- `file.rs`: `WireFile` JSONL persistence, metadata header, `WireMessageRecord`.
+- `file.rs`: `WireMessageRecord`, the canonical serialized wire event payload stored by the SQLite-backed recorder.
 - `protocol.rs`: wire protocol version constants.
 - `jsonrpc.rs`: JSON-RPC models/utilities for wire server.
 - `server.rs`: JSON-RPC wire servers for stdio and WebSocket transports.

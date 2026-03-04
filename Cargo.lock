@@ -2710,7 +2710,6 @@ name = "kimi-agent"
 version = "1.8.0"
 dependencies = [
  "anyhow",
- "async-stream",
  "async-trait",
  "axum 0.8.8",
  "base64 0.22.1",
@@ -2718,7 +2717,6 @@ dependencies = [
  "chrono",
  "clap",
  "dirs 6.0.0",
- "filetime",
  "flate2",
  "futures",
  "html2md",
@@ -2731,6 +2729,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.2",
  "rmcp",
+ "rusqlite",
  "schemars",
  "scraper",
  "serde",

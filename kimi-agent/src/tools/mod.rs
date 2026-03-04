@@ -4,7 +4,7 @@ use kaos::KaosPath;
 use serde_json::Value;
 
 use crate::exception::InvalidToolError;
-use crate::soul::agent::Runtime;
+use crate::soul::agent::{AgentDefinition, Runtime};
 use crate::soul::toolset::KimiToolset;
 use crate::utils::shorten_middle;
 
@@ -25,13 +25,22 @@ pub mod web;
 pub struct SkipThisTool;
 
 pub struct ToolDeps<'a> {
+    pub agent_definition: Arc<AgentDefinition>,
     pub runtime: &'a Runtime,
     pub toolset: Arc<tokio::sync::Mutex<KimiToolset>>,
 }
 
 impl<'a> ToolDeps<'a> {
-    pub fn new(runtime: &'a Runtime, toolset: Arc<tokio::sync::Mutex<KimiToolset>>) -> Self {
-        Self { runtime, toolset }
+    pub fn new(
+        runtime: &'a Runtime,
+        toolset: Arc<tokio::sync::Mutex<KimiToolset>>,
+        agent_definition: Arc<AgentDefinition>,
+    ) -> Self {
+        Self {
+            agent_definition,
+            runtime,
+            toolset,
+        }
     }
 }
 
@@ -60,11 +69,12 @@ pub fn load_tool(
         "kimi_cli.tools.todo:SetTodoList" => {
             Ok(Some(Arc::new(todo::SetTodoList::new(deps.runtime))))
         }
-        "kimi_cli.tools.multiagent:Task" => {
-            Ok(Some(Arc::new(multiagent::TaskTool::new(deps.runtime))))
-        }
+        "kimi_cli.tools.multiagent:Task" => Ok(Some(Arc::new(multiagent::TaskTool::new(
+            deps.runtime,
+            Arc::clone(&deps.toolset),
+        )))),
         "kimi_cli.tools.multiagent:CreateSubagent" => Ok(Some(Arc::new(
-            multiagent::CreateSubagent::new(Arc::clone(&deps.toolset), deps.runtime),
+            multiagent::CreateSubagent::new(deps.runtime, Arc::clone(&deps.agent_definition)),
         ))),
         "kimi_cli.tools.dmail:SendDMail" => Ok(Some(Arc::new(dmail::SendDMail::new(deps.runtime)))),
         "kimi_cli.tools.think:Think" => Ok(Some(Arc::new(think::Think::new(deps.runtime)))),

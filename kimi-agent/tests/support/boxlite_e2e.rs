@@ -11,6 +11,7 @@ use kaos::{
     CurrentKaosToken, SshHostKeyPolicy, SshKaos, SshKaosOptions, reset_current_kaos,
     set_current_kaos,
 };
+use rusqlite::Connection;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
@@ -267,6 +268,30 @@ impl BoxliteSshFixture {
 
     pub fn host_home(&self) -> &Path {
         self.host_home.path()
+    }
+
+    pub fn local_state_db_path(&self) -> PathBuf {
+        self.host_home().join(".kimi").join("state.db")
+    }
+
+    pub fn with_local_state_db<T, F>(&self, op: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T>,
+    {
+        let path = self.local_state_db_path();
+        let conn = Connection::open(&path)
+            .with_context(|| format!("open local SQLite state database {}", path.display()))?;
+        op(&conn)
+    }
+
+    pub async fn remote_file_exists(&self, path: &str) -> Result<bool> {
+        let output = exec_box_output(
+            &self.litebox,
+            BoxCommand::new("sh").args(["-lc", &format!("test -e {path}")]),
+        )
+        .await
+        .with_context(|| format!("probe remote file existence for {path}"))?;
+        Ok(output.exit_code == 0)
     }
 
     pub async fn connect_ssh_kaos(&self) -> Result<SshKaos> {

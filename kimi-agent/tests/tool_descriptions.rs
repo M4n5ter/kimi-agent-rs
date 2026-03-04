@@ -1,6 +1,6 @@
+mod agent_test_utils;
 mod tool_test_utils;
 
-use kimi_agent::soul::toolset::KimiToolset;
 use kimi_agent::tools::dmail::SendDMail;
 use kimi_agent::tools::file::{Glob, Grep, ReadFile, ReadMediaFile, StrReplaceFile, WriteFile};
 use kimi_agent::tools::multiagent::{CreateSubagent, TaskTool};
@@ -9,14 +9,18 @@ use kimi_agent::tools::think::Think;
 use kimi_agent::tools::todo::SetTodoList;
 use kimi_agent::tools::web::{FetchURL, SearchWeb};
 use kosong::tooling::CallableTool2;
-use std::sync::Arc;
-
 use tool_test_utils::{RuntimeFixture, normalize_newlines};
 
-#[test]
-fn test_task_description() {
+#[tokio::test]
+async fn test_task_description() {
     let fixture = RuntimeFixture::new();
-    let tool = TaskTool::new(&fixture.runtime);
+    agent_test_utils::install_test_fixed_subagents(&fixture.runtime).await;
+    let tool = TaskTool::new(
+        &fixture.runtime,
+        std::sync::Arc::new(tokio::sync::Mutex::new(
+            kimi_agent::soul::toolset::KimiToolset::new(),
+        )),
+    );
     assert_eq!(
         normalize_newlines(tool.description()),
         "\
@@ -52,10 +56,7 @@ Examples:\n\
 #[test]
 fn test_create_subagent_description() {
     let fixture = RuntimeFixture::new();
-    let tool = CreateSubagent::new(
-        Arc::new(tokio::sync::Mutex::new(KimiToolset::new())),
-        &fixture.runtime,
-    );
+    let tool = CreateSubagent::new(&fixture.runtime, agent_test_utils::test_agent_definition());
     assert_eq!(
         normalize_newlines(tool.description()),
         "\

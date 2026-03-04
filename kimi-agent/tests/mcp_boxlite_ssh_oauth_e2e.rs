@@ -13,11 +13,13 @@ use anyhow::{Context, Result, bail};
 use boxlite_e2e::{
     BoxliteSshFixture, CurrentKaosGuard, REMOTE_WORK_DIR, run_kimi_agent, run_kimi_agent_with_env,
 };
-use kaos::{KaosPath, get_current_kaos};
+use kaos::KaosPath;
+use kimi_agent::config::{KaosConfig, StorageConfig};
+use kimi_agent::session::Session;
 use kosong::message::{ContentPart, TextPart, ToolCall};
 use kosong::tooling::{CallableTool, ToolOutput, ToolReturnValue};
 use oauth_mock::{
-    HostOauthFixture, OAuthFixtureState, assert_remote_auth_file_contains_token,
+    HostOauthFixture, OAuthFixtureState, assert_sqlite_auth_record_contains_token,
     provision_oauth_fixture,
 };
 use serde::Deserialize;
@@ -26,6 +28,7 @@ use tokio::time::timeout;
 use tool_test_utils::RuntimeFixture;
 
 use kimi_agent::soul::toolset::{KimiToolset, wait_mcp_loading_tasks, with_current_tool_call};
+use kimi_agent::storage::Storage;
 
 /// BoxLite-backed OAuth end-to-end coverage for HTTP MCP over SSH Kaos.
 ///
@@ -83,8 +86,12 @@ async fn exercise_cli_oauth_roundtrip(
     let remote_mcp_url = oauth.remote_mcp_url();
 
     assert!(
-        !fixture.local_mcp_auth_path().exists(),
-        "local OAuth cache should stay empty when Kaos backend is SSH"
+        !fixture.local_legacy_mcp_auth_path().exists(),
+        "legacy local OAuth cache file should stay empty"
+    );
+    assert!(
+        !fixture.remote_legacy_mcp_auth_exists().await?,
+        "legacy remote OAuth cache file should not exist"
     );
 
     run_kimi_agent(
@@ -134,11 +141,17 @@ async fn exercise_cli_oauth_roundtrip(
     assert!(auth_output.stdout.contains("Successfully authorized"));
     assert!(auth_output.stdout.contains("Available tools: 1"));
 
-    let remote_auth = fixture.read_remote_mcp_auth_file().await?;
-    assert_remote_auth_file_contains_token(&remote_auth, &remote_mcp_url)?;
+    let stored_auth = fixture
+        .read_host_mcp_credential(&remote_mcp_url)?
+        .context("missing SQLite-backed OAuth credential record")?;
+    assert_sqlite_auth_record_contains_token(&stored_auth)?;
     assert!(
-        !fixture.local_mcp_auth_path().exists(),
-        "local OAuth cache should remain empty after authorization"
+        !fixture.local_legacy_mcp_auth_path().exists(),
+        "legacy local OAuth cache file should remain empty after authorization"
+    );
+    assert!(
+        !fixture.remote_legacy_mcp_auth_exists().await?,
+        "legacy remote OAuth cache file should remain absent after authorization"
     );
     let state_after_auth = oauth.read_state(fixture).await?;
     assert_completed_oauth_handshake(&state_after_auth);
@@ -186,10 +199,7 @@ async fn exercise_runtime_oauth_tool_invocation(
     let _guard = CurrentKaosGuard::new(ssh_kaos);
 
     let mut runtime_fixture = RuntimeFixture::new();
-    runtime_fixture.runtime.session.work_dir = remote_work_dir.clone();
-    runtime_fixture.runtime.session.work_dir_meta.path = remote_work_dir.to_string_lossy();
-    runtime_fixture.runtime.session.work_dir_meta.kaos = get_current_kaos().storage_name();
-    runtime_fixture.runtime.builtin_args.KIMI_WORK_DIR = remote_work_dir;
+    rebind_runtime_to_fixture_state(fixture, &mut runtime_fixture, remote_work_dir.clone()).await?;
 
     let toolset = Arc::new(tokio::sync::Mutex::new(KimiToolset::new()));
     let state_before_runtime = oauth.read_state(fixture).await?;
@@ -261,6 +271,43 @@ async fn exercise_runtime_oauth_tool_invocation(
     Ok(())
 }
 
+async fn rebind_runtime_to_fixture_state(
+    fixture: &BoxliteSshFixture,
+    runtime_fixture: &mut RuntimeFixture,
+    work_dir: KaosPath,
+) -> Result<()> {
+    let storage_config = StorageConfig {
+        database_path: fixture.local_state_db_path().display().to_string(),
+        busy_timeout_ms: 1_000,
+    };
+    let storage = Storage::open(&storage_config).await.with_context(|| {
+        format!(
+            "open local SQLite state database {}",
+            storage_config.database_path
+        )
+    })?;
+    let kaos = KaosConfig::Ssh {
+        options: fixture.ssh_options(Duration::from_secs(10)),
+    };
+    let mut session = Session::create(
+        storage.clone(),
+        kaos.clone(),
+        work_dir.clone(),
+        Some("test".to_string()),
+    )
+    .await
+    .context("create runtime session in shared SQLite storage")?;
+    session.title = "Test Session".to_string();
+
+    runtime_fixture.runtime.config.storage = storage_config;
+    runtime_fixture.runtime.config.kaos = kaos;
+    runtime_fixture.runtime.storage = storage;
+    runtime_fixture.runtime.session = session;
+    runtime_fixture.runtime.builtin_args.KIMI_WORK_DIR = work_dir;
+
+    Ok(())
+}
+
 async fn exercise_cli_reset_auth(
     fixture: &BoxliteSshFixture,
     oauth: &HostOauthFixture,
@@ -271,10 +318,10 @@ async fn exercise_cli_reset_auth(
         &["mcp", "reset-auth", oauth.server_name()],
     )?;
 
-    let remote_auth = fixture.read_remote_mcp_auth_file().await?;
+    let remote_auth = fixture.read_host_mcp_credential(&oauth.remote_mcp_url())?;
     assert!(
-        !remote_auth.contains(&oauth.remote_mcp_url()),
-        "reset-auth should remove the remote OAuth credential entry"
+        remote_auth.is_none(),
+        "reset-auth should remove the SQLite-backed OAuth credential entry"
     );
 
     let list_after_reset = run_kimi_agent(

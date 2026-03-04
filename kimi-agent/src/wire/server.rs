@@ -24,10 +24,14 @@ use kosong::tooling::tool_error;
 use crate::app::{ConfigInput, CreateOptions, KimiCLI};
 use crate::config::Config;
 use crate::constant::{NAME, VERSION};
-use crate::session::{Session, post_run as post_run_session};
+use crate::session::{Session, cleanup_failed_startup, post_run as post_run_session};
 use crate::session_id::normalize_session_id;
 use crate::soul::kimisoul::KimiSoul;
-use crate::soul::{LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul};
+use crate::soul::{
+    LLMNotSet, LLMNotSupported, MaxStepsReached, RunCancelled, Soul, run_soul,
+    session_state_from_run_result,
+};
+use crate::storage::{SessionState, Storage};
 use crate::utils::{Queue, QueueShutDown};
 use crate::wire::jsonrpc::{
     InitializeParams, JsonRpcErrorObject, JsonRpcErrorResponse, JsonRpcErrorResponseNullableId,
@@ -53,22 +57,40 @@ struct ActiveTurn {
 }
 
 #[derive(Clone)]
+struct WireSessionFacts {
+    created_new_session: bool,
+    last_turn_state: Option<SessionState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WireSessionFinalizationAction {
+    Persist(SessionState),
+    DeleteNewUnused,
+    PreserveExisting,
+}
+
+#[derive(Clone)]
 struct WireRpcState {
     soul: Arc<KimiSoul>,
     write_queue: Queue<Value>,
     pending: Arc<tokio::sync::Mutex<HashMap<String, PendingRequest>>>,
     active_turn: Arc<tokio::sync::Mutex<Option<ActiveTurn>>>,
     next_turn_id: Arc<AtomicU64>,
+    session_facts: Arc<tokio::sync::Mutex<WireSessionFacts>>,
 }
 
 impl WireRpcState {
-    fn new(soul: Arc<KimiSoul>) -> Self {
+    fn new(soul: Arc<KimiSoul>, created_new_session: bool) -> Self {
         Self {
             soul,
             write_queue: Queue::new(),
             pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_turn: Arc::new(tokio::sync::Mutex::new(None)),
             next_turn_id: Arc::new(AtomicU64::new(1)),
+            session_facts: Arc::new(tokio::sync::Mutex::new(WireSessionFacts {
+                created_new_session,
+                last_turn_state: None,
+            })),
         }
     }
 
@@ -279,9 +301,13 @@ impl WireRpcState {
         let turn_cancel_token = cancel_token.clone();
         let active_turn_slot = Arc::clone(&self.active_turn);
         let soul = Arc::clone(&self.soul);
+        let session_facts = Arc::clone(&self.session_facts);
         let write_queue = self.write_queue.clone();
         let pending = Arc::clone(&self.pending);
-        let wire_file = Some(self.soul.runtime().session.wire_file());
+        let wire_target = Some(crate::wire::WireRecordTarget::new(
+            self.soul.runtime().storage.clone(),
+            self.soul.runtime().session.db_id(),
+        ));
         let mut active_turn = self.active_turn.lock().await;
         if active_turn.is_some() {
             drop(active_turn);
@@ -310,7 +336,7 @@ impl WireRpcState {
                         )
                     },
                     turn_cancel_token,
-                    wire_file,
+                    wire_target,
                 ))
             });
             let run_result = match run_handle.await {
@@ -328,7 +354,7 @@ impl WireRpcState {
                     let _ = write_queue
                         .put_nowait(serde_json::to_value(response).unwrap_or(Value::Null));
                 }
-                Err(err) => {
+                Err(ref err) => {
                     if err.is::<LLMNotSet>() {
                         let response = JsonRpcErrorResponse {
                             jsonrpc: "2.0",
@@ -401,6 +427,8 @@ impl WireRpcState {
                     }
                 }
             }
+            let state = session_state_from_run_result(&run_result);
+            session_facts.lock().await.last_turn_state = Some(state);
             let mut slot = active_turn_slot.lock().await;
             if slot.as_ref().is_some_and(|turn| turn.id == turn_id) {
                 *slot = None;
@@ -590,6 +618,24 @@ impl WireRpcState {
 
         self.write_queue.shutdown(false);
     }
+
+    async fn finalize_session(&self) -> anyhow::Result<()> {
+        let action = {
+            let facts = self.session_facts.lock().await;
+            wire_session_finalization_action(
+                facts.created_new_session,
+                facts.last_turn_state.clone(),
+            )
+        };
+        let session = self.session();
+        match action {
+            WireSessionFinalizationAction::Persist(state) => {
+                post_run_session(&session, state).await
+            }
+            WireSessionFinalizationAction::DeleteNewUnused => session.delete().await,
+            WireSessionFinalizationAction::PreserveExisting => Ok(()),
+        }
+    }
 }
 
 async fn cancel_and_wait_active_turn(
@@ -607,6 +653,17 @@ async fn cancel_and_wait_active_turn(
     }
 }
 
+fn wire_session_finalization_action(
+    created_new_session: bool,
+    last_turn_state: Option<SessionState>,
+) -> WireSessionFinalizationAction {
+    match last_turn_state {
+        Some(state) => WireSessionFinalizationAction::Persist(state),
+        None if created_new_session => WireSessionFinalizationAction::DeleteNewUnused,
+        None => WireSessionFinalizationAction::PreserveExisting,
+    }
+}
+
 pub struct WireServer {
     rpc: WireRpcState,
 }
@@ -614,9 +671,9 @@ pub struct WireServer {
 pub type WireOverStdio = WireServer;
 
 impl WireServer {
-    pub fn new(soul: Arc<KimiSoul>) -> Self {
+    pub fn new(soul: Arc<KimiSoul>, created_new_session: bool) -> Self {
         Self {
-            rpc: WireRpcState::new(soul),
+            rpc: WireRpcState::new(soul, created_new_session),
         }
     }
 
@@ -656,21 +713,30 @@ impl WireServer {
             }
         });
 
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            let n = reader.read_until(b'\n', &mut buf).await?;
-            if n == 0 {
-                info!("stdin closed, Wire server exiting");
-                break;
+        let result = async {
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                let n = reader.read_until(b'\n', &mut buf).await?;
+                if n == 0 {
+                    info!("stdin closed, Wire server exiting");
+                    break Ok(());
+                }
+                let line = String::from_utf8_lossy(&buf);
+                self.rpc.handle_json_line(&line).await;
             }
-            let line = String::from_utf8_lossy(&buf);
-            self.rpc.handle_json_line(&line).await;
         }
+        .await;
 
         self.rpc.shutdown().await;
+        if let Err(err) = self.rpc.finalize_session().await {
+            warn!(
+                "Failed to finalize session metadata after stdio shutdown: {}",
+                err
+            );
+        }
         let _ = write_task.await;
-        Ok(())
+        result
     }
 }
 
@@ -682,6 +748,7 @@ pub struct WireWsServer {
 
 #[derive(Clone)]
 pub struct WsSessionRuntimeOptions {
+    pub storage: Storage,
     pub work_dir: KaosPath,
     pub default_session_id: String,
     pub config: Config,
@@ -781,12 +848,24 @@ impl WsServerState {
 
     async fn create_rpc(&self, session_id: &str) -> anyhow::Result<WireRpcState> {
         let options = &self.options;
-        let found_session = Session::find(options.work_dir.clone(), session_id).await;
+        let found_session = Session::find(
+            options.storage.clone(),
+            options.config.kaos.clone(),
+            options.work_dir.clone(),
+            session_id,
+        )
+        .await?;
         let created_new_session = found_session.is_none();
         let session = match found_session {
             Some(session) => session,
             None => {
-                Session::create(options.work_dir.clone(), Some(session_id.to_string()), None).await
+                Session::create(
+                    options.storage.clone(),
+                    options.config.kaos.clone(),
+                    options.work_dir.clone(),
+                    Some(session_id.to_string()),
+                )
+                .await?
             }
         };
         let rollback_session = if created_new_session {
@@ -799,6 +878,7 @@ impl WsServerState {
             session,
             CreateOptions {
                 config: Some(ConfigInput::Inline(Box::new(options.config.clone()))),
+                storage: Some(options.storage.clone()),
                 model_name: options.model_name.clone(),
                 thinking: options.thinking,
                 yolo: options.yolo,
@@ -815,19 +895,19 @@ impl WsServerState {
             Ok(cli) => cli,
             Err(err) => {
                 if let Some(rollback_session) = rollback_session
-                    && let Err(post_run_err) = post_run_session(&rollback_session).await
+                    && let Err(cleanup_err) = cleanup_failed_startup(&rollback_session, true).await
                 {
                     warn!(
                         session_id = %session_id,
-                        "Failed to rollback newly created session after runtime init failure: {}",
-                        post_run_err
+                        "Failed to discard newly created session after runtime init failure: {}",
+                        cleanup_err
                     );
                 }
                 return Err(err);
             }
         };
 
-        Ok(WireRpcState::new(cli.soul()))
+        Ok(WireRpcState::new(cli.soul(), created_new_session))
     }
 }
 
@@ -881,9 +961,8 @@ async fn ws_upgrade_handler(
         );
         tokio::spawn(async move {
             if let Some(rpc) = rpc_slot_for_failed_upgrade.lock().await.take() {
-                let session = rpc.session();
                 rpc.shutdown().await;
-                if let Err(post_run_err) = post_run_session(&session).await {
+                if let Err(post_run_err) = rpc.finalize_session().await {
                     warn!(
                         session_id = %session_id_for_failed_upgrade,
                         "Failed to finalize session metadata after failed websocket upgrade: {}",
@@ -967,9 +1046,8 @@ async fn handle_ws_socket(
         }
     }
 
-    let session = rpc.session();
     rpc.shutdown().await;
-    if let Err(err) = post_run_session(&session).await {
+    if let Err(err) = rpc.finalize_session().await {
         warn!(
             session_id = %session_id,
             "Failed to finalize session metadata after websocket close: {}",
@@ -1059,7 +1137,12 @@ mod tests {
 
     use tokio_util::sync::CancellationToken;
 
-    use super::{ActiveTurn, cancel_and_wait_active_turn, normalize_ws_path};
+    use crate::storage::SessionState;
+
+    use super::{
+        ActiveTurn, WireSessionFinalizationAction, cancel_and_wait_active_turn, normalize_ws_path,
+        wire_session_finalization_action,
+    };
 
     #[test]
     fn normalize_ws_path_accepts_valid_path() {
@@ -1073,6 +1156,38 @@ mod tests {
         assert!(normalize_ws_path("wire").is_err());
         assert!(normalize_ws_path("/wire?x=1").is_err());
         assert!(normalize_ws_path("/wire#frag").is_err());
+    }
+
+    #[test]
+    fn wire_session_finalization_action_persists_last_turn_state() {
+        assert_eq!(
+            wire_session_finalization_action(true, Some(SessionState::Completed)),
+            WireSessionFinalizationAction::Persist(SessionState::Completed)
+        );
+        assert_eq!(
+            wire_session_finalization_action(false, Some(SessionState::Cancelled)),
+            WireSessionFinalizationAction::Persist(SessionState::Cancelled)
+        );
+        assert_eq!(
+            wire_session_finalization_action(false, Some(SessionState::MaxStepsReached)),
+            WireSessionFinalizationAction::Persist(SessionState::MaxStepsReached)
+        );
+    }
+
+    #[test]
+    fn wire_session_finalization_action_discards_unused_new_sessions() {
+        assert_eq!(
+            wire_session_finalization_action(true, None),
+            WireSessionFinalizationAction::DeleteNewUnused
+        );
+    }
+
+    #[test]
+    fn wire_session_finalization_action_preserves_unused_existing_sessions() {
+        assert_eq!(
+            wire_session_finalization_action(false, None),
+            WireSessionFinalizationAction::PreserveExisting
+        );
     }
 
     #[tokio::test]
